@@ -1,5 +1,5 @@
-// Reservoir-Worker-2026.11.02-w203
-globalThis.w203_TOP = "Reservoir-Worker-2026.11.02-w203";
+// Reservoir-Worker-2026.11.03-w204
+globalThis.w204_TOP = "Reservoir-Worker-2026.11.03-w204";
 // Reservoir API Worker. Validates the Microsoft Entra token on every request, then reads and writes the D1 fleet table.
 const FIELDS = ["name","rego","expiry","serial","make","model","colour","year","body","vin","engine","compliance","fuel","driver","garaged","finance","directDebit","contract","lastService","nextService","serviceProvider","servicePhone","serviceEmail","serviceBooking","financeExpiry","financeDocs"];
 
@@ -225,7 +225,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
   await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
 }
 
-const WORKER_BUILD = "Reservoir-Worker-2026.11.02-w203";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.03-w204";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.izzyandloki.workers.dev/api/xero/callback";
@@ -2837,6 +2837,13 @@ function arofloShape(rec) {
   const when = flat.find(([k, v]) => /(created|added|loaded|inserted|entered|logged)/i.test(k) && /^\d{4}-\d{2}-\d{2}/.test(v));
   return { number: String(number || ""), client: String(client || ""), address: String(address || ""), when: when ? when[1] : "" };
 }
+// The date a project was created, read from whichever date field AroFlo sent. Returns YYYY-MM-DD or "".
+function arofloWhen(rec) {
+  const flat = arofloFlat(rec, "", [], 0).filter(([, v]) => /^\d{4}[-\/]\d{2}[-\/]\d{2}/.test(String(v)));
+  const pick = (re) => flat.find(([k]) => re.test(k));
+  const hit = pick(/(created|added|loaded|inserted|entered|logged)/i) || pick(/(start|open|date)/i);
+  return hit ? String(hit[1]).slice(0, 10).replace(/\//g, "-") : "";
+}
 async function arofloDiscover(env) {
   const tries = ["/openapi.json", "/swagger.json", "/docs/json", "/", "/healthcheck"];
   const found = [];
@@ -3363,6 +3370,8 @@ async function arofloRoutes(request, env, user, url) {
     if (url.pathname === "/api/aroflo/suburbs") {
       await env.DB.prepare("CREATE TABLE IF NOT EXISTS aroflo_projects (id TEXT PRIMARY KEY, number TEXT, name TEXT, client TEXT, status TEXT, suburb TEXT, address TEXT, state TEXT, extra TEXT, seen TEXT)").run();
       try { await env.DB.prepare("ALTER TABLE aroflo_projects ADD COLUMN custom TEXT").run(); } catch (e) { /* already there */ }
+      try { await env.DB.prepare("ALTER TABLE aroflo_projects ADD COLUMN created TEXT").run(); } catch (e) { /* already there */ }
+      try { await env.DB.prepare("ALTER TABLE aroflo_projects ADD COLUMN site TEXT").run(); } catch (e) { /* already there */ }
       const mode = String(url.searchParams.get("mode") || "report");
       const wantedAll = String(url.searchParams.get("s") || "").split("|").map((x) => x.trim().toLowerCase()).filter(Boolean).slice(0, 12);
       const pendingQ = "SELECT COUNT(*) AS n FROM aroflo_projects WHERE UPPER(status) = 'OPEN' AND suburb IS NULL";
@@ -3398,7 +3407,7 @@ async function arofloRoutes(request, env, user, url) {
           const id = String((rec && (rec.id ?? rec.projectId ?? rec.ID)) ?? "");
           if (!id) continue;
           const loc = rec.location && typeof rec.location === "object" ? rec.location : null;
-          stmts.push(env.DB.prepare("INSERT INTO aroflo_projects (id, number, name, client, status, suburb, seen) VALUES (?, ?, ?, ?, ?, ?, datetime('now')) ON CONFLICT(id) DO UPDATE SET number = excluded.number, name = excluded.name, client = excluded.client, status = excluded.status, seen = excluded.seen").bind(id, String(rec.projectNumber ?? rec.referenceNumber ?? ""), String(rec.name || ""), String((rec.client && rec.client.name) || ""), String(rec.status || ""), loc && loc.suburb ? String(loc.suburb) : null));
+          stmts.push(env.DB.prepare("INSERT INTO aroflo_projects (id, number, name, client, status, suburb, created, seen) VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now')) ON CONFLICT(id) DO UPDATE SET number = excluded.number, name = excluded.name, client = excluded.client, status = excluded.status, created = excluded.created, seen = excluded.seen").bind(id, String(rec.projectNumber ?? rec.referenceNumber ?? ""), String(rec.name || ""), String((rec.client && rec.client.name) || ""), String(rec.status || ""), loc && loc.suburb ? String(loc.suburb) : null, arofloWhen(rec) || null));
         }
         for (let k = 0; k < stmts.length; k += 90) await env.DB.batch(stmts.slice(k, k + 90));
         if (!throttled && !failed) await env.DB.prepare("INSERT INTO app_settings (key, value, by_name, at) VALUES ('aroflo.projects.refreshed', ?, ?, datetime('now')) ON CONFLICT(key) DO UPDATE SET value = excluded.value, at = excluded.at").bind(String(Date.now()), user.name || "").run().catch(() => {});
@@ -3455,6 +3464,48 @@ async function arofloRoutes(request, env, user, url) {
         }
         const pendC = await env.DB.prepare(`SELECT COUNT(*) AS n FROM aroflo_projects WHERE UPPER(status) = 'OPEN' AND custom IS NULL AND LOWER(suburb) IN (${marks})`).bind(...wantedAll).first();
         return reply(env, 200, { ok: true, done, failed, limited, firstErr, pending: pendC ? pendC.n : 0, worker: WORKER_BUILD });
+      }
+      // Escape Homes report. Every Escape Homes project from the last six months, with the full site address and the BPC Certificate Number.
+      if (mode === "eh-detail" || mode === "eh-report") {
+        const cut = new Date(); cut.setMonth(cut.getMonth() - 6);
+        const cutoff = cut.toISOString().slice(0, 10);
+        const scope = "LOWER(client) LIKE '%escape%' AND (created IS NULL OR created >= ?)";
+        if (mode === "eh-detail") {
+          const rows = (await env.DB.prepare(`SELECT id FROM aroflo_projects WHERE ${scope} AND site IS NULL LIMIT 18`).bind(cutoff).all()).results || [];
+          let done = 0, failed = 0, limited = false, firstErr = "";
+          for (let k = 0; k < rows.length && !limited; k += 3) {
+            await Promise.all(rows.slice(k, k + 3).map(async (row) => {
+              try {
+                const rd = await arofloGet(env, "/projects/" + encodeURIComponent(row.id));
+                if (rd.status === 429) { limited = true; return; }
+                if (!rd.ok || !rd.json) { failed++; if (!firstErr) firstErr = `project ${row.id} answered ${rd.status} ${String(rd.text || "").slice(0, 120)}`; return; }
+                const loc = rd.json.location || {};
+                const pc = loc.postcode ?? loc.postCode ?? loc.postalCode ?? loc.zip ?? "";
+                const site = [loc.address1, loc.address2, loc.suburb, loc.state, pc].map((x) => String(x || "").trim()).filter(Boolean).join(", ");
+                const out = {};
+                const rc = await arofloGet(env, "/projects/" + encodeURIComponent(row.id) + "/customFields");
+                if (rc.status === 429) { limited = true; return; }
+                if (rc.ok) {
+                  for (const it of arofloList(rc.json) || []) {
+                    const cf = (it && it.customField) || it || {};
+                    if (/bpc/i.test(String(cf.name || ""))) out.bpc = String(cf.value ?? it.value ?? "").trim();
+                  }
+                } else { failed++; if (!firstErr) firstErr = `custom fields for ${row.id} answered ${rc.status}`; return; }
+                await env.DB.prepare("UPDATE aroflo_projects SET site = ?, custom = ? WHERE id = ?").bind(site, JSON.stringify(out), row.id).run();
+                done++;
+              } catch (e) { failed++; if (!firstErr) firstErr = String(e && e.message || e).slice(0, 160); }
+            }));
+            await new Promise((r) => setTimeout(r, 250));
+          }
+          const pendE = await env.DB.prepare(`SELECT COUNT(*) AS n FROM aroflo_projects WHERE ${scope} AND site IS NULL`).bind(cutoff).first();
+          return reply(env, 200, { ok: true, done, failed, limited, firstErr, pending: pendE ? pendE.n : 0, worker: WORKER_BUILD });
+        }
+        const rows = (await env.DB.prepare(`SELECT id, number, name, client, status, site, custom, created FROM aroflo_projects WHERE ${scope} ORDER BY CAST(number AS INTEGER) DESC`).bind(cutoff).all()).results || [];
+        const items = rows.map((x) => ({ id: x.id, number: x.number, location: x.site || "", project: x.name || "", client: x.client || "", bpc: (() => { try { return JSON.parse(x.custom || "{}").bpc || ""; } catch (e) { return ""; } })(), created: x.created || "", status: x.status || "" }));
+        const pendE = await env.DB.prepare(`SELECT COUNT(*) AS n FROM aroflo_projects WHERE ${scope} AND site IS NULL`).bind(cutoff).first();
+        const total = await env.DB.prepare("SELECT COUNT(*) AS n FROM aroflo_projects").first();
+        const dated = await env.DB.prepare("SELECT COUNT(*) AS n FROM aroflo_projects WHERE created IS NOT NULL").first();
+        return reply(env, 200, { ok: true, items, cutoff, pending: pendE ? pendE.n : 0, scanned: total ? total.n : 0, dated: dated ? dated.n : 0, undated: items.filter((x) => !x.created).length, worker: WORKER_BUILD });
       }
       const wanted = wantedAll;
       if (!wanted.length) return reply(env, 400, { error: "no suburbs" });
@@ -6685,5 +6736,5 @@ export default {
   }
 };
 
-globalThis.w203_BOTTOM = "Reservoir-Worker-2026.11.02-w203";
-// Reservoir-Worker-2026.11.02-w203
+globalThis.w204_BOTTOM = "Reservoir-Worker-2026.11.03-w204";
+// Reservoir-Worker-2026.11.03-w204
