@@ -225,7 +225,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
   await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
 }
 
-const WORKER_BUILD = "Reservoir-Worker-2026.10.31-w201";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.02-w202";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.izzyandloki.workers.dev/api/xero/callback";
@@ -2911,6 +2911,8 @@ async function tempAccessFor(env, email) {
 }
 async function accessRoutes(request, env, user, url) {
   if (!url.pathname.startsWith("/api/access") && url.pathname !== "/api/mytiles") return null;
+  // /api/access/tiers has its own handler further down. Without this line this function answered it with "not found" first, which is what broke Login As.
+  if (url.pathname === "/api/access/tiers") return null;
   if (url.pathname === "/api/mytiles") {
     if (request.method !== "GET") return reply(env, 404, { error: "not found" });
     await accessTable(env);
@@ -5045,7 +5047,10 @@ export default {
             try {
               const isHb = docKind(row.kind) !== "policy";
               const staff = (((await env.DB.prepare("SELECT email, name FROM xero_payroll WHERE email IS NOT NULL AND email <> '' AND (status IS NULL OR status = 'ACTIVE')").all()).results) || []).filter((p) => !/andrew\s+wowk/i.test(String(p.name || "")));
-              for (const p of staff) await notify(env, { to: String(p.email).toLowerCase(), kind: "policy", title: `${row.title} has been updated`, body: `A new version of the ${isHb ? "handbook" : "policy"} is out. Open it, read it to the end and acknowledge it again.`, link: isHb ? "handbook" : "policies", by: user.name || who });
+              // Directors (T1) write the policies, so they are not asked to acknowledge them.
+              let t1 = new Set();
+              try { const tr = await accessTiers(env); t1 = new Set(Object.keys(tr).filter((e) => tr[e] === "T1")); } catch (e) { /* if Entra cannot answer, only the director named above is skipped */ }
+              for (const p of staff.filter((q) => !t1.has(String(q.email).toLowerCase()))) await notify(env, { to: String(p.email).toLowerCase(), kind: "policy", title: `${row.title} has been updated`, body: `A new version of the ${isHb ? "handbook" : "policy"} is out. Open it, read it to the end and acknowledge it again.`, link: isHb ? "handbook" : "policies", by: user.name || who });
             } catch (e) { console.log("policy notice failed", String(e && e.message || e).slice(0, 200)); }
           }
           return reply(env, 200, { policy: policyOut(outV), archived });
