@@ -1,5 +1,5 @@
-// Reservoir-Worker-2026.10.28-w197
-globalThis.w197_TOP = "Reservoir-Worker-2026.10.28-w197";
+// Reservoir-Worker-2026.11.02-w203
+globalThis.w203_TOP = "Reservoir-Worker-2026.11.02-w203";
 // Reservoir API Worker. Validates the Microsoft Entra token on every request, then reads and writes the D1 fleet table.
 const FIELDS = ["name","rego","expiry","serial","make","model","colour","year","body","vin","engine","compliance","fuel","driver","garaged","finance","directDebit","contract","lastService","nextService","serviceProvider","servicePhone","serviceEmail","serviceBooking","financeExpiry","financeDocs"];
 
@@ -225,7 +225,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
   await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
 }
 
-const WORKER_BUILD = "Reservoir-Worker-2026.11.02-w202";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.02-w203";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.izzyandloki.workers.dev/api/xero/callback";
@@ -2868,7 +2868,7 @@ async function mailGraph(env, address, qs) {
   try { json = JSON.parse(text); } catch (e) { json = null; }
   return { ok: res.ok, status: res.status, json, text };
 }
-const mailWhy = (r) => {
+const mailWhy = (r, write) => {
   let who = "";
   try {
     const c = JSON.parse(atob(String(graphToken.value).split(".")[1].replace(/-/g, "+").replace(/_/g, "/")));
@@ -2876,6 +2876,7 @@ const mailWhy = (r) => {
     who = ` Reservoir signs in to Microsoft as app ${c.appid || c.azp || "unknown"}, and its token holds these mail permissions: ${mailRoles.join(", ") || "none"}.`;
   } catch (e) { who = ""; }
   const code = r.json && r.json.error && r.json.error.code ? ` Microsoft said ${r.json.error.code}.` : "";
+  if ((r.status === 403 || r.status === 401) && write) return "Reservoir's Microsoft app is not allowed to change this mailbox yet. The Reservoir Directories app needs the Mail.ReadWrite and Mail.Send application permissions." + code + who;
   if (r.status === 403 || r.status === 401) return "Reservoir's Microsoft app is not allowed to read this mailbox yet." + code + who;
   if (r.status === 404) return "Microsoft could not find this mailbox." + code;
   return `Microsoft answered ${r.status}.` + code;
@@ -3062,25 +3063,117 @@ async function budgetRoutes(request, env, user, url) {
   }
   return reply(env, 404, { error: "not found" });
 }
+// ---- Mail client. Folders, messages, reading, replying, forwarding, sending, deleting and attachments for the four DFP mailboxes, all through Microsoft Graph. Changing mail needs the Mail.ReadWrite and Mail.Send application permissions on the Reservoir Directories app. ----
+async function mailDo(env, address, path, method, bodyObj) {
+  const go = () => graphFetch(env, `/users/${encodeURIComponent(address)}${path}`, { method, headers: { "Content-Type": "application/json" }, body: bodyObj === void 0 ? void 0 : JSON.stringify(bodyObj) });
+  let res = await go();
+  if (res.status === 401 || res.status === 403) { graphToken = { value: null, at: 0 }; res = await go(); }
+  const text = await res.text();
+  let json = null;
+  try { json = JSON.parse(text); } catch (e) { json = null; }
+  return { ok: res.ok, status: res.status, json, text };
+}
+const MAIL_ALIAS = { "inbox": "inbox", "sent items": "sentitems", "drafts": "drafts", "deleted items": "deleteditems", "junk email": "junkemail", "archive": "archive" };
+const MAIL_HIDE = /^(conversation history|sync issues|conflicts|local failures|server failures|outbox|rss feeds|rss subscriptions|clutter|scheduled|yammer|quick step settings|social activity notifications|personmetadata|externalcontacts)/i;
+const mailPart = (x) => ({ name: String((x && x.emailAddress && x.emailAddress.name) || "").slice(0, 80), address: String((x && x.emailAddress && x.emailAddress.address) || "").slice(0, 120) });
+const mailShow = (x) => { const a = mailPart(x); return a.name || a.address; };
+const mailId = (v) => { const t = String(v || ""); return t && t.length < 600 ? t : ""; };
+const mailFolderId = (v) => { const t = String(v || "inbox"); return /^[A-Za-z0-9_\-=+\/.]{1,300}$/.test(t) ? t : "inbox"; };
+function mailRecipients(v) {
+  const out = [];
+  String(v || "").split(/[;,\n]/).map((x) => x.trim()).filter(Boolean).forEach((x) => {
+    const m = x.match(/<([^>]+)>/);
+    const a = (m ? m[1] : x).trim();
+    if (/^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/.test(a)) out.push({ emailAddress: { address: a } });
+  });
+  return out.slice(0, 20);
+}
 async function mailRoutes(request, env, user, url) {
   if (!url.pathname.startsWith("/api/mail")) return null;
-  if (request.method !== "GET") return reply(env, 404, { error: "not found" });
   const mine = MAILBOXES.filter((b) => mailAllowed(b, user));
+  const post = request.method === "POST";
+  if (request.method !== "GET" && !post) return reply(env, 404, { error: "not found" });
+  if (post && user.viewAs) return reply(env, 403, { error: "Viewing as someone else is read only." });
   try {
-    if (url.pathname === "/api/mail/boxes") {
+    if (url.pathname === "/api/mail/boxes" && !post) {
       const out = await Promise.all(mine.map(async (b) => {
         const r = await mailGraph(env, mailAddress(env, b), "/mailFolders/inbox?$select=unreadItemCount");
         return { id: b.id, label: b.label, unread: r.ok && r.json ? Number(r.json.unreadItemCount || 0) : 0, error: r.ok ? "" : mailWhy(r) };
       }));
       return reply(env, 200, { boxes: out, worker: WORKER_BUILD });
     }
-    if (url.pathname === "/api/mail/box") {
-      const b = mine.find((x) => x.id === url.searchParams.get("id"));
-      if (!b) return reply(env, 403, { error: "forbidden" });
-      const r = await mailGraph(env, mailAddress(env, b), "/mailFolders/inbox/messages?$top=25&$select=subject,from,receivedDateTime,isRead,bodyPreview&$orderby=receivedDateTime desc");
+    const b = mine.find((x) => x.id === (url.searchParams.get("id") || ""));
+    let body = null;
+    if (post) { try { body = await request.json(); } catch (e) { body = null; } }
+    const box = b || (body && mine.find((x) => x.id === body.id));
+    if (!box) return reply(env, 403, { error: "forbidden" });
+    const addr = mailAddress(env, box);
+    if (url.pathname === "/api/mail/folders" && !post) {
+      const top = await mailGraph(env, addr, "/mailFolders?$top=100&$select=displayName,unreadItemCount");
+      if (!top.ok) return reply(env, 200, { ok: false, error: mailWhy(top), worker: WORKER_BUILD });
+      const inboxRes = await mailGraph(env, addr, "/mailFolders/inbox?$select=id");
+      const inboxId = inboxRes.ok && inboxRes.json ? inboxRes.json.id : "";
+      const kids = inboxId ? await mailGraph(env, addr, "/mailFolders/inbox/childFolders?$top=100&$select=displayName,unreadItemCount") : null;
+      const folders = [];
+      ((top.json && top.json.value) || []).forEach((f) => {
+        const name = String(f.displayName || "");
+        if (MAIL_HIDE.test(name)) return;
+        folders.push({ id: MAIL_ALIAS[name.toLowerCase()] || f.id, name, unread: Number(f.unreadItemCount || 0) });
+      });
+      ((kids && kids.ok && kids.json && kids.json.value) || []).forEach((f) => folders.push({ id: f.id, name: "Inbox: " + String(f.displayName || ""), unread: Number(f.unreadItemCount || 0) }));
+      return reply(env, 200, { ok: true, folders, worker: WORKER_BUILD });
+    }
+    if (url.pathname === "/api/mail/box" && !post) {
+      const folder = mailFolderId(url.searchParams.get("folder"));
+      const top = Math.max(1, Math.min(200, Number(url.searchParams.get("top")) || 40));
+      const filter = url.searchParams.get("filter") || "";
+      const q = String(url.searchParams.get("q") || "").replace(/["\\]/g, " ").trim().slice(0, 100);
+      let qs = `/mailFolders/${encodeURIComponent(folder)}/messages?$top=${top}&$select=subject,from,toRecipients,receivedDateTime,isRead,bodyPreview,hasAttachments`;
+      if (q) qs += `&$search=${encodeURIComponent('"' + q + '"')}`;
+      else {
+        const f = ["receivedDateTime ge 1900-01-01T00:00:00Z"];
+        if (filter === "unread") f.push("isRead eq false");
+        if (filter === "attachments") f.push("hasAttachments eq true");
+        qs += `&$filter=${encodeURIComponent(f.join(" and "))}&$orderby=receivedDateTime desc`;
+      }
+      const r = await mailGraph(env, addr, qs);
       if (!r.ok) return reply(env, 200, { ok: false, error: mailWhy(r), worker: WORKER_BUILD });
-      const list = ((r.json && r.json.value) || []).map((m) => ({ from: String((m.from && m.from.emailAddress && (m.from.emailAddress.name || m.from.emailAddress.address)) || "").slice(0, 80), subject: String(m.subject || "(no subject)").slice(0, 160), at: m.receivedDateTime || "", read: !!m.isRead, preview: String(m.bodyPreview || "").replace(/\s+/g, " ").slice(0, 140) }));
-      return reply(env, 200, { ok: true, label: b.label, messages: list, worker: WORKER_BUILD });
+      const list = ((r.json && r.json.value) || []).map((m) => ({ id: m.id, from: mailShow(m.from).slice(0, 80), to: ((m.toRecipients || []).map(mailShow).join(", ")).slice(0, 120), subject: String(m.subject || "(no subject)").slice(0, 160), at: m.receivedDateTime || "", read: !!m.isRead, attach: !!m.hasAttachments, preview: String(m.bodyPreview || "").replace(/\s+/g, " ").slice(0, 140) }));
+      return reply(env, 200, { ok: true, label: box.label, messages: list, more: list.length >= top && !q, worker: WORKER_BUILD });
+    }
+    if (url.pathname === "/api/mail/message" && !post) {
+      const msg = mailId(url.searchParams.get("msg"));
+      if (!msg) return reply(env, 400, { error: "bad request" });
+      const r = await mailGraph(env, addr, `/messages/${encodeURIComponent(msg)}?$select=subject,from,toRecipients,ccRecipients,receivedDateTime,sentDateTime,body,hasAttachments,isRead&$expand=attachments($select=id,name,size,contentType,isInline)`);
+      if (!r.ok) return reply(env, 200, { ok: false, error: mailWhy(r), worker: WORKER_BUILD });
+      const m = r.json || {};
+      const html = !!(m.body && String(m.body.contentType || "").toLowerCase() === "html");
+      return reply(env, 200, { ok: true, id: m.id, subject: String(m.subject || "(no subject)"), from: mailPart(m.from), to: (m.toRecipients || []).map(mailPart), cc: (m.ccRecipients || []).map(mailPart), at: m.receivedDateTime || m.sentDateTime || "", read: !!m.isRead, html, body: String((m.body && m.body.content) || "").slice(0, 1500000), attachments: (m.attachments || []).filter((a) => !a.isInline).map((a) => ({ id: a.id, name: String(a.name || "attachment").slice(0, 160), size: Number(a.size || 0), type: String(a.contentType || "") })), worker: WORKER_BUILD });
+    }
+    if (url.pathname === "/api/mail/attachment" && !post) {
+      const msg = mailId(url.searchParams.get("msg")), att = mailId(url.searchParams.get("att"));
+      if (!msg || !att) return reply(env, 400, { error: "bad request" });
+      const res = await graphFetch(env, `/users/${encodeURIComponent(addr)}/messages/${encodeURIComponent(msg)}/attachments/${encodeURIComponent(att)}/$value`);
+      if (!res.ok) return reply(env, 200, { ok: false, error: "The attachment could not be opened. Microsoft answered " + res.status + ".", worker: WORKER_BUILD });
+      return new Response(res.body, { status: 200, headers: { ...cors(env), "Content-Type": res.headers.get("Content-Type") || "application/octet-stream", "Cache-Control": "no-store" } });
+    }
+    if (post) {
+      const act = url.pathname.replace("/api/mail/", "");
+      const msg = mailId(body && body.msg);
+      const done = (r) => r.ok ? reply(env, 200, { ok: true, worker: WORKER_BUILD }) : reply(env, 200, { ok: false, error: mailWhy(r, true), worker: WORKER_BUILD });
+      if (act === "read" && msg) return done(await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}`, "PATCH", { isRead: !!body.read }));
+      if (act === "delete" && msg) return done(await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}/move`, "POST", { destinationId: "deleteditems" }));
+      if (act === "reply" && msg) return done(await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}/reply`, "POST", { comment: String(body.comment || "").slice(0, 200000) }));
+      if (act === "forward" && msg) {
+        const to = mailRecipients(body.to);
+        if (!to.length) return reply(env, 200, { ok: false, error: "Add at least one valid email address to forward to.", worker: WORKER_BUILD });
+        return done(await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}/forward`, "POST", { comment: String(body.comment || "").slice(0, 200000), toRecipients: to }));
+      }
+      if (act === "send") {
+        const to = mailRecipients(body && body.to), cc = mailRecipients(body && body.cc);
+        if (!to.length) return reply(env, 200, { ok: false, error: "Add at least one valid email address to send to.", worker: WORKER_BUILD });
+        return done(await mailDo(env, addr, "/sendMail", "POST", { message: { subject: String(body.subject || "").slice(0, 250), body: { contentType: "Text", content: String(body.text || "").slice(0, 200000) }, toRecipients: to, ccRecipients: cc }, saveToSentItems: true }));
+      }
     }
   } catch (e) { return reply(env, 200, { ok: false, error: String(e && e.message || e).slice(0, 160), worker: WORKER_BUILD }); }
   return reply(env, 404, { error: "not found" });
@@ -6592,5 +6685,5 @@ export default {
   }
 };
 
-globalThis.w197_BOTTOM = "Reservoir-Worker-2026.10.28-w197";
-// Reservoir-Worker-2026.10.28-w197
+globalThis.w203_BOTTOM = "Reservoir-Worker-2026.11.02-w203";
+// Reservoir-Worker-2026.11.02-w203
