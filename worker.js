@@ -1,5 +1,5 @@
-// Reservoir-Worker-2026.11.03-w210
-globalThis.w210_TOP = "Reservoir-Worker-2026.11.03-w210";
+// Reservoir-Worker-2026.11.03-w211
+globalThis.w210_TOP = "Reservoir-Worker-2026.11.03-w211";
 // Reservoir API Worker. Validates the Microsoft Entra token on every request, then reads and writes the D1 fleet table.
 const FIELDS = ["name","rego","expiry","serial","make","model","colour","year","body","vin","engine","compliance","fuel","driver","garaged","finance","directDebit","contract","lastService","nextService","serviceProvider","servicePhone","serviceEmail","serviceBooking","financeExpiry","financeDocs"];
 
@@ -225,7 +225,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
   await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
 }
 
-const WORKER_BUILD = "Reservoir-Worker-2026.11.03-w210";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.03-w211";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.izzyandloki.workers.dev/api/xero/callback";
@@ -5805,8 +5805,8 @@ export default {
         if (url.pathname === "/api/passkey/challenge" && request.method === "POST") {
           const kind = body.kind === "create" ? "create" : "get";
           const challenge = b64enc(crypto.getRandomValues(new Uint8Array(32)));
-          await env.DB.prepare("DELETE FROM passkey_challenges WHERE exp < ?").bind(Date.now()).run();
-          await env.DB.prepare("INSERT INTO passkey_challenges (challenge, email, kind, exp) VALUES (?, ?, ?, ?)").bind(challenge, email, kind, Date.now() + 5 * 60 * 1000).run();
+          if (Math.random() < 0.1) await env.DB.prepare("DELETE FROM passkey_challenges WHERE exp < ?").bind(Date.now()).run();
+          await env.DB.prepare("INSERT INTO passkey_challenges (challenge, email, kind, exp) VALUES (?, ?, ?, ?)").bind(challenge, email, kind, Date.now() + 16 * 60 * 1000).run();
           return reply(env, 200, { challenge, rpId: passkeyRpId(env) });
         }
         if (url.pathname === "/api/passkey/register" && request.method === "POST") {
@@ -6841,5 +6841,5 @@ export default {
   }
 };
 
-globalThis.w210_BOTTOM = "Reservoir-Worker-2026.11.03-w210";
-// Reservoir-Worker-2026.11.03-w210
+globalThis.w210_BOTTOM = "Reservoir-Worker-2026.11.03-w211";
+// Reservoir-Worker-2026.11.03-w211
