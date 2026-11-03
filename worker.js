@@ -1,5 +1,5 @@
-// Reservoir-Worker-2026.11.03-w204
-globalThis.w204_TOP = "Reservoir-Worker-2026.11.03-w204";
+// Reservoir-Worker-2026.11.03-w205
+globalThis.w205_TOP = "Reservoir-Worker-2026.11.03-w205";
 // Reservoir API Worker. Validates the Microsoft Entra token on every request, then reads and writes the D1 fleet table.
 const FIELDS = ["name","rego","expiry","serial","make","model","colour","year","body","vin","engine","compliance","fuel","driver","garaged","finance","directDebit","contract","lastService","nextService","serviceProvider","servicePhone","serviceEmail","serviceBooking","financeExpiry","financeDocs"];
 
@@ -225,7 +225,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
   await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
 }
 
-const WORKER_BUILD = "Reservoir-Worker-2026.11.03-w204";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.03-w205";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.izzyandloki.workers.dev/api/xero/callback";
@@ -4217,6 +4217,7 @@ async function notify(env, n) {
 const noticeOut = (r) => { let data = null; try { data = r.data ? JSON.parse(r.data) : null; } catch (e) { data = null; } return { id: r.id, kind: r.kind || "info", title: r.title || "", body: r.body || "", todo: r.todo === 1, link: r.link || "", data, by: r.by_name || "", createdAt: r.created_at || "", read: !!r.read_at, done: !!r.done_at, doneBy: r.done_by || "", office: r.to_email === "@office" }; };
 // At 10am on a weekday, if any Daily Operations task is still not ticked, tell the directors (T1). One alert a day. The cron runs every 30 minutes, so a run between 10:00 and 12:00 sends it if it has not gone yet.
 async function dailyOpsAlert(env) {
+  return; // The Daily Operations alert is switched off for now. Remove this line to turn it back on.
   const parts = new Intl.DateTimeFormat("en-AU", { timeZone: "Australia/Melbourne", weekday: "short", hour: "2-digit", minute: "2-digit", hour12: false }).formatToParts(new Date());
   const get = (t) => (parts.find((x) => x.type === t) || {}).value || "";
   const mins = (Number(get("hour")) % 24) * 60 + Number(get("minute"));
@@ -6736,5 +6737,5 @@ export default {
   }
 };
 
-globalThis.w204_BOTTOM = "Reservoir-Worker-2026.11.03-w204";
-// Reservoir-Worker-2026.11.03-w204
+globalThis.w205_BOTTOM = "Reservoir-Worker-2026.11.03-w205";
+// Reservoir-Worker-2026.11.03-w205
