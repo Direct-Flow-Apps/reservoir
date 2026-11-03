@@ -1,5 +1,5 @@
-// Reservoir-Worker-2026.11.03-w208
-globalThis.w208_TOP = "Reservoir-Worker-2026.11.03-w208";
+// Reservoir-Worker-2026.11.03-w209
+globalThis.w209_TOP = "Reservoir-Worker-2026.11.03-w209";
 // Reservoir API Worker. Validates the Microsoft Entra token on every request, then reads and writes the D1 fleet table.
 const FIELDS = ["name","rego","expiry","serial","make","model","colour","year","body","vin","engine","compliance","fuel","driver","garaged","finance","directDebit","contract","lastService","nextService","serviceProvider","servicePhone","serviceEmail","serviceBooking","financeExpiry","financeDocs"];
 
@@ -225,7 +225,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
   await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
 }
 
-const WORKER_BUILD = "Reservoir-Worker-2026.11.03-w208";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.03-w209";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.izzyandloki.workers.dev/api/xero/callback";
@@ -3468,9 +3468,10 @@ async function arofloRoutes(request, env, user, url) {
       // Escape Homes report. Every Escape Homes project from the last six months, with the full site address and the BPC Certificate Number.
       if (mode === "eh-detail" || mode === "eh-report") {
         const cut = new Date(); cut.setMonth(cut.getMonth() - 6);
-        const cutoff = cut.toISOString().slice(0, 10);
+        const ehKey0 = String(url.searchParams.get("client") || "escape").toLowerCase().replace(/[^a-z]/g, "");
+        const cutoff = ehKey0 === "wyndhamvale" ? "2026-01-01" : cut.toISOString().slice(0, 10);
         const ehKey = String(url.searchParams.get("client") || "escape").toLowerCase().replace(/[^a-z]/g, "") || "escape";
-        const ehMatch = ehKey === "levonix" ? "(LOWER(client) LIKE '%levon%' OR LOWER(client) LIKE '%lavon%')" : "LOWER(client) LIKE '%escape%'";
+        const ehMatch = ehKey === "levonix" ? "(LOWER(client) LIKE '%levon%' OR LOWER(client) LIKE '%lavon%')" : ehKey === "arvee" ? "LOWER(client) LIKE '%arvee%'" : ehKey === "wyndhamvale" ? "(LOWER(suburb) LIKE '%wyndham vale%' OR LOWER(address) LIKE '%wyndham vale%')" : "LOWER(client) LIKE '%escape%'";
         const scope = ehMatch + " AND (created IS NULL OR created >= ?)";
         if (mode === "eh-detail") {
           const rows = (await env.DB.prepare(`SELECT id FROM aroflo_projects WHERE ${scope} AND site IS NULL LIMIT 18`).bind(cutoff).all()).results || [];
@@ -6731,5 +6732,5 @@ export default {
   }
 };
 
-globalThis.w208_BOTTOM = "Reservoir-Worker-2026.11.03-w208";
-// Reservoir-Worker-2026.11.03-w208
+globalThis.w209_BOTTOM = "Reservoir-Worker-2026.11.03-w209";
+// Reservoir-Worker-2026.11.03-w209
