@@ -2,6 +2,7 @@
   "name": "reservoir-api",
   "main": "worker.js",
   "compatibility_date": "2026-10-08",
+  "placement": { "mode": "smart" },
   "keep_vars": true,
   "d1_databases": [
     { "binding": "DB", "database_name": "reservoir", "database_id": "9aef3882-4dcf-480e-9ff9-2c379abdcccb" }

@@ -1,5 +1,5 @@
-// Reservoir-Worker-2026.11.03-w211
-globalThis.w210_TOP = "Reservoir-Worker-2026.11.03-w211";
+// Reservoir-Worker-2026.11.03-w212
+globalThis.w210_TOP = "Reservoir-Worker-2026.11.03-w212";
 // Reservoir API Worker. Validates the Microsoft Entra token on every request, then reads and writes the D1 fleet table.
 const FIELDS = ["name","rego","expiry","serial","make","model","colour","year","body","vin","engine","compliance","fuel","driver","garaged","finance","directDebit","contract","lastService","nextService","serviceProvider","servicePhone","serviceEmail","serviceBooking","financeExpiry","financeDocs"];
 
@@ -14,6 +14,67 @@ async function getKeys(env) {
   if (!res.ok) throw new Error("jwks");
   jwksCache = { at: Date.now(), keys: (await res.json()).keys };
   return jwksCache.keys;
+}
+
+
+// Speed: setup statements (CREATE TABLE/INDEX IF NOT EXISTS, ALTER TABLE) and one time seeds are remembered in D1 per Worker build, so a cold Worker start reads one list instead of running dozens of setup calls.
+let schemaSet = null;
+let schemaLoading = null;
+const SCHEMA_DDL = /^\s*(CREATE\s+(UNIQUE\s+)?(TABLE|INDEX)\s+IF\s+NOT\s+EXISTS|ALTER\s+TABLE)/i;
+function schemaHash(str) {
+  let a = 0x811c9dc5, b = 5381;
+  for (let i = 0; i < str.length; i++) { const c = str.charCodeAt(i); a = Math.imul(a ^ c, 16777619) >>> 0; b = (Math.imul(b, 33) + c) >>> 0; }
+  return a.toString(36) + b.toString(36) + str.length.toString(36);
+}
+async function schemaLoad(rawEnv) {
+  if (schemaSet) return schemaSet;
+  if (!schemaLoading) schemaLoading = (async () => {
+    try {
+      let rows;
+      try { rows = ((await rawEnv.DB.prepare("SELECT h FROM schema_done WHERE b = ?").bind(WORKER_BUILD).all()).results) || []; }
+      catch (e) {
+        await rawEnv.DB.prepare("CREATE TABLE IF NOT EXISTS schema_done (h TEXT NOT NULL, b TEXT NOT NULL, PRIMARY KEY (h, b))").run();
+        rows = [];
+      }
+      schemaSet = new Set(rows.map((r) => r.h));
+      try { await rawEnv.DB.prepare("DELETE FROM schema_done WHERE b <> ?").bind(WORKER_BUILD).run(); } catch (e) { /* tidy up only */ }
+    } catch (e) { schemaSet = new Set(); schemaSet.broken = true; }
+    return schemaSet;
+  })();
+  return schemaLoading;
+}
+async function schemaMark(rawEnv, h) {
+  if (!schemaSet || schemaSet.broken) return;
+  schemaSet.add(h);
+  try { await rawEnv.DB.prepare("INSERT OR IGNORE INTO schema_done (h, b) VALUES (?, ?)").bind(h, WORKER_BUILD).run(); } catch (e) { /* will just run again next start */ }
+}
+function schemaDb(rawEnv) {
+  const db = rawEnv.DB;
+  const noop = { bind() { return this; }, run: async () => ({ success: true, results: [] }), all: async () => ({ results: [] }), first: async () => null, raw: async () => [] };
+  return {
+    prepare(sql) {
+      if (!schemaSet || !SCHEMA_DDL.test(sql)) return db.prepare(sql);
+      const h = schemaHash(sql);
+      if (schemaSet.has(h)) return noop;
+      const st = db.prepare(sql);
+      return {
+        bind() { return this; },
+        async run() {
+          try { const r = await st.run(); await schemaMark(rawEnv, h); return r; }
+          catch (e) { if (/duplicate column|already exists/i.test(String(e && e.message || e))) await schemaMark(rawEnv, h); throw e; }
+        },
+        all: () => st.all(), first: () => st.first(), raw: () => st.raw()
+      };
+    },
+    batch: (x) => db.batch(x),
+    exec: (q) => db.exec(q)
+  };
+}
+// Runs fn once per Worker build (the seeds and moves that only need doing after a deploy).
+async function schemaOnce(env, name, fn) {
+  if (schemaSet && !schemaSet.broken && schemaSet.has("once:" + name)) return;
+  await fn();
+  await schemaMark(env, "once:" + name);
 }
 
 async function verifyToken(request, env) {
@@ -225,7 +286,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
   await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
 }
 
-const WORKER_BUILD = "Reservoir-Worker-2026.11.03-w211";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.03-w212";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.izzyandloki.workers.dev/api/xero/callback";
@@ -292,12 +353,14 @@ async function reservoirTables(env) {
   }
   await dfpTables(env);
   // Uniform sizes that were in the app's staff list are put in the database so staff see what they saw before. Only a size that has never been saved (NULL) is filled. A size someone has saved or deliberately cleared is never touched.
+  await schemaOnce(env, "profile_seed_sizes", async () => {
   for (const [name, polo, jumper, jacket] of PROFILE_SEED_SIZES) {
     const key = profileKey(name);
     await env.DB.prepare("INSERT OR IGNORE INTO dfp_reservoir (person_key, name, source, updated_by) VALUES (?, ?, 'initial sizes', 'initial sizes')").bind(key, name).run();
     await env.DB.prepare("UPDATE dfp_reservoir SET polo = COALESCE(polo, ?), jumper = COALESCE(jumper, ?), jacket = COALESCE(jacket, ?) WHERE person_key = ?").bind(polo, jumper, jacket, key).run();
   }
-  await moveOwnFields(env);
+  });
+  await schemaOnce(env, "move_own_fields", () => moveOwnFields(env));
   reservoirReady = true;
 }
 // One time: preferred name, time of birth and the emergency contact move from dfp_xero to dfp_reservoir. Only blanks in dfp_reservoir are filled. Every value is checked after it is copied, and the old dfp_xero columns are dropped only when every one checked out. If anything did not check out nothing is dropped and the whole step runs again on the next start.
@@ -2268,6 +2331,7 @@ async function phonesNormalise(env) {
   if (phonesChecked) return;
   phonesChecked = true;
   await reservoirTables(env);
+  if (schemaSet && !schemaSet.broken && schemaSet.has("once:phones")) return;
   let changed = 0;
   for (const [tbl, col, idCol] of [["dfp_xero", "mobile", "email"], ["dfp_reservoir", "em_mobile", "person_key"]]) {
     const rows = ((await env.DB.prepare(`SELECT ${idCol} AS id, ${col} AS v FROM ${tbl} WHERE ${col} IS NOT NULL AND ${col} <> ''`).all()).results) || [];
@@ -2284,6 +2348,7 @@ async function phonesNormalise(env) {
     }
   } catch (e) { console.log("phones: fleet not checked", String(e && e.message || e).slice(0, 120)); }
   if (changed) console.log("phones moved to the standard style:", changed);
+  await schemaMark(env, "once:phones");
 }
 // ---- Leave. The app reads only this table (xero_leave). Xero is written to only when the office approves a request or applies a change. ----
 // Balances come from xero_payroll.leave_balances. History is brought in from Xero by the leave sync (leaveSync) and by nothing else.
@@ -2911,9 +2976,14 @@ function tempAccessLive(row) {
   const hour = Number(g("hour")) % 24;
   return day < row.until || (day === row.until && hour < 16);
 }
+const tempAccessCache = new Map();
 async function tempAccessFor(env, email) {
   try {
-    const row = await env.DB.prepare("SELECT tier, until FROM temp_access WHERE email = ?").bind(String(email || "").toLowerCase()).first();
+    const key = String(email || "").toLowerCase();
+    const hit = tempAccessCache.get(key);
+    if (hit && Date.now() - hit.at < 60000) return tempAccessLive(hit.row) ? hit.row : null;
+    const row = await env.DB.prepare("SELECT tier, until FROM temp_access WHERE email = ?").bind(key).first();
+    tempAccessCache.set(key, { at: Date.now(), row });
     return tempAccessLive(row) ? row : null;
   } catch (e) { return null; }
 }
@@ -5027,6 +5097,8 @@ export default {
     }
     let user;
     try { user = await verifyToken(request, env); } catch (e) { return reply(env, 401, { error: "unauthorised" }); }
+    await schemaLoad(rawEnv);
+    env = Object.create(rawEnv, { DB: { value: schemaDb(rawEnv) } });
 
     const url = new URL(request.url);
 
@@ -5050,7 +5122,7 @@ export default {
     }
 
     // From here on every call carries the caller's access level, which is what the Xero gate reads. A level that is missing or unknown is treated as closed.
-    env = Object.create(rawEnv, { __callerTier: { value: String(user.tier || "T3") } });
+    env = Object.create(env, { __callerTier: { value: String(user.tier || "T3") } });
 
     try { await phonesNormalise(env); } catch (e) { console.log("phones normalise failed", String(e && e.message || e).slice(0, 160)); }
     const leaveReply = await leaveRoutes(request, env, user, url);
@@ -6841,5 +6913,5 @@ export default {
   }
 };
 
-globalThis.w210_BOTTOM = "Reservoir-Worker-2026.11.03-w211";
-// Reservoir-Worker-2026.11.03-w211
+globalThis.w210_BOTTOM = "Reservoir-Worker-2026.11.03-w212";
+// Reservoir-Worker-2026.11.03-w212
