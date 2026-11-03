@@ -1,5 +1,5 @@
-// Reservoir-Worker-2026.11.03-w209
-globalThis.w209_TOP = "Reservoir-Worker-2026.11.03-w209";
+// Reservoir-Worker-2026.11.03-w210
+globalThis.w210_TOP = "Reservoir-Worker-2026.11.03-w210";
 // Reservoir API Worker. Validates the Microsoft Entra token on every request, then reads and writes the D1 fleet table.
 const FIELDS = ["name","rego","expiry","serial","make","model","colour","year","body","vin","engine","compliance","fuel","driver","garaged","finance","directDebit","contract","lastService","nextService","serviceProvider","servicePhone","serviceEmail","serviceBooking","financeExpiry","financeDocs"];
 
@@ -225,7 +225,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
   await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
 }
 
-const WORKER_BUILD = "Reservoir-Worker-2026.11.03-w209";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.03-w210";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.izzyandloki.workers.dev/api/xero/callback";
@@ -4846,6 +4846,73 @@ async function payrollSweep(env) {
   try { await timesheetSync(env); } catch (e) { /* banking is retried by the Pay Run Filed button */ }
 }
 
+// ---- Device unlock (passkeys). A person turns it on once on their own phone or computer. The device keeps the private key in its secure chip and Reservoir keeps only the public key. Unlocking is checked here: the server issues a one time challenge, the device signs it after face, fingerprint or passcode, and the signature is checked against the saved public key. ----
+let passkeyTableMade = false;
+async function passkeyTables(env) {
+  if (passkeyTableMade) return;
+  await env.DB.prepare("CREATE TABLE IF NOT EXISTS passkeys (cred_id TEXT PRIMARY KEY, email TEXT NOT NULL, pub TEXT NOT NULL, alg INTEGER NOT NULL, created_at TEXT DEFAULT (datetime('now')), last_used TEXT)").run();
+  await env.DB.prepare("CREATE TABLE IF NOT EXISTS passkey_challenges (challenge TEXT PRIMARY KEY, email TEXT, kind TEXT, exp INTEGER)").run();
+  passkeyTableMade = true;
+}
+const passkeyOrigins = (env) => String(env.ALLOWED_ORIGIN || "").split(",").map((x) => x.trim()).filter(Boolean);
+const passkeyRpId = (env) => { try { return new URL(passkeyOrigins(env)[0]).hostname; } catch (e) { return ""; } };
+function passkeyDerToRaw(der) {
+  let i = 2;
+  if (der[1] & 0x80) i = 2 + (der[1] & 0x7f);
+  const rl = der[i + 1];
+  const r = der.slice(i + 2, i + 2 + rl);
+  i = i + 2 + rl;
+  const sl = der[i + 1];
+  const s = der.slice(i + 2, i + 2 + sl);
+  const fix = (x) => { while (x.length > 32 && x[0] === 0) x = x.slice(1); const o = new Uint8Array(32); o.set(x, 32 - x.length); return o; };
+  const out = new Uint8Array(64);
+  out.set(fix(r), 0);
+  out.set(fix(s), 32);
+  return out;
+}
+// Reads the client data, checks its type and origin, and uses up the one time challenge it carries.
+async function passkeyClientData(env, email, clientDataJSON, kind) {
+  const bytes = b64u(String(clientDataJSON || ""));
+  let cd;
+  try { cd = JSON.parse(new TextDecoder().decode(bytes)); } catch (e) { return { error: "The unlock answer could not be read." }; }
+  if (cd.type !== (kind === "create" ? "webauthn.create" : "webauthn.get")) return { error: "Wrong kind of unlock answer." };
+  if (!passkeyOrigins(env).includes(cd.origin)) return { error: "The unlock came from the wrong address." };
+  const row = await env.DB.prepare("SELECT challenge FROM passkey_challenges WHERE challenge = ? AND email = ? AND kind = ? AND exp > ?").bind(String(cd.challenge || ""), email, kind, Date.now()).first();
+  if (!row) return { error: "The unlock request expired. Try again." };
+  await env.DB.prepare("DELETE FROM passkey_challenges WHERE challenge = ?").bind(row.challenge).run();
+  return { bytes };
+}
+async function passkeyVerify(env, email, body) {
+  await passkeyTables(env);
+  const cdr = await passkeyClientData(env, email, body.clientDataJSON, "get");
+  if (cdr.error) return { ok: false, error: cdr.error };
+  const key = await env.DB.prepare("SELECT pub, alg FROM passkeys WHERE cred_id = ? AND email = ?").bind(String(body.credentialId || ""), email).first();
+  if (!key) return { ok: false, error: "This device is not set up for unlock." };
+  const authData = b64u(String(body.authenticatorData || ""));
+  const rpHash = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(passkeyRpId(env))));
+  if (authData.length < 37 || rpHash.some((b, i) => b !== authData[i])) return { ok: false, error: "The unlock was for a different site." };
+  if (!(authData[32] & 1) || !(authData[32] & 4)) return { ok: false, error: "Face, fingerprint or passcode was not confirmed." };
+  const cdHash = new Uint8Array(await crypto.subtle.digest("SHA-256", cdr.bytes));
+  const signed = new Uint8Array(authData.length + cdHash.length);
+  signed.set(authData, 0);
+  signed.set(cdHash, authData.length);
+  const sig = b64u(String(body.signature || ""));
+  const pub = b64u(key.pub);
+  let good = false;
+  try {
+    if (key.alg === -7) {
+      const k = await crypto.subtle.importKey("spki", pub, { name: "ECDSA", namedCurve: "P-256" }, false, ["verify"]);
+      good = await crypto.subtle.verify({ name: "ECDSA", hash: "SHA-256" }, k, passkeyDerToRaw(sig), signed);
+    } else if (key.alg === -257) {
+      const k = await crypto.subtle.importKey("spki", pub, { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, false, ["verify"]);
+      good = await crypto.subtle.verify("RSASSA-PKCS1-v1_5", k, sig, signed);
+    }
+  } catch (e) { good = false; }
+  if (!good) return { ok: false, error: "The unlock could not be confirmed." };
+  await env.DB.prepare("UPDATE passkeys SET last_used = datetime('now') WHERE cred_id = ?").bind(String(body.credentialId)).run();
+  return { ok: true };
+}
+
 // One off test: Saturday 24 Oct 2026, first half hour tick at or after 3:30pm Melbourne sends Andrey a timesheet reminder push. Sends once only.
 async function pushOneOffAndrey(env) {
   const now = tsMelbourne(new Date());
@@ -5722,6 +5789,48 @@ export default {
       const per = ((await env.DB.prepare("SELECT name, COUNT(*) c, MIN(payment_date) a, MAX(payment_date) b FROM payslip_store GROUP BY employee_id ORDER BY name").all()).results) || [];
       const waiting = ((await env.DB.prepare("SELECT r.payment_date, r.built_at, (SELECT COUNT(*) FROM payslip_store s WHERE s.run_id = r.run_id) AS slips FROM payslip_runs r WHERE r.filed = 0 ORDER BY r.payment_date DESC").all()).results) || [];
       return reply(env, 200, { worker: WORKER_BUILD, unfiled: waiting.map((x) => x.payment_date), unfiledRuns: waiting.map((x) => ({ paymentDate: x.payment_date, builtAt: x.built_at, slips: x.slips })), from: PAYSLIP_FROM, runsStored: runs.c, firstPaid: runs.a, lastPaid: runs.b, slipsStored: slips.c, slipsWithGaps: slips.m, slipsOnCurrentRules: slips.r, people: per.map((x) => ({ name: x.name, slips: x.c, first: x.a, last: x.b })) });
+    }
+    if (url.pathname.startsWith("/api/passkey/")) {
+      // Device unlock. Any signed in person, only for their own email.
+      try {
+        const email = String(user.email || "").trim().toLowerCase();
+        if (!email) return reply(env, 403, { error: "No email on your sign in" });
+        await passkeyTables(env);
+        if (url.pathname === "/api/passkey/status" && request.method === "GET") {
+          const n = await env.DB.prepare("SELECT COUNT(*) AS n FROM passkeys WHERE email = ?").bind(email).first();
+          return reply(env, 200, { enabled: !!(n && n.n), rpId: passkeyRpId(env) });
+        }
+        let body = {};
+        try { body = await request.json(); } catch (e) { body = {}; }
+        if (url.pathname === "/api/passkey/challenge" && request.method === "POST") {
+          const kind = body.kind === "create" ? "create" : "get";
+          const challenge = b64enc(crypto.getRandomValues(new Uint8Array(32)));
+          await env.DB.prepare("DELETE FROM passkey_challenges WHERE exp < ?").bind(Date.now()).run();
+          await env.DB.prepare("INSERT INTO passkey_challenges (challenge, email, kind, exp) VALUES (?, ?, ?, ?)").bind(challenge, email, kind, Date.now() + 5 * 60 * 1000).run();
+          return reply(env, 200, { challenge, rpId: passkeyRpId(env) });
+        }
+        if (url.pathname === "/api/passkey/register" && request.method === "POST") {
+          const cdr = await passkeyClientData(env, email, body.clientDataJSON, "create");
+          if (cdr.error) return reply(env, 400, { error: cdr.error });
+          const alg = Number(body.alg);
+          if (alg !== -7 && alg !== -257) return reply(env, 400, { error: "This device uses a kind of unlock Reservoir does not support." });
+          if (!body.credentialId || !body.publicKey) return reply(env, 400, { error: "The unlock details were incomplete." });
+          await env.DB.prepare("INSERT OR REPLACE INTO passkeys (cred_id, email, pub, alg) VALUES (?, ?, ?, ?)").bind(String(body.credentialId), email, String(body.publicKey), alg).run();
+          return reply(env, 200, { ok: true });
+        }
+        if (url.pathname === "/api/passkey/verify" && request.method === "POST") {
+          const r = await passkeyVerify(env, email, body);
+          return reply(env, r.ok ? 200 : 401, r.ok ? { ok: true } : { error: r.error });
+        }
+        if (url.pathname === "/api/passkey/remove" && request.method === "POST") {
+          await env.DB.prepare("DELETE FROM passkeys WHERE email = ?").bind(email).run();
+          return reply(env, 200, { ok: true });
+        }
+        return reply(env, 404, { error: "not found" });
+      } catch (e) {
+        console.log("passkey error", String(e && e.message || e));
+        return reply(env, 502, { error: String(e && e.message || e).slice(0, 200) });
+      }
     }
     if (url.pathname === "/api/xero/pay" && request.method === "GET") {
       // The signed in person's own pay details, read from xero_payroll (the snapshot the one time fill and the Saturday sweep keep). Nothing is read from Xero. Any tier, only their own record.
@@ -6732,5 +6841,5 @@ export default {
   }
 };
 
-globalThis.w209_BOTTOM = "Reservoir-Worker-2026.11.03-w209";
-// Reservoir-Worker-2026.11.03-w209
+globalThis.w210_BOTTOM = "Reservoir-Worker-2026.11.03-w210";
+// Reservoir-Worker-2026.11.03-w210
