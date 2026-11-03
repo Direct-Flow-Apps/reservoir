@@ -1,5 +1,5 @@
-// Reservoir-Worker-2026.11.03-w205
-globalThis.w205_TOP = "Reservoir-Worker-2026.11.03-w205";
+// Reservoir-Worker-2026.11.03-w206
+globalThis.w206_TOP = "Reservoir-Worker-2026.11.03-w206";
 // Reservoir API Worker. Validates the Microsoft Entra token on every request, then reads and writes the D1 fleet table.
 const FIELDS = ["name","rego","expiry","serial","make","model","colour","year","body","vin","engine","compliance","fuel","driver","garaged","finance","directDebit","contract","lastService","nextService","serviceProvider","servicePhone","serviceEmail","serviceBooking","financeExpiry","financeDocs"];
 
@@ -225,7 +225,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
   await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
 }
 
-const WORKER_BUILD = "Reservoir-Worker-2026.11.03-w205";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.03-w206";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.izzyandloki.workers.dev/api/xero/callback";
@@ -4795,7 +4795,7 @@ async function leaveRoutes(request, env, user, url) {
 
 // ---- Payroll sweeps. Xero is the source for payroll, so Reservoir keeps checking it and does what the Payroll screen buttons do, so nobody has to remember to tap them. They run from the half hourly cron and check the Melbourne clock themselves, so the first run in a window is the first half hour mark at or after its start time. ----
 // Tuesday from 10:00 to 14:00: looks for a posted pay run and, if one is there, stores its slips exactly as Post Pay Run does (without replacing a run already stored). Stops once a run waiting to be filed exists. If nothing is posted by 14:00, sends one notice to Tayler.
-// Thursday from 7:45: files the pay run that is waiting, exactly as File Pay Run does (marks it filed, moves its slips from Next Pay to Paid, banks the processed timesheets). If Tuesday was missed it first looks for a posted run in Xero. Only a run with a payment date of today or earlier is filed. Stops once a run paying today is filed.
+// Thursday from 7:45: only checks. It never files a pay run; the director files by hand.
 // The last thing each sweep did is kept in app_settings under sweep.payroll_last, so it can be checked.
 async function payrollSweepNote(env, day, text) {
   try {
@@ -4844,11 +4844,8 @@ async function payrollSweep(env) {
   }
   if (!run) { await payrollSweepNote(env, now.date, "Thursday check: no posted pay run to file"); return; }
   if (String(run.payment_date) > now.date) { await payrollSweepNote(env, now.date, `Thursday check: waiting run pays ${run.payment_date}, not filed yet`); return; }
-  await env.DB.prepare("UPDATE payslip_runs SET filed = 1, filed_at = datetime('now'), filed_by = 'Payroll sweep' WHERE run_id = ? AND filed = 0").bind(run.run_id).run();
-  // The same one pull the button makes after filing: processed timesheets are banked as permanent history. A failure here does not undo the filing.
-  let ts = "timesheets not banked";
-  try { const r = await timesheetSync(env); ts = r && r.ok ? `timesheets banked: ${r.saved || 0}` : `timesheets failed: ${String((r && r.error) || "").slice(0, 120)}`; } catch (e) { ts = `timesheets failed: ${String(e && e.message || e).slice(0, 120)}`; }
-  await payrollSweepNote(env, now.date, `Filed pay run paid ${run.payment_date}. ${ts}`);
+  // The sweep never marks a run filed. Filing is the director's job, done by hand in Xero and with Pay Run Filed in Reservoir.
+  await payrollSweepNote(env, now.date, `Thursday check: pay run paying ${run.payment_date} is waiting to be filed by the director. Nothing was filed by the sweep.`);
 }
 
 // One off test: Saturday 24 Oct 2026, first half hour tick at or after 3:30pm Melbourne sends Andrey a timesheet reminder push. Sends once only.
@@ -6737,5 +6734,5 @@ export default {
   }
 };
 
-globalThis.w205_BOTTOM = "Reservoir-Worker-2026.11.03-w205";
-// Reservoir-Worker-2026.11.03-w205
+globalThis.w206_BOTTOM = "Reservoir-Worker-2026.11.03-w206";
+// Reservoir-Worker-2026.11.03-w206
