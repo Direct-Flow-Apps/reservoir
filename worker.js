@@ -286,7 +286,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
   await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
 }
 
-const WORKER_BUILD = "Reservoir-Worker-2026.11.05-w214";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.05-w215";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.izzyandloki.workers.dev/api/xero/callback";
@@ -4909,6 +4909,11 @@ async function payrollSweep(env) {
       const pr = ((await r.json()).PayRuns || [])[0] || {};
       const seen = (o, d) => { if (d > 6 || !o || typeof o !== "object") return false; for (const [k, v] of Object.entries(o)) { if (k !== "PayRunStatus" && typeof v === "string" && /^(stp\s*)?(filed|lodged|submitted)$/i.test(v.trim())) return true; if (typeof v === "boolean" && v && /(stp|filed|lodged)/i.test(k)) return true; if (v && typeof v === "object" && seen(v, d + 1)) return true; } return false; };
       xeroFiled = seen(pr, 0);
+      if (!xeroFiled) {
+        // Look in the pay run list as well, in case the filing status only shows there.
+        const lr = await xeroFetch(env, "payroll.xro/1.0/PayRuns");
+        if (lr.ok) { const hit = ((await lr.json()).PayRuns || []).find((x) => x && x.PayRunID === run.run_id); xeroFiled = !!hit && seen(hit, 0); }
+      }
     }
   } catch (e) { xeroFiled = false; }
   if (!xeroFiled) {
@@ -5077,7 +5082,7 @@ export default {
     ctx.waitUntil(pushOneOffAndrey(env).catch((e) => console.log("one off failed", String(e && e.message || e))));
     ctx.waitUntil(mailWatch(env).catch((e) => console.log("mail watch failed", String(e && e.message || e))));
     ctx.waitUntil(payrollSweep(env).catch((e) => console.log("payroll sweep failed", String(e && e.message || e))));
-    if (event && event.cron === "*/30 * * * *") return;
+    if (event && (event.cron === "*/30 * * * *" || event.cron === "*/15 * * * *")) return;
     ctx.waitUntil(leaveSync(env).catch((e) => console.log("leave sync failed", String(e && e.message || e))));
   },
   async fetch(request, rawEnv) {
