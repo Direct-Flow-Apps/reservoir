@@ -286,7 +286,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
   await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
 }
 
-const WORKER_BUILD = "Reservoir-Worker-2026.11.03-w212";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.05-w213";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.izzyandloki.workers.dev/api/xero/callback";
@@ -4911,7 +4911,16 @@ async function payrollSweep(env) {
       xeroFiled = seen(pr, 0);
     }
   } catch (e) { xeroFiled = false; }
-  if (!xeroFiled) return;
+  if (!xeroFiled) {
+    // Keep what Xero sent back for this run (without the payslips), so the field that says Filed can be found.
+    try {
+      const rr = await xeroFetch(env, `payroll.xro/1.0/PayRuns/${run.run_id}`);
+      const p0 = ((await rr.json()).PayRuns || [])[0] || {};
+      const { Payslips, ...rest } = p0;
+      await payrollSweepNote(env, now.date, `Thursday check, Xero says: ${JSON.stringify(rest)}`);
+    } catch (e) { /* diagnostic only */ }
+    return;
+  }
   await env.DB.prepare("UPDATE payslip_runs SET filed = 1, filed_at = datetime('now'), filed_by = 'Xero' WHERE run_id = ? AND filed = 0").bind(run.run_id).run();
   try { await timesheetSync(env); } catch (e) { /* banking is retried by the Pay Run Filed button */ }
 }
@@ -5860,7 +5869,8 @@ export default {
       const slips = await env.DB.prepare("SELECT COUNT(*) c, COALESCE(SUM(missing),0) m, COALESCE(SUM(CASE WHEN rules >= ? THEN 1 ELSE 0 END),0) r FROM payslip_store").bind(PAYSLIP_RULES).first();
       const per = ((await env.DB.prepare("SELECT name, COUNT(*) c, MIN(payment_date) a, MAX(payment_date) b FROM payslip_store GROUP BY employee_id ORDER BY name").all()).results) || [];
       const waiting = ((await env.DB.prepare("SELECT r.payment_date, r.built_at, (SELECT COUNT(*) FROM payslip_store s WHERE s.run_id = r.run_id) AS slips FROM payslip_runs r WHERE r.filed = 0 ORDER BY r.payment_date DESC").all()).results) || [];
-      return reply(env, 200, { worker: WORKER_BUILD, unfiled: waiting.map((x) => x.payment_date), unfiledRuns: waiting.map((x) => ({ paymentDate: x.payment_date, builtAt: x.built_at, slips: x.slips })), from: PAYSLIP_FROM, runsStored: runs.c, firstPaid: runs.a, lastPaid: runs.b, slipsStored: slips.c, slipsWithGaps: slips.m, slipsOnCurrentRules: slips.r, people: per.map((x) => ({ name: x.name, slips: x.c, first: x.a, last: x.b })) });
+      const sweepNote = await env.DB.prepare("SELECT value, detail, at FROM app_settings WHERE key = 'sweep.payroll_last'").first().catch(() => null);
+      return reply(env, 200, { sweep: sweepNote || null, worker: WORKER_BUILD, unfiled: waiting.map((x) => x.payment_date), unfiledRuns: waiting.map((x) => ({ paymentDate: x.payment_date, builtAt: x.built_at, slips: x.slips })), from: PAYSLIP_FROM, runsStored: runs.c, firstPaid: runs.a, lastPaid: runs.b, slipsStored: slips.c, slipsWithGaps: slips.m, slipsOnCurrentRules: slips.r, people: per.map((x) => ({ name: x.name, slips: x.c, first: x.a, last: x.b })) });
     }
     if (url.pathname.startsWith("/api/passkey/")) {
       // Device unlock. Any signed in person, only for their own email.
