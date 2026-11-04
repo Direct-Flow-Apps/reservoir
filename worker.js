@@ -286,7 +286,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
   await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
 }
 
-const WORKER_BUILD = "Reservoir-Worker-2026.11.05-w215";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.05-w216";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.izzyandloki.workers.dev/api/xero/callback";
@@ -5863,6 +5863,46 @@ export default {
         return reply(env, 200, { filed: true, paymentDate: run.payment_date, timesheets, worker: WORKER_BUILD });
       } catch (e) {
         console.log("payslip filed error", String(e && e.message || e));
+        return reply(env, 502, { error: String(e && e.message || e).slice(0, 300) });
+      }
+    }
+    if (url.pathname === "/api/dfp/payroll/probe" && request.method === "GET") {
+      // Temporary, director only (T1). Calls the payroll parts of Xero for the latest pay run and returns the raw replies, and every place a word like Filed or STP sits, so the real Filed field can be found.
+      if (user.tier !== "T1") return reply(env, 403, { error: "forbidden" });
+      try {
+        await payslipTables(env);
+        const latest = await env.DB.prepare("SELECT run_id FROM payslip_runs ORDER BY payment_date DESC LIMIT 1").first();
+        const out = [];
+        const call = async (label, path) => {
+          try {
+            const r = await xeroFetch(env, path);
+            const t = await r.text();
+            let j = null; try { j = JSON.parse(t); } catch (e) { /* not json */ }
+            out.push({ label, path, status: r.status, json: j, text: j ? "" : t.slice(0, 400) });
+            return j;
+          } catch (e) { out.push({ label, path, status: 0, json: null, text: String(e && e.message || e).slice(0, 300) }); return null; }
+        };
+        await call("Pay run list", "payroll.xro/1.0/PayRuns");
+        let slipId = "";
+        if (latest && latest.run_id) {
+          const d = await call("Latest pay run", `payroll.xro/1.0/PayRuns/${latest.run_id}`);
+          slipId = d && d.PayRuns && d.PayRuns[0] && d.PayRuns[0].Payslips && d.PayRuns[0].Payslips[0] ? d.PayRuns[0].Payslips[0].PayslipID : "";
+        }
+        if (slipId) await call("One payslip", `payroll.xro/1.0/Payslip/${slipId}`);
+        await call("Payroll settings", "payroll.xro/1.0/Settings");
+        await call("Pay calendars", "payroll.xro/1.0/PayrollCalendars");
+        await call("Pay run list, posted only", "payroll.xro/1.0/PayRuns?where=PayRunStatus%3D%3D%22POSTED%22");
+        const hits = [];
+        const walk = (label, o, p, d) => {
+          if (d > 8 || o === null || o === undefined) return;
+          if (Array.isArray(o)) { o.slice(0, 40).forEach((v, i) => walk(label, v, `${p}[${i}]`, d + 1)); return; }
+          if (typeof o === "object") { for (const [k, v] of Object.entries(o)) { if (/fil|lodg|stp|submit|ato\b|status/i.test(k) && typeof v !== "object") hits.push(`${label}: ${p}.${k} = ${v}`); walk(label, v, `${p}.${k}`, d + 1); } return; }
+          if (typeof o === "string" && /\b(filed|lodged|stp)\b/i.test(o)) hits.push(`${label}: ${p} = ${o}`);
+        };
+        out.forEach((e) => walk(e.label, e.json, "", 0));
+        const strip = (e) => { const j = e.json; if (j && Array.isArray(j.PayRuns)) j.PayRuns = j.PayRuns.slice(0, 3).map((x) => { const { Payslips, ...rest } = x || {}; return { ...rest, PayslipsCount: (Payslips || []).length }; }); return j; };
+        return reply(env, 200, { worker: WORKER_BUILD, hits: hits.slice(0, 120), endpoints: out.map((e) => ({ label: e.label, path: e.path, status: e.status, raw: (e.json ? JSON.stringify(e.label.indexOf("Latest") === 0 ? e.json : strip(e)) : e.text).slice(0, 4000) })) });
+      } catch (e) {
         return reply(env, 502, { error: String(e && e.message || e).slice(0, 300) });
       }
     }
