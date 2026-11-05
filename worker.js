@@ -286,7 +286,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
   await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
 }
 
-const WORKER_BUILD = "Reservoir-Worker-2026.11.05-w219";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.05-w220";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.izzyandloki.workers.dev/api/xero/callback";
@@ -4134,7 +4134,7 @@ async function noticesTable(env) {
   }
 }
 // Push notifications. Which kinds of notice also go to people's phones is decided here, once. Anything marked todo (someone has to act) also pushes. To change what pushes, change this list.
-const PUSH_KINDS = ["timesheet", "payroll", "cardreset", "card", "request", "policy", "dailyops", "mail"];
+const PUSH_KINDS = ["timesheet", "payroll", "cardreset", "card", "request", "policy", "dailyops", "mail", "incident"];
 const b64uEnc = (buf) => { const u = new Uint8Array(buf); let s = ""; for (let i = 0; i < u.length; i++) s += String.fromCharCode(u[i]); return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, ""); };
 const b64uDec = (str) => { const s = String(str || "").replace(/-/g, "+").replace(/_/g, "/"); const bin = atob(s + "=".repeat((4 - (s.length % 4)) % 4)); const u = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i); return u; };
 const concatBytes = (...parts) => { const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0)); let o = 0; for (const p of parts) { out.set(p, o); o += p.length; } return out; };
@@ -4937,6 +4937,98 @@ async function payrollSweep(env) {
   try { await timesheetSync(env); } catch (e) { /* banking is retried by the Pay Run Filed button */ }
 }
 
+// ---- Incident reports. Any team member lodges one from the First Aid tile. The directors and managers (T1 and T2) get an urgent alert, open the report, and one of them presses Assign to Me. Nobody can assign it to anyone else. Until someone does, the alert repeats every half hour. ----
+async function incidentTables(env) {
+  await env.DB.prepare("CREATE TABLE IF NOT EXISTS incident_reports (id TEXT PRIMARY KEY, created_at TEXT DEFAULT (datetime('now')), reporter_email TEXT, reporter_name TEXT, injury_type TEXT, incident_date TEXT, location_kind TEXT, location TEXT, aroflo_task TEXT, description TEXT, injured TEXT, witnesses TEXT, action_taken TEXT, photo_ids TEXT, assigned_to TEXT, assigned_email TEXT, assigned_at TEXT, last_alert_at TEXT)").run();
+  await env.DB.prepare("CREATE TABLE IF NOT EXISTS incident_photos (id TEXT PRIMARY KEY, reporter_email TEXT, name TEXT, mime TEXT, data TEXT, created_at TEXT DEFAULT (datetime('now')))").run();
+}
+async function incidentAlert(env, row, repeat) {
+  await notify(env, { to: "@office", kind: "incident", title: repeat ? "Incident report still needs someone to take it" : "URGENT: someone has been injured", body: repeat ? `${row.reporter_name} reported an injury and nobody has taken the report yet. Open Reservoir and press Assign to Me.` : `${row.reporter_name} has submitted an incident report: ${String(row.injury_type || "").slice(0, 80)}. Open Reservoir to read it.`, link: "notices" });
+  await env.DB.prepare("UPDATE incident_reports SET last_alert_at = datetime('now') WHERE id = ?").bind(row.id).run();
+}
+async function incidentReminders(env) {
+  await incidentTables(env);
+  const rows = ((await env.DB.prepare("SELECT * FROM incident_reports WHERE assigned_to IS NULL AND (last_alert_at IS NULL OR last_alert_at <= datetime('now', '-29 minutes'))").all()).results) || [];
+  for (const r of rows) await incidentAlert(env, r, true);
+}
+const incidentOut = (r, full) => {
+  const arr = (v) => { try { return JSON.parse(v || "[]"); } catch (e) { return []; } };
+  const o = { id: r.id, at: r.created_at, by: r.reporter_name, injuryType: r.injury_type, date: r.incident_date, location: r.location, assignedTo: r.assigned_to || "" };
+  if (full) Object.assign(o, { locationKind: r.location_kind, aroflo: r.aroflo_task || "", description: r.description, injured: arr(r.injured), witnesses: arr(r.witnesses), actionTaken: r.action_taken, photos: arr(r.photo_ids), assignedAt: r.assigned_at || "" });
+  return o;
+};
+async function incidentRoutes(request, env, user, url) {
+  if (!url.pathname.startsWith("/api/incidents")) return null;
+  const email = String(user.email || "").trim().toLowerCase();
+  const office = user.tier === "T1" || user.tier === "T2";
+  try {
+    await incidentTables(env);
+    if (url.pathname === "/api/incidents/lookup" && request.method === "POST") {
+      const b = await request.json().catch(() => ({}));
+      const n = String(b.number || "").trim();
+      if (!/^[A-Za-z0-9_.-]{1,40}$/.test(n)) return reply(env, 400, { error: "Enter a task number" });
+      const u2 = new URL(`${url.origin}/api/aroflo/job?number=${encodeURIComponent(n)}`);
+      const r = await arofloRoutes(new Request(u2.toString(), { method: "GET" }), env, { ...user, tier: "T1" }, u2);
+      const j = r ? await r.json().catch(() => ({})) : {};
+      if (!j || !j.ok) return reply(env, 200, { ok: false, error: (j && j.error) || "That task was not found in AroFlo." });
+      return reply(env, 200, { ok: true, address: String(j.address || "").slice(0, 300), taskName: String(j.taskName || "").slice(0, 200), client: String(j.client || "").slice(0, 120) });
+    }
+    if (url.pathname === "/api/incidents/photo" && request.method === "POST") {
+      const bytes = await request.arrayBuffer();
+      if (!bytes.byteLength) return reply(env, 400, { error: "empty photo" });
+      if (bytes.byteLength > 1800000) return reply(env, 413, { error: "That photo is too large" });
+      const u8 = new Uint8Array(bytes);
+      let bin = "";
+      for (let i = 0; i < u8.length; i += 8192) bin += String.fromCharCode.apply(null, u8.subarray(i, i + 8192));
+      const id = crypto.randomUUID();
+      const mime = /^image\/(jpeg|png|webp)$/.test(String(request.headers.get("Content-Type") || "")) ? request.headers.get("Content-Type") : "image/jpeg";
+      await env.DB.prepare("INSERT INTO incident_photos (id, reporter_email, name, mime, data) VALUES (?, ?, ?, ?, ?)").bind(id, email, String(url.searchParams.get("name") || "photo.jpg").slice(0, 80), mime, btoa(bin)).run();
+      return reply(env, 200, { id });
+    }
+    const pm = url.pathname.match(/^\/api\/incidents\/photo\/([0-9a-fA-F-]{20,40})$/);
+    if (pm && request.method === "GET") {
+      const p = await env.DB.prepare("SELECT * FROM incident_photos WHERE id = ?").bind(pm[1]).first();
+      if (!p || (!office && p.reporter_email !== email)) return reply(env, 404, { error: "not found" });
+      const bin = atob(p.data);
+      const out = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+      return new Response(out, { status: 200, headers: { "Content-Type": p.mime || "image/jpeg", ...cors(env), "Cache-Control": "private, max-age=3600" } });
+    }
+    if (url.pathname === "/api/incidents" && request.method === "POST") {
+      const b = await request.json().catch(() => ({}));
+      const txt = (v, n) => String(v || "").trim().slice(0, n);
+      const list = (v) => (Array.isArray(v) ? v : []).map((x) => txt(x, 80)).filter(Boolean).slice(0, 20);
+      const rec = { injuryType: txt(b.injuryType, 200), date: txt(b.incidentDate, 10), kind: b.locationKind === "aroflo" ? "aroflo" : "address", location: txt(b.location, 300), aroflo: txt(b.arofloTask, 40), description: txt(b.description, 6000), injured: list(b.injured), witnesses: list(b.witnesses), action: txt(b.actionTaken, 4000), photos: list(b.photoIds) };
+      if (!rec.injuryType || !/^\d{4}-\d{2}-\d{2}$/.test(rec.date) || !rec.location || !rec.description || !rec.injured.length || !rec.witnesses.length || !rec.action || !rec.photos.length) return reply(env, 400, { error: "Every question needs an answer, and at least one photo." });
+      const id = crypto.randomUUID();
+      await env.DB.prepare("INSERT INTO incident_reports (id, reporter_email, reporter_name, injury_type, incident_date, location_kind, location, aroflo_task, description, injured, witnesses, action_taken, photo_ids) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").bind(id, email, String(user.name || email).slice(0, 80), rec.injuryType, rec.date, rec.kind, rec.location, rec.aroflo, rec.description, JSON.stringify(rec.injured), JSON.stringify(rec.witnesses), rec.action, JSON.stringify(rec.photos)).run();
+      const row = await env.DB.prepare("SELECT * FROM incident_reports WHERE id = ?").bind(id).first();
+      await incidentAlert(env, row, false);
+      return reply(env, 200, { ok: true, id });
+    }
+    if (!office) return reply(env, 403, { error: "forbidden" });
+    if (url.pathname === "/api/incidents" && request.method === "GET") {
+      const rows = ((await env.DB.prepare("SELECT * FROM incident_reports ORDER BY created_at DESC LIMIT 200").all()).results) || [];
+      return reply(env, 200, { reports: rows.map((r) => incidentOut(r, false)) });
+    }
+    const dm = url.pathname.match(/^\/api\/incidents\/([0-9a-fA-F-]{20,40})(\/assign)?$/);
+    if (dm && request.method === "GET" && !dm[2]) {
+      const r = await env.DB.prepare("SELECT * FROM incident_reports WHERE id = ?").bind(dm[1]).first();
+      return r ? reply(env, 200, incidentOut(r, true)) : reply(env, 404, { error: "not found" });
+    }
+    if (dm && dm[2] && request.method === "POST") {
+      // Only the person taking the report can assign it, and only to themselves.
+      const r = await env.DB.prepare("UPDATE incident_reports SET assigned_to = ?, assigned_email = ?, assigned_at = datetime('now') WHERE id = ? AND assigned_to IS NULL").bind(String(user.name || email).slice(0, 80), email, dm[1]).run();
+      const now = await env.DB.prepare("SELECT * FROM incident_reports WHERE id = ?").bind(dm[1]).first();
+      return now ? reply(env, 200, { ok: true, report: incidentOut(now, true) }) : reply(env, 404, { error: "not found" });
+    }
+    return reply(env, 404, { error: "not found" });
+  } catch (e) {
+    console.log("incident error", String(e && e.message || e).slice(0, 200));
+    return reply(env, 500, { error: "Could not complete that." });
+  }
+}
+
 // ---- Device unlock (passkeys). A person turns it on once on their own phone or computer. The device keeps the private key in its secure chip and Reservoir keeps only the public key. Unlocking is checked here: the server issues a one time challenge, the device signs it after face, fingerprint or passcode, and the signature is checked against the saved public key. ----
 let passkeyTableMade = false;
 async function passkeyTables(env) {
@@ -5089,6 +5181,7 @@ export default {
     ctx.waitUntil(pushOneOffAndrey(env).catch((e) => console.log("one off failed", String(e && e.message || e))));
     ctx.waitUntil(mailWatch(env).catch((e) => console.log("mail watch failed", String(e && e.message || e))));
     ctx.waitUntil(payrollSweep(env).catch((e) => console.log("payroll sweep failed", String(e && e.message || e))));
+    ctx.waitUntil(incidentReminders(env).catch((e) => console.log("incident reminders failed", String(e && e.message || e))));
     if (event && (event.cron === "*/30 * * * *" || event.cron === "*/15 * * * *")) return;
     ctx.waitUntil(leaveSync(env).catch((e) => console.log("leave sync failed", String(e && e.message || e))));
   },
@@ -5924,6 +6017,7 @@ export default {
       const sweepNote = await env.DB.prepare("SELECT value, detail, at FROM app_settings WHERE key = 'sweep.payroll_last'").first().catch(() => null);
       return reply(env, 200, { sweep: sweepNote || null, worker: WORKER_BUILD, unfiled: waiting.map((x) => x.payment_date), unfiledRuns: waiting.map((x) => ({ paymentDate: x.payment_date, builtAt: x.built_at, slips: x.slips })), from: PAYSLIP_FROM, runsStored: runs.c, firstPaid: runs.a, lastPaid: runs.b, slipsStored: slips.c, slipsWithGaps: slips.m, slipsOnCurrentRules: slips.r, people: per.map((x) => ({ name: x.name, slips: x.c, first: x.a, last: x.b })) });
     }
+    if (url.pathname.startsWith("/api/incidents")) return incidentRoutes(request, env, user, url);
     if (url.pathname.startsWith("/api/passkey/")) {
       // Device unlock. Any signed in person, only for their own email.
       try {
