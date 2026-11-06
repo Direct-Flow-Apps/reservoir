@@ -4943,11 +4943,16 @@ async function incidentTables(env) {
   await env.DB.prepare("CREATE TABLE IF NOT EXISTS incident_photos (id TEXT PRIMARY KEY, reporter_email TEXT, name TEXT, mime TEXT, data TEXT, created_at TEXT DEFAULT (datetime('now')))").run();
 }
 async function incidentAlert(env, row, repeat) {
+  return; // Incident alerts switched off until the rebuilt incident report is live.
   await notify(env, { to: "@office", kind: "incident", title: repeat ? "Incident report still needs someone to take it" : "URGENT: someone has been injured", body: repeat ? `${row.reporter_name} reported an injury and nobody has taken the report yet. Open Reservoir and press Assign to Me.` : `${row.reporter_name} has submitted an incident report: ${String(row.injury_type || "").slice(0, 80)}. Open Reservoir to read it.`, link: "notices" });
   await env.DB.prepare("UPDATE incident_reports SET last_alert_at = datetime('now') WHERE id = ?").bind(row.id).run();
 }
 async function incidentReminders(env) {
   await incidentTables(env);
+  // One off clean up: delete the unreadable incident report and its photos, which stops the repeat alerts. Remove this block once the rebuilt incident report is live.
+  await env.DB.prepare("DELETE FROM incident_reports").run();
+  await env.DB.prepare("DELETE FROM incident_photos").run();
+  return;
   const rows = ((await env.DB.prepare("SELECT * FROM incident_reports WHERE assigned_to IS NULL AND (last_alert_at IS NULL OR last_alert_at <= datetime('now', '-29 minutes'))").all()).results) || [];
   for (const r of rows) await incidentAlert(env, r, true);
 }
