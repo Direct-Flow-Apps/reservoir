@@ -4512,8 +4512,8 @@ async function tsAutoRun(env) {
       if (TS_HOLIDAYS[date]) { if (!day.holiday) { day.holiday = TS_HOLIDAYS[date]; changed = true; } continue; }
       const l = leave.find((x) => x.from_date <= date && x.to_date >= date);
       if (l) { day.type = l.type === "personal" ? "personal_leave" : "annual_leave"; changed = true; continue; }
-      day.entries = [{ id: `auto-${date}`, start: 450, end: 960 }];
-      day.breakMins = 30;
+      day.entries = [{ id: `auto-${date}`, start: 450, end: 930 }];
+      day.breakMins = 0;
       changed = true;
     }
     if (changed) {
