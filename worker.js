@@ -6724,6 +6724,34 @@ export default {
       return reply(env, 405, { error: "method not allowed" });
     }
 
+    if (url.pathname === "/api/tools/items") {
+      // The tools editor behind the Tools tile on the Operations home screen. T1 and T2 only. Deleting hides the tool, so old checks still read correctly.
+      if (user.tier !== "T1" && user.tier !== "T2") return reply(env, 403, { error: "forbidden" });
+      await env.DB.prepare("CREATE TABLE IF NOT EXISTS vehicle_tool_items (id INTEGER PRIMARY KEY AUTOINCREMENT, grp TEXT NOT NULL, item TEXT NOT NULL, spec TEXT, sort INTEGER, active INTEGER DEFAULT 1)").run();
+      if (request.method === "GET") {
+        const rows = ((await env.DB.prepare("SELECT id, grp, item, spec FROM vehicle_tool_items WHERE active = 1 ORDER BY sort, id").all()).results) || [];
+        return reply(env, 200, { items: rows.map((r) => ({ id: r.id, group: r.grp, item: r.item, spec: r.spec || "" })) });
+      }
+      if (request.method !== "POST") return reply(env, 405, { error: "method not allowed" });
+      if (user.viewAs) return reply(env, 403, { error: "Viewing as someone else is read only." });
+      let body;
+      try { body = await request.json(); } catch (e) { return reply(env, 400, { error: "bad json" }); }
+      const name = String(body.item || "").trim().slice(0, 80), spec = String(body.spec || "").trim().slice(0, 120);
+      if (body.action === "add") {
+        if (!name) return reply(env, 400, { error: "Give the tool a name" });
+        const top = await env.DB.prepare("SELECT COALESCE(MAX(sort), 0) AS m FROM vehicle_tool_items").first();
+        const grp = await env.DB.prepare("SELECT grp FROM vehicle_tool_items WHERE active = 1 ORDER BY sort, id LIMIT 1").first();
+        await env.DB.prepare("INSERT INTO vehicle_tool_items (grp, item, spec, sort) VALUES (?, ?, ?, ?)").bind(grp ? grp.grp : "Company Tool", name, spec, (top ? top.m : 0) + 1).run();
+      } else if (body.action === "edit") {
+        if (!name) return reply(env, 400, { error: "Give the tool a name" });
+        await env.DB.prepare("UPDATE vehicle_tool_items SET item = ?, spec = ? WHERE id = ?").bind(name, spec, Number(body.id)).run();
+      } else if (body.action === "delete") {
+        await env.DB.prepare("UPDATE vehicle_tool_items SET active = 0 WHERE id = ?").bind(Number(body.id)).run();
+      } else return reply(env, 400, { error: "unknown action" });
+      const rows = ((await env.DB.prepare("SELECT id, grp, item, spec FROM vehicle_tool_items WHERE active = 1 ORDER BY sort, id").all()).results) || [];
+      return reply(env, 200, { items: rows.map((r) => ({ id: r.id, group: r.grp, item: r.item, spec: r.spec || "" })) });
+    }
+
     const tm = url.pathname.match(/^\/api\/fleet\/([A-Za-z0-9_-]{1,64})\/tools$/);
     if (tm) {
       // The Vehicle Tools check. Whoever takes in a vehicle ticks off what is on it; each save is kept, so the next swap can be compared with the last.
