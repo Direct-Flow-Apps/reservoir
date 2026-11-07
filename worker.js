@@ -4501,7 +4501,7 @@ async function tsAutoRun(env) {
     try { period = row ? JSON.parse(row.data) : null; } catch (e) { period = null; }
     if (period && period.status === "submitted") { note("left alone, already submitted in Reservoir"); continue; }
     if (!period) period = { key, status: "draft", days: [] };
-    while (period.days.length < 6) { const i = period.days.length; period.days.push({ type: "work", holiday: TS_HOLIDAYS[tsAddDays(monday, i)] || null, entries: [], breakMins: 0, shortDayReason: null, shortDayApprover: null }); }
+    while (period.days.length < 6) { const i = period.days.length; period.days.push({ type: "work", holiday: TS_HOLIDAYS[tsAddDays(monday, i)] || null, entries: [], breakMins: 0 }); }
     const leave = ((await env.DB.prepare("SELECT from_date, to_date, type FROM xero_leave WHERE email = ? AND status = 'approved' AND to_date >= ? AND from_date <= ?").bind(email, monday, sunday).all()).results) || [];
     let changed = !row;
     for (let i = 0; i < 5; i++) {
@@ -6415,24 +6415,6 @@ export default {
       const at = new Date().toISOString().slice(0, 19).replace("T", " ");
       await env.DB.prepare("INSERT INTO app_settings (key, value, by_name, at) VALUES ('ppe.audit_at', ?, ?, datetime('now')) ON CONFLICT(key) DO UPDATE SET value = excluded.value, by_name = excluded.by_name, at = excluded.at").bind(at, user.name || "").run();
       return reply(env, 200, { ok: true, at });
-    }
-    if (url.pathname === "/api/ppe/seed" && request.method === "POST") {
-      // Test data for the office: marks your own bag as handed over and puts one order in your locker, provided and waiting for you to tick it received. T1 and T2 only.
-      if (user.tier !== "T1" && user.tier !== "T2") return reply(env, 403, { error: "forbidden" });
-      if (user.viewAs) return reply(env, 403, { error: "Viewing as someone else is read only." });
-      try {
-        await ppeTables(env);
-        const who = ppePerson(user);
-        const have = {};
-        PPE_ITEMS.filter((x) => x.kind === "stock").forEach((x) => { have[x.id] = true; });
-        const exp = new Date(Date.now() + 365 * 86400000).toISOString().slice(0, 10);
-        await env.DB.prepare("INSERT INTO ppe_state (person_key, name, email, have, first_aid_expiry, acknowledged_at, updated_at) VALUES (?, ?, ?, ?, ?, datetime('now'), datetime('now')) ON CONFLICT(person_key) DO UPDATE SET name = excluded.name, email = excluded.email, have = excluded.have, first_aid_expiry = excluded.first_aid_expiry, acknowledged_at = datetime('now'), updated_at = datetime('now')")
-          .bind(who.key, who.name, who.email, JSON.stringify(have), exp).run();
-        await env.DB.prepare("DELETE FROM ppe_orders WHERE person_key = ?").bind(who.key).run();
-        const it = ppeItem("respirator");
-        if (it) await env.DB.prepare("INSERT INTO ppe_orders (id, person_key, name, email, items, source, status, approved_by, approved_at, provided_by, provided_at) VALUES (?, ?, ?, ?, ?, 'order', 'provided', 'seed', datetime('now'), 'seed', datetime('now'))").bind(crypto.randomUUID(), who.key, who.name, who.email, JSON.stringify([{ id: it.id, label: it.label, kind: it.kind }])).run();
-        return reply(env, 200, { ok: true });
-      } catch (e) { return reply(env, 500, { error: "Could not seed the test data", detail: String(e && e.message || e).slice(0, 200) }); }
     }
     if (url.pathname === "/api/ppe/items") {
       // The PPE editor behind the PPE tile on the Operations home screen. T1 and T2 only. Deleting hides the item, so old bags and orders still read correctly.
