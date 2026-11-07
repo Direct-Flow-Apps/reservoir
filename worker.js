@@ -1890,7 +1890,7 @@ function financialYear(iso) {
 // Everything is kept in DFP's own database and nothing here touches Xero. Items are fixed on the Worker so a request can only name a real item.
 // "stock" items are supplied by DFP from the shed. "buy" items are bought by the person after approval, with the receipt uploaded against the order to close it.
 const PPE_BOOT_SIZES = ["AU 9", "AU 10", "AU 11", "AU 12", "AU 13"];
-const PPE_ITEMS = [
+const PPE_DEFAULTS = [
   { id: "earmuffs", label: "Ear Muffs", kind: "stock" },
   { id: "earplugs", label: "Ear Plugs", kind: "stock" },
   { id: "masks", label: "Face Masks", kind: "stock" },
@@ -1904,6 +1904,21 @@ const PPE_ITEMS = [
   { id: "steelcap", label: "Steel Cap Boots", kind: "stock", sizes: PPE_BOOT_SIZES },
   { id: "sunscreen", label: "Sunscreen", kind: "stock" }
 ];
+const PPE_ITEMS = PPE_DEFAULTS.map((x) => ({ ...x }));
+let ppeLoadedAt = 0;
+// The PPE kit list lives in D1 so the office can reword it from the PPE editor. PPE_ITEMS is refilled in place, so every existing reader keeps working.
+async function ppeLoad(env, force) {
+  if (!force && Date.now() - ppeLoadedAt < 20000) return;
+  await env.DB.prepare("CREATE TABLE IF NOT EXISTS ppe_items (id TEXT PRIMARY KEY, label TEXT NOT NULL, kind TEXT DEFAULT 'stock', sizes TEXT, expiry INTEGER DEFAULT 0, sort INTEGER, active INTEGER DEFAULT 1)").run();
+  const have = await env.DB.prepare("SELECT COUNT(*) AS n FROM ppe_items").first();
+  if (!have || !have.n) {
+    for (let i = 0; i < PPE_DEFAULTS.length; i++) { const x = PPE_DEFAULTS[i]; await env.DB.prepare("INSERT INTO ppe_items (id, label, kind, sizes, expiry, sort) VALUES (?, ?, 'stock', ?, ?, ?)").bind(x.id, x.label, x.sizes ? JSON.stringify(x.sizes) : null, x.expiry ? 1 : 0, i).run(); }
+  }
+  const rows = ((await env.DB.prepare("SELECT id, label, kind, sizes, expiry FROM ppe_items WHERE active = 1 ORDER BY sort, id").all()).results) || [];
+  const list = rows.map((r) => { let sizes = null; try { sizes = r.sizes ? JSON.parse(r.sizes) : null; } catch (e) { sizes = null; } return { id: r.id, label: r.label, kind: r.kind || "stock", ...(sizes && sizes.length ? { sizes } : {}), ...(r.expiry ? { expiry: true } : {}) }; });
+  PPE_ITEMS.splice(0, PPE_ITEMS.length, ...list);
+  ppeLoadedAt = Date.now();
+}
 const ppeItem = (id) => PPE_ITEMS.find((x) => x.id === id);
 let ppeReady = false;
 async function ppeTables(env) {
@@ -1911,13 +1926,14 @@ async function ppeTables(env) {
   await env.DB.prepare("CREATE TABLE IF NOT EXISTS ppe_state (person_key TEXT PRIMARY KEY, name TEXT, email TEXT, have TEXT, first_aid_expiry TEXT, acknowledged_at TEXT, updated_at TEXT DEFAULT (datetime('now')))").run();
   await env.DB.prepare("CREATE TABLE IF NOT EXISTS ppe_orders (id TEXT PRIMARY KEY, person_key TEXT, name TEXT, email TEXT, items TEXT, source TEXT, status TEXT NOT NULL DEFAULT 'requested', po_number TEXT, receipt_item TEXT, created_at TEXT DEFAULT (datetime('now')), approved_by TEXT, approved_at TEXT, provided_by TEXT, provided_at TEXT, received_at TEXT, declined_by TEXT, declined_at TEXT)").run();
   await env.DB.prepare("CREATE INDEX IF NOT EXISTS ppe_orders_person ON ppe_orders (person_key)").run();
+  for (const col of ["deleted_at TEXT", "delete_reason TEXT"]) { try { await env.DB.prepare("ALTER TABLE ppe_orders ADD COLUMN " + col).run(); } catch (e) { /* already there */ } }
   ppeReady = true;
 }
 const ppePerson = (user) => ({ key: profileKey(user.name) || (user.email ? "email:" + String(user.email).toLowerCase() : ""), name: String(user.name || user.email || "").slice(0, 120), email: String(user.email || "").toLowerCase() });
 const ppeJson = (t, d) => { try { const v = JSON.parse(t || ""); return v === null || v === undefined ? d : v; } catch (e) { return d; } };
 const ppeOrderOut = (r) => {
   const items = ppeJson(r.items, []);
-  return { id: r.id, kind: "ppe", type: "PPE order", by: String(r.name || "").split(" ")[0], byName: r.name || "", items, source: r.source || "order", status: r.status, poNumber: r.po_number || "", hasReceipt: !!r.receipt_item, date: String(r.created_at || "").slice(0, 10), approvedDate: r.approved_at ? String(r.approved_at).slice(0, 10) : "", providedDate: r.provided_at ? String(r.provided_at).slice(0, 10) : "", receivedDate: r.received_at ? String(r.received_at).slice(0, 10) : "", text: items.map((x) => x.label + (x.size ? " " + x.size : "")).join(", "), server: true };
+  return { id: r.id, kind: "ppe", type: "PPE order", by: String(r.name || "").split(" ")[0], byName: r.name || "", items, source: r.source || "order", status: r.status, poNumber: r.po_number || "", hasReceipt: !!r.receipt_item, date: String(r.created_at || "").slice(0, 10), approvedDate: r.approved_at ? String(r.approved_at).slice(0, 10) : "", providedDate: r.provided_at ? String(r.provided_at).slice(0, 10) : "", receivedDate: r.received_at ? String(r.received_at).slice(0, 10) : "", deletedDate: r.deleted_at ? String(r.deleted_at).slice(0, 10) : "", deleteReason: r.delete_reason || "", text: items.map((x) => x.label + (x.size ? " " + x.size : "")).join(", "), server: true };
 };
 // Where the person's bag stands. none: never acknowledged. partial: something is outstanding. full: every stock item is in the bag and the bought item has its receipt.
 function ppeBagStatus(state, orders) {
@@ -1928,13 +1944,18 @@ function ppeBagStatus(state, orders) {
   return missing.length ? "partial" : "full";
 }
 async function ppeMe(env, user) {
+  await ppeLoad(env);
   await ppeTables(env);
   const who = ppePerson(user);
   const state = await env.DB.prepare("SELECT * FROM ppe_state WHERE person_key = ?").bind(who.key).first();
   const rows = ((await env.DB.prepare("SELECT * FROM ppe_orders WHERE person_key = ? ORDER BY created_at DESC, rowid DESC LIMIT 100").bind(who.key).all()).results) || [];
-  const status = ppeBagStatus(state, rows);
+  let status = ppeBagStatus(state, rows);
+  // An audit pushed from the PPE editor sends everyone who had a handover back through the tick list, until they confirm again.
+  let auditAt = "";
+  try { const a = await env.DB.prepare("SELECT value FROM app_settings WHERE key = 'ppe.audit_at'").first(); auditAt = a && a.value ? String(a.value) : ""; } catch (e) { auditAt = ""; }
+  if (status === "full" && auditAt && state && String(state.acknowledged_at || "") < auditAt) status = "audit";
   const open = (id) => rows.some((o) => ["requested", "approved", "provided"].includes(o.status) && ppeJson(o.items, []).some((x) => x.id === id));
-  return { status, acknowledged: !!(state && state.acknowledged_at), have: ppeJson(state && state.have, {}), firstAidExpiry: (state && state.first_aid_expiry) || "", outstanding: PPE_ITEMS.filter((x) => open(x.id)).map((x) => x.id), orders: rows.map(ppeOrderOut) };
+  return { status, ackAt: (state && state.acknowledged_at) || "", ackBy: (state && state.name) || "", acknowledged: !!(state && state.acknowledged_at), have: ppeJson(state && state.have, {}), firstAidExpiry: (state && state.first_aid_expiry) || "", outstanding: PPE_ITEMS.filter((x) => open(x.id)).map((x) => x.id), orders: rows.map(ppeOrderOut) };
 }
 function ppeCleanItems(list) {
   if (!Array.isArray(list) || !list.length || list.length > 12) return null;
@@ -1953,7 +1974,7 @@ function ppeCleanItems(list) {
 // Makes one order for the stock items and one for the bought items, so each can move through its own stages.
 async function ppeCreateOrders(env, who, items, source) {
   const made = [];
-  for (const group of [items.filter((x) => x.kind === "stock"), items.filter((x) => x.kind === "buy")]) {
+  for (const group of items.map((x) => [x])) {
     if (!group.length) continue;
     const id = crypto.randomUUID();
     await env.DB.prepare("INSERT INTO ppe_orders (id, person_key, name, email, items, source, status) VALUES (?, ?, ?, ?, ?, ?, 'requested')").bind(id, who.key, who.name, who.email, JSON.stringify(group), source).run();
@@ -6386,6 +6407,57 @@ export default {
         return reply(env, 502, { error: "Could not open the document" });
       }
     }
+    if (url.pathname.startsWith("/api/ppe")) await ppeLoad(env);
+    if (url.pathname === "/api/ppe/audit" && request.method === "POST") {
+      // Push an audit: everyone who has had a PPE bag handover has to tick their bag again. T1 and T2 only.
+      if (user.tier !== "T1" && user.tier !== "T2") return reply(env, 403, { error: "forbidden" });
+      if (user.viewAs) return reply(env, 403, { error: "Viewing as someone else is read only." });
+      const at = new Date().toISOString().slice(0, 19).replace("T", " ");
+      await env.DB.prepare("INSERT INTO app_settings (key, value, by_name, at) VALUES ('ppe.audit_at', ?, ?, datetime('now')) ON CONFLICT(key) DO UPDATE SET value = excluded.value, by_name = excluded.by_name, at = excluded.at").bind(at, user.name || "").run();
+      return reply(env, 200, { ok: true, at });
+    }
+    if (url.pathname === "/api/ppe/seed" && request.method === "POST") {
+      // Test data for the office: marks your own bag as handed over and puts one order in your locker, provided and waiting for you to tick it received. T1 and T2 only.
+      if (user.tier !== "T1" && user.tier !== "T2") return reply(env, 403, { error: "forbidden" });
+      if (user.viewAs) return reply(env, 403, { error: "Viewing as someone else is read only." });
+      try {
+        await ppeTables(env);
+        const who = ppePerson(user);
+        const have = {};
+        PPE_ITEMS.filter((x) => x.kind === "stock").forEach((x) => { have[x.id] = true; });
+        const exp = new Date(Date.now() + 365 * 86400000).toISOString().slice(0, 10);
+        await env.DB.prepare("INSERT INTO ppe_state (person_key, name, email, have, first_aid_expiry, acknowledged_at, updated_at) VALUES (?, ?, ?, ?, ?, datetime('now'), datetime('now')) ON CONFLICT(person_key) DO UPDATE SET name = excluded.name, email = excluded.email, have = excluded.have, first_aid_expiry = excluded.first_aid_expiry, acknowledged_at = datetime('now'), updated_at = datetime('now')")
+          .bind(who.key, who.name, who.email, JSON.stringify(have), exp).run();
+        await env.DB.prepare("DELETE FROM ppe_orders WHERE person_key = ?").bind(who.key).run();
+        const it = ppeItem("respirator");
+        if (it) await env.DB.prepare("INSERT INTO ppe_orders (id, person_key, name, email, items, source, status, approved_by, approved_at, provided_by, provided_at) VALUES (?, ?, ?, ?, ?, 'order', 'provided', 'seed', datetime('now'), 'seed', datetime('now'))").bind(crypto.randomUUID(), who.key, who.name, who.email, JSON.stringify([{ id: it.id, label: it.label, kind: it.kind }])).run();
+        return reply(env, 200, { ok: true });
+      } catch (e) { return reply(env, 500, { error: "Could not seed the test data", detail: String(e && e.message || e).slice(0, 200) }); }
+    }
+    if (url.pathname === "/api/ppe/items") {
+      // The PPE editor behind the PPE tile on the Operations home screen. T1 and T2 only. Deleting hides the item, so old bags and orders still read correctly.
+      if (user.tier !== "T1" && user.tier !== "T2") return reply(env, 403, { error: "forbidden" });
+      if (request.method === "POST") {
+        if (user.viewAs) return reply(env, 403, { error: "Viewing as someone else is read only." });
+        let body;
+        try { body = await request.json(); } catch (e) { return reply(env, 400, { error: "bad json" }); }
+        const name = String(body.label || "").trim().slice(0, 80);
+        const sizes = String(body.sizes || "").split(",").map((z) => z.trim().slice(0, 12)).filter(Boolean).slice(0, 12);
+        if (body.action === "add") {
+          if (!name) return reply(env, 400, { error: "Give the item a name" });
+          const top = await env.DB.prepare("SELECT COALESCE(MAX(sort), 0) AS m FROM ppe_items").first();
+          const id = `x${Date.now().toString(36)}${Math.random().toString(36).slice(2, 5)}`;
+          await env.DB.prepare("INSERT INTO ppe_items (id, label, kind, sizes, sort) VALUES (?, ?, 'stock', ?, ?)").bind(id, name, sizes.length ? JSON.stringify(sizes) : null, (top ? top.m : 0) + 1).run();
+        } else if (body.action === "edit") {
+          if (!name) return reply(env, 400, { error: "Give the item a name" });
+          await env.DB.prepare("UPDATE ppe_items SET label = ?, sizes = ? WHERE id = ?").bind(name, sizes.length ? JSON.stringify(sizes) : null, String(body.id || "")).run();
+        } else if (body.action === "delete") {
+          await env.DB.prepare("UPDATE ppe_items SET active = 0 WHERE id = ?").bind(String(body.id || "")).run();
+        } else return reply(env, 400, { error: "unknown action" });
+        await ppeLoad(env, true);
+      } else if (request.method !== "GET") return reply(env, 405, { error: "method not allowed" });
+      return reply(env, 200, { items: PPE_ITEMS });
+    }
     if (url.pathname === "/api/ppe/me" && request.method === "GET") {
       // The signed in person's own PPE bag and orders. Any tier.
       try { return reply(env, 200, { items: PPE_ITEMS, ...(await ppeMe(env, user)) }); }
@@ -6409,7 +6481,7 @@ export default {
           .bind(who.key, who.name, who.email, JSON.stringify(have), expiry || null).run();
         const mine = ((await env.DB.prepare("SELECT * FROM ppe_orders WHERE person_key = ?").bind(who.key).all()).results) || [];
         const openFor = (id) => mine.some((o) => ["requested", "approved", "provided"].includes(o.status) && ppeJson(o.items, []).some((x) => x.id === id));
-        const missing = PPE_ITEMS.filter((x) => x.kind === "stock" && !have[x.id] && !openFor(x.id));
+        const missing = []; // The first bag is a handover, not an order. What is not in the bag yet stays ticked off until the person has it.
         let made = [];
         if (missing.length) {
           const list = missing.map((x) => { const sz = String(sizes[x.id] || "").toUpperCase(); return { id: x.id, label: x.label, kind: "stock", ...(x.sizes ? { size: x.sizes.includes(sz) ? sz : "" } : {}) }; });
@@ -6444,7 +6516,7 @@ export default {
       if (user.tier !== "T1" && user.tier !== "T2") return reply(env, 403, { error: "forbidden" });
       try {
         await ppeTables(env);
-        const rows = ((await env.DB.prepare("SELECT * FROM ppe_orders ORDER BY created_at DESC, rowid DESC LIMIT 300").all()).results) || [];
+        const rows = ((await env.DB.prepare("SELECT * FROM ppe_orders WHERE status <> 'deleted' ORDER BY created_at DESC, rowid DESC LIMIT 300").all()).results) || [];
         return reply(env, 200, { orders: rows.map(ppeOrderOut) });
       } catch (e) { console.log("ppe list error", String(e && e.message || e)); return reply(env, 500, { error: "Could not read the PPE orders" }); }
     }
@@ -6457,7 +6529,13 @@ export default {
         if (!row) return reply(env, 200, { removed: false, alreadyGone: true, ...(await ppeMe(env, user)) });
         const owner = row.person_key === ppePerson(user).key;
         if (owner) {
-          if (row.status !== "requested" && row.status !== "received" && row.status !== "declined") return reply(env, 409, { error: "The office is already working on that order, so it can not be deleted yet" });
+          // Deleting your own order keeps a trail: the order is marked deleted with the reason, and shows in the history.
+          if (row.status !== "requested" && row.status !== "approved") return reply(env, 409, { error: "That order can not be deleted now" });
+          let reason = "";
+          try { const b = await request.json(); reason = String((b && b.reason) || ""); } catch (e) { reason = ""; }
+          if (!["Not required", "Ordered by accident", "Sourced myself"].includes(reason)) return reply(env, 400, { error: "Pick a reason" });
+          await env.DB.prepare("UPDATE ppe_orders SET status = 'deleted', deleted_at = datetime('now'), delete_reason = ? WHERE id = ?").bind(reason, row.id).run();
+          return reply(env, 200, { removed: true, ...(await ppeMe(env, user)) });
         } else {
           if (user.tier !== "T1") return reply(env, 403, { error: "forbidden" });
           if ((await requestsLock(env)).locked) return reply(env, 403, { error: REMOVAL_LOCKED });
