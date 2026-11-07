@@ -7086,6 +7086,19 @@ export default {
           }
         }
       } catch (e) { console.log("fleet details restore failed", String(e && e.message || e).slice(0, 160)); }
+      // One time: 1LL2HE gets the service provider, phone, email and booking details the other vehicles share (all are serviced at the same place). Only blank fields are filled.
+      try {
+        const flag3 = await env.DB.prepare("SELECT key FROM app_settings WHERE key = 'migration.restore_fleet_1LL2HE_v3'").first();
+        if (!flag3) {
+          const row = await env.DB.prepare("SELECT id FROM fleet WHERE upper(rego) = '1LL2HE'").first();
+          const src = await env.DB.prepare("SELECT * FROM fleet WHERE upper(rego) <> '1LL2HE' AND COALESCE(serviceProvider, '') <> '' ORDER BY sort_order LIMIT 1").first();
+          if (row && src) {
+            const keys = ["serviceProvider", "servicePhone", "serviceEmail", "serviceBooking"].filter((k) => FIELDS.includes(k));
+            await env.DB.prepare(`UPDATE fleet SET ${keys.map((k) => `${k} = CASE WHEN COALESCE(${k}, '') = '' THEN ? ELSE ${k} END`).join(", ")} WHERE id = ?`).bind(...keys.map((k) => src[k] || ""), row.id).run();
+            await env.DB.prepare("INSERT INTO app_settings (key, value, detail, by_name, at) VALUES ('migration.restore_fleet_1LL2HE_v3', '1', 'Service details copied from other vehicles', 'Restored', datetime('now'))").run();
+          }
+        }
+      } catch (e) { console.log("fleet service restore failed", String(e && e.message || e).slice(0, 160)); }
       const { results } = await env.DB.prepare("SELECT * FROM fleet ORDER BY grp, sort_order, id").all();
       return reply(env, 200, results.map(rowToItem));
     }
