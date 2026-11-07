@@ -7059,6 +7059,20 @@ export default {
 
     await fleetCols(env);
     if (request.method === "GET" && !id) {
+      // One time: Chad Lyons's Hilux 1LL2HE had dropped out of the fleet table. Put it back once, with only what is known (rego, make, model, driver). Done once, so deleting it later sticks.
+      try {
+        await settingsTable(env);
+        const flag = await env.DB.prepare("SELECT key FROM app_settings WHERE key = 'migration.restore_fleet_1LL2HE_v1'").first();
+        if (!flag) {
+          const have = await env.DB.prepare("SELECT id FROM fleet WHERE upper(rego) = '1LL2HE'").first();
+          if (!have) {
+            const next = await env.DB.prepare("SELECT COALESCE(MAX(sort_order), 0) + 1 AS n FROM fleet WHERE grp = 'Vehicles'").first();
+            const vals = FIELDS.map((f) => f === "rego" ? "1LL2HE" : f === "make" ? "Toyota" : f === "model" ? "Hilux" : f === "driver" ? "Chad Lyons" : "");
+            await env.DB.prepare(`INSERT INTO fleet (id, grp, ${FIELDS.join(", ")}, repairs, serviceHistory, sort_order, updated_by) VALUES (?, 'Vehicles', ${FIELDS.map(() => "?").join(", ")}, '[]', '[]', ?, 'Restored')`).bind("v-1ll2he", ...vals, next.n).run();
+          }
+          await env.DB.prepare("INSERT INTO app_settings (key, value, detail, by_name, at) VALUES ('migration.restore_fleet_1LL2HE_v1', '1', 'Chad Lyons fleet row put back', 'Restored', datetime('now'))").run();
+        }
+      } catch (e) { console.log("fleet restore failed", String(e && e.message || e).slice(0, 160)); }
       const { results } = await env.DB.prepare("SELECT * FROM fleet ORDER BY grp, sort_order, id").all();
       return reply(env, 200, results.map(rowToItem));
     }
