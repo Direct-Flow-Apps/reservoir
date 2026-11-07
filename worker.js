@@ -7073,6 +7073,19 @@ export default {
           await env.DB.prepare("INSERT INTO app_settings (key, value, detail, by_name, at) VALUES ('migration.restore_fleet_1LL2HE_v1', '1', 'Chad Lyons fleet row put back', 'Restored', datetime('now'))").run();
         }
       } catch (e) { console.log("fleet restore failed", String(e && e.message || e).slice(0, 160)); }
+      // One time: put back the rest of 1LL2HE's recorded details (from the original fleet record). Only blank fields are filled, so nothing typed since is overwritten, and it runs once.
+      try {
+        const flag2 = await env.DB.prepare("SELECT key FROM app_settings WHERE key = 'migration.restore_fleet_1LL2HE_v2'").first();
+        if (!flag2) {
+          const known = { fuel: "Diesel", expiry: "2026-11-10", serial: "8792223", year: "2017", body: "Tray", colour: "White", vin: "MR0EB3CB200444240", engine: "2GD4322537", compliance: "08/2017" };
+          const row = await env.DB.prepare("SELECT id FROM fleet WHERE upper(rego) = '1LL2HE'").first();
+          if (row) {
+            const keys = Object.keys(known).filter((k) => FIELDS.includes(k));
+            await env.DB.prepare(`UPDATE fleet SET ${keys.map((k) => `${k} = CASE WHEN COALESCE(${k}, '') = '' THEN ? ELSE ${k} END`).join(", ")} WHERE id = ?`).bind(...keys.map((k) => known[k]), row.id).run();
+            await env.DB.prepare("INSERT INTO app_settings (key, value, detail, by_name, at) VALUES ('migration.restore_fleet_1LL2HE_v2', '1', 'Chad Lyons fleet details put back', 'Restored', datetime('now'))").run();
+          }
+        }
+      } catch (e) { console.log("fleet details restore failed", String(e && e.message || e).slice(0, 160)); }
       const { results } = await env.DB.prepare("SELECT * FROM fleet ORDER BY grp, sort_order, id").all();
       return reply(env, 200, results.map(rowToItem));
     }
