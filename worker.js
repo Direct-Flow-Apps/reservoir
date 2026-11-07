@@ -4647,6 +4647,12 @@ async function timesheetRoutes(request, env, user, url) {
       const email = String(user.email || "").trim().toLowerCase();
       if (!email) return reply(env, 400, { error: "No email on your sign in" });
       await timesheetTable(env);
+      // Xero is the truth for a submitted week. If the database copy is more than two minutes old it is refreshed from Xero first, so an approved week always shows Xero's hours.
+      try {
+        const last = await env.DB.prepare("SELECT MAX(synced_at) AS s FROM xero_timesheets").first();
+        const age = last && last.s ? Date.now() - Date.parse(String(last.s).replace(" ", "T") + "Z") : Infinity;
+        if (!(age < 120000)) await timesheetSync(env);
+      } catch (e) { /* the copy already in the database is used */ }
       const rows = ((await env.DB.prepare("SELECT id, start_date, end_date, status, total_hours, lines, xero_updated, synced_at FROM xero_timesheets WHERE lower(email) = ? AND end_date >= ? ORDER BY start_date DESC").bind(email, TIMESHEET_FROM).all()).results) || [];
       const items = rows.map((r) => {
         let lines;
