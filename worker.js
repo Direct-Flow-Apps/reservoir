@@ -4149,10 +4149,24 @@ async function pushTable(env) {
   pushReady = true;
 }
 // Each phone picks when push may reach it. Weekday windows are Monday to Friday in Melbourne time, or 24 hours every day. Anything held back is counted and sent as one push when that phone's window next opens. The notice itself is always in the shield.
-const PUSH_MODES = { "0730-1600": [450, 960], "0700-1630": [420, 990], "0600-1800": [360, 1080], "24": null };
-const pushModeOf = (row) => (row && row.hours_mode && Object.prototype.hasOwnProperty.call(PUSH_MODES, row.hours_mode)) ? row.hours_mode : (row && row.all_hours ? "24" : "0700-1630");
+const PUSH_MODES = { "default": "biz", "0730-1600": [450, 960], "0700-1630": [420, 990], "0600-1800": [360, 1080], "24": null };
+// The default mode follows the business hours Tayler sets in the Hours tile. Kept in app_settings as business.hours and loaded before any push decision.
+let PUSH_BIZ = [450, 960];
+const bizMins = (t) => { const m = /^(\d{1,2}):(\d{2})$/.exec(String(t || "")); return m ? Number(m[1]) * 60 + Number(m[2]) : null; };
+async function pushLoadBiz(env) {
+  try {
+    const r = await env.DB.prepare("SELECT value FROM app_settings WHERE key = 'business.hours'").first();
+    const v = r && r.value ? JSON.parse(r.value) : null;
+    const a = v ? bizMins(v.start) : null, b = v ? bizMins(v.end) : null;
+    PUSH_BIZ = a !== null && b !== null && b > a ? [a, b] : [450, 960];
+  } catch (e) { PUSH_BIZ = [450, 960]; }
+  return PUSH_BIZ;
+}
+const bizText = (w) => { const f = (m) => `${String(Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`; return { start: f(w[0]), end: f(w[1]) }; };
+const pushModeOf = (row) => (row && row.hours_mode && Object.prototype.hasOwnProperty.call(PUSH_MODES, row.hours_mode)) ? row.hours_mode : (row && row.all_hours ? "24" : "default");
 function pushInHours(mode, d) {
-  const w = PUSH_MODES[mode || "0700-1630"];
+  let w = PUSH_MODES[mode || "default"];
+  if (w === "biz") w = PUSH_BIZ;
   if (w === null) return true;
   const parts = new Intl.DateTimeFormat("en-AU", { timeZone: "Australia/Melbourne", weekday: "short", hour: "2-digit", minute: "2-digit", hour12: false }).formatToParts(d || new Date());
   const get = (t) => (parts.find((x) => x.type === t) || {}).value || "";
@@ -4162,6 +4176,7 @@ function pushInHours(mode, d) {
 async function pushFlushHeld(env) {
   try {
     await pushTable(env);
+    await pushLoadBiz(env);
     const rows = ((await env.DB.prepare("SELECT endpoint, COUNT(*) AS n FROM push_held GROUP BY endpoint").all()).results) || [];
     for (const r of rows) {
       const sub = await env.DB.prepare("SELECT * FROM push_subs WHERE endpoint = ?").bind(r.endpoint).first();
@@ -4226,6 +4241,7 @@ async function pushForNotice(env, n, id) {
   try {
     if (!(PUSH_KINDS.includes(String(n.kind || "")) || n.todo)) return;
     await pushTable(env);
+    await pushLoadBiz(env);
     const to = String(n.to || "").toLowerCase();
     const rows = to === "@office"
       ? ((await env.DB.prepare("SELECT * FROM push_subs WHERE tier IN ('T1', 'T2')").all()).results) || []
@@ -4243,6 +4259,7 @@ async function pushRoutes(request, env, user, url) {
   const email = String(user.email || "").toLowerCase();
   if (!email) return reply(env, 400, { error: "No email on your sign in" });
   await pushTable(env);
+  if (url.pathname === "/api/push/business" && request.method === "GET") return reply(env, 200, bizText(await pushLoadBiz(env)));
   if (url.pathname === "/api/push/key" && request.method === "GET") return reply(env, 200, { key: (await pushKeys(env)).pub });
   if (url.pathname === "/api/push/status" && request.method === "GET") {
     const ep = url.searchParams.get("endpoint") || "";
@@ -4259,11 +4276,18 @@ async function pushRoutes(request, env, user, url) {
     const ep = String(s.endpoint || ""), p = String(s.keys && s.keys.p256dh || ""), a = String(s.keys && s.keys.auth || "");
     if (!/^https:\/\//.test(ep) || ep.length > 600 || !p || !a) return reply(env, 400, { error: "That subscription is not valid" });
     const subMode = Object.prototype.hasOwnProperty.call(PUSH_MODES, String(body.mode)) ? String(body.mode) : null;
-    await env.DB.prepare("INSERT INTO push_subs (endpoint, email, tier, p256dh, auth, ua, hours_mode, all_hours) VALUES (?, ?, ?, ?, ?, ?, COALESCE(?, '0700-1630'), ?) ON CONFLICT(endpoint) DO UPDATE SET email = excluded.email, tier = excluded.tier, p256dh = excluded.p256dh, auth = excluded.auth, ua = excluded.ua, hours_mode = COALESCE(?, hours_mode), all_hours = CASE WHEN ? IS NULL THEN all_hours WHEN ? = '24' THEN 1 ELSE 0 END").bind(ep, email, String(user.tier || "T3"), p, a, String(body.ua || "").slice(0, 160), subMode, subMode === "24" ? 1 : 0, subMode, subMode, subMode).run();
+    await env.DB.prepare("INSERT INTO push_subs (endpoint, email, tier, p256dh, auth, ua, hours_mode, all_hours) VALUES (?, ?, ?, ?, ?, ?, COALESCE(?, 'default'), ?) ON CONFLICT(endpoint) DO UPDATE SET email = excluded.email, tier = excluded.tier, p256dh = excluded.p256dh, auth = excluded.auth, ua = excluded.ua, hours_mode = COALESCE(?, hours_mode), all_hours = CASE WHEN ? IS NULL THEN all_hours WHEN ? = '24' THEN 1 ELSE 0 END").bind(ep, email, String(user.tier || "T3"), p, a, String(body.ua || "").slice(0, 160), subMode, subMode === "24" ? 1 : 0, subMode, subMode, subMode).run();
     return reply(env, 200, { ok: true });
   }
+  if (url.pathname === "/api/push/business") {
+    if (user.tier !== "T1" && user.tier !== "T2") return reply(env, 403, { error: "forbidden" });
+    const a = bizMins(body.start), b = bizMins(body.end);
+    if (a === null || b === null || b <= a || b > 1440) return reply(env, 400, { error: "Finish must be after start" });
+    await env.DB.prepare("INSERT INTO app_settings (key, value, by_name, at) VALUES ('business.hours', ?, ?, datetime('now')) ON CONFLICT(key) DO UPDATE SET value = excluded.value, by_name = excluded.by_name, at = excluded.at").bind(JSON.stringify(bizText([a, b])), String(user.name || "")).run();
+    return reply(env, 200, { ok: true, ...bizText([a, b]) });
+  }
   if (url.pathname === "/api/push/hours") {
-    const mode = Object.prototype.hasOwnProperty.call(PUSH_MODES, String(body.mode)) ? String(body.mode) : "0700-1630";
+    const mode = Object.prototype.hasOwnProperty.call(PUSH_MODES, String(body.mode)) ? String(body.mode) : "default";
     await env.DB.prepare("UPDATE push_subs SET hours_mode = ?, all_hours = ? WHERE endpoint = ? AND email = ?").bind(mode, mode === "24" ? 1 : 0, String(body.endpoint || ""), email).run();
     return reply(env, 200, { ok: true });
   }
