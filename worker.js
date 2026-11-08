@@ -5496,10 +5496,8 @@ export default {
             try {
               const isHb = docKind(row.kind) !== "policy";
               const staff = (((await env.DB.prepare("SELECT email, name FROM xero_payroll WHERE email IS NOT NULL AND email <> '' AND (status IS NULL OR status = 'ACTIVE')").all()).results) || []).filter((p) => !/andrew\s+wowk/i.test(String(p.name || "")));
-              // Directors (T1) write the policies, so they are not asked to acknowledge them.
-              let t1 = new Set();
-              try { const tr = await accessTiers(env); t1 = new Set(Object.keys(tr).filter((e) => tr[e] === "T1")); } catch (e) { /* if Entra cannot answer, only the director named above is skipped */ }
-              for (const p of staff.filter((q) => !t1.has(String(q.email).toLowerCase()))) await notify(env, { to: String(p.email).toLowerCase(), kind: "policy", title: `${row.title} has been updated`, body: `A new version of the ${isHb ? "handbook" : "policy"} is out. Open it, read it to the end and acknowledge it again.`, link: isHb ? "handbook" : "policies", by: user.name || who });
+              // Everyone is asked to acknowledge, every level. Only Andrew, the director, is skipped (filtered above).
+              for (const p of staff) await notify(env, { to: String(p.email).toLowerCase(), kind: "policy", title: `${row.title} has been updated`, body: `A new version of the ${isHb ? "handbook" : "policy"} is out. Open it, read it to the end and acknowledge it again.`, link: isHb ? "handbook" : "policies", by: user.name || who });
             } catch (e) { console.log("policy notice failed", String(e && e.message || e).slice(0, 200)); }
           }
           return reply(env, 200, { policy: policyOut(outV), archived });
