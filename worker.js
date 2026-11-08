@@ -326,7 +326,7 @@ const PROFILE_DATES = new Set(["driverExpiry", "wwccExpiry", "firstAidExpiry", "
 const profileKey = (name) => String(name || "").toLowerCase().replace(/[^a-z0-9]/g, "");
 // Uniform sizes only. Identification numbers, licences and tickets are not seeded: their real values are entered through Reservoir.
 const PROFILE_SEED_SIZES = [["Andrew Wowk", "L", "L", "XL"], ["Mitch Saba", "XL", "XL", "XL"], ["Hamish Burchell", "XXL", "XXL", "XXL"], ["Chad Lyons", "M", "L", "L"], ["Mark Hansen", "M", "L", "L"], ["Tyler Willey", "L", "XL", "XL"], ["Zac Rochow-O\u2019Toole", "L", "XL", "XL"], ["Tayler Reid", "L", "L", ""]];
-// ---- DFP Reservoir: the one table for everything DFP keeps about a person that never leaves DFP ----
+// ---- Reservoir: the one table for everything DFP keeps about a person that never leaves DFP ----
 // Replaces staff_profile, staff_emergency and staff_personal_email. One row per person, keyed by their name with spaces and punctuation removed (person_key), with the work email stored as soon as it is known. Rows are found by email first, then by name.
 // Holds: uniform sizes, identification numbers, licences, tickets, training, personal email and contract details. Vehicles stay in the fleet table.
 // Preferred name, time of birth and the emergency contact are here too, because they never go to or come from Xero. Bank details go back and forth with Xero, so they live in dfp_xero.
