@@ -3154,12 +3154,11 @@ async function budgetRoutes(request, env, user, url) {
         const list = j && j.Invoices || [];
         for (const inv of list) {
           const name = String(inv.Contact && inv.Contact.Name || "");
-          const kind = /pmfa/i.test(name) ? "pmfa" : /wex/i.test(name) ? "wex" : /microsoft/i.test(name) ? "microsoft" : "";
-          if (!kind) continue;
+          if (!name) continue;
           const amount = Number(inv.AmountDue);
           const due = xeroDate(inv.DueDateString || inv.DueDate);
           if (!due || !(amount > 0)) continue;
-          bills.push({ kind, due, amount: Math.round(amount * 100) / 100, number: String(inv.InvoiceNumber || ""), contact: name });
+          bills.push({ due, amount: Math.round(amount * 100) / 100, number: String(inv.InvoiceNumber || ""), contact: name });
         }
         if (list.length < 100) break;
       }
