@@ -6816,6 +6816,41 @@ export default {
       return reply(env, 200, { items: rows.map((r) => ({ id: r.id, group: r.grp, item: r.item, spec: r.spec || "" })) });
     }
 
+    if (url.pathname === "/api/team-tools") {
+      // The assigned driver tools list: what each driver is expected to carry. Read by everyone signed in, edited by T1 and T2 from the Team Tools tile. Deleting hides the tool.
+      await env.DB.prepare("CREATE TABLE IF NOT EXISTS team_tool_items (id INTEGER PRIMARY KEY AUTOINCREMENT, grp TEXT NOT NULL, item TEXT NOT NULL, spec TEXT, sort INTEGER, active INTEGER DEFAULT 1)").run();
+      const haveTeam = await env.DB.prepare("SELECT COUNT(*) AS n FROM team_tool_items").first();
+      if (!haveTeam || !haveTeam.n) {
+        const seedTeam = [["Power Tools",[["Drill/driver","Battery platform compatible with employee kit"],["Impact driver",""],["Nail gun",""],["Circular saw",""],["125 mm angle grinder",""],["SDS rotary hammer drill",""],["Reciprocating saw",""],["Torch","Rechargeable"],["Batteries and charger","Suitable quantity for a full workday"],["Multi-tool","Optional"]]],["Hand Tools",[["PVC/plastic pipe saw",""],["8 m tape measure",""],["1 m folding ruler",""],["Utility knife",""],["Plasterboard cutter",""],["Adjustable spanners","Assorted sizes"],["Multigrips",""],["Footprint grips",""],["Screwdriver set","Phillips and flat-head"],["Allen key set",""],["Hammer",""],["Spirit levels","300 mm and 600 mm"],["Flaring block",""],["Deburring tool",""],["Hacksaw",""],["Copper tube cutters",""],["Markers and pencils",""],["Tube benders","16 mm and 20 mm"],["Tin snips","Right-cut and left-cut"],["Combination square",""],["Cold chisel",""],["Wood chisel",""],["Caulking/silicone gun",""],["Mixer tap socket set",""],["Long-nose pliers",""],["File",""],["Tool bag",""],["Headlamp","Rechargeable"]]]];
+        let n = 0;
+        for (const g of seedTeam) for (const row of g[1]) await env.DB.prepare("INSERT INTO team_tool_items (grp, item, spec, sort) VALUES (?, ?, ?, ?)").bind(g[0], row[0], row[1], n++).run();
+      }
+      const teamRows = async () => (((await env.DB.prepare("SELECT id, grp, item, spec FROM team_tool_items WHERE active = 1 ORDER BY sort, id").all()).results) || []).map((r) => ({ id: r.id, group: r.grp, item: r.item, spec: r.spec || "" }));
+      if (request.method === "GET") return reply(env, 200, { items: await teamRows() });
+      if (request.method !== "POST") return reply(env, 405, { error: "method not allowed" });
+      if (user.tier !== "T1" && user.tier !== "T2") return reply(env, 403, { error: "forbidden" });
+      if (user.viewAs) return reply(env, 403, { error: "Viewing as someone else is read only." });
+      let body;
+      try { body = await request.json(); } catch (e) { return reply(env, 400, { error: "bad json" }); }
+      const name = String(body.item || "").trim().slice(0, 80), spec = String(body.spec || "").trim().slice(0, 120);
+      if (body.action === "add") {
+        if (!name) return reply(env, 400, { error: "Give the tool a name" });
+        const grp = String(body.group || "").trim().slice(0, 40) || "Hand Tools";
+        const last = await env.DB.prepare("SELECT MAX(sort) AS m FROM team_tool_items WHERE grp = ?").bind(grp).first();
+        const top = await env.DB.prepare("SELECT COALESCE(MAX(sort), 0) AS m FROM team_tool_items").first();
+        // Insert at the end of its group by pushing later rows down one place.
+        const at = last && last.m !== null && last.m !== undefined ? last.m + 1 : (top ? top.m : 0) + 1;
+        await env.DB.prepare("UPDATE team_tool_items SET sort = sort + 1 WHERE sort >= ?").bind(at).run();
+        await env.DB.prepare("INSERT INTO team_tool_items (grp, item, spec, sort) VALUES (?, ?, ?, ?)").bind(grp, name, spec, at).run();
+      } else if (body.action === "edit") {
+        if (!name) return reply(env, 400, { error: "Give the tool a name" });
+        await env.DB.prepare("UPDATE team_tool_items SET item = ?, spec = ? WHERE id = ?").bind(name, spec, Number(body.id)).run();
+      } else if (body.action === "delete") {
+        await env.DB.prepare("UPDATE team_tool_items SET active = 0 WHERE id = ?").bind(Number(body.id)).run();
+      } else return reply(env, 400, { error: "unknown action" });
+      return reply(env, 200, { items: await teamRows() });
+    }
+
     const tm = url.pathname.match(/^\/api\/fleet\/([A-Za-z0-9_-]{1,64})\/tools$/);
     if (tm) {
       // The Vehicle Tools check. Whoever takes in a vehicle ticks off what is on it; each save is kept, so the next swap can be compared with the last.
