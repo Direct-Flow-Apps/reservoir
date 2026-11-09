@@ -5610,7 +5610,7 @@ export default {
         for (const k of def.keys) if (Object.prototype.hasOwnProperty.call(keep, k)) bits.push(/Expiry$/.test(k) ? `Expiry ${dmyOf(saved[k])}` : /Class$/.test(k) ? `Class ${saved[k]}` : `Number ${saved[k]}`);
         if (newIds.length) bits.push(newIds.length > 1 ? "Front and back photos added" : "Front photo added");
         const first = String(user.name || user.email).split(" ")[0];
-        await notify(env, { to: "@office", kind: "card", title: `${first} updated their ${def.label}`, body: bits.join(". "), todo: true, link: "", data: { card: body.card, label: def.label, email: String(user.email || "").toLowerCase(), name: user.name || "", photo: saved[def.copy] || "" }, by: user.name || user.email });
+        // The office is not notified when someone saves a licence or registration card.
         await env.DB.prepare("INSERT INTO profile_audit (event, person, email, section, section_title, fields, by_name, note) VALUES ('card saved', ?, ?, ?, ?, ?, ?, ?)").bind(user.name || "", String(user.email || "").toLowerCase(), String(body.card), def.label, JSON.stringify(Object.keys(keep)), user.name || user.email || "", bits.join(". ").slice(0, 300)).run();
         return reply(env, 200, { saved: true, profile: saved });
       } catch (e) {
