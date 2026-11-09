@@ -3140,8 +3140,34 @@ async function accessRoutes(request, env, user, url) {
 }
 // ---- Budget. The expense list, what is ticked paid this month and the weekly transfer, kept in one settings row so it survives reloads and is the same on every device. T1 and T2 only. ----
 async function budgetRoutes(request, env, user, url) {
-  if (url.pathname !== "/api/budget") return null;
+  if (url.pathname !== "/api/budget" && url.pathname !== "/api/budget/bills") return null;
   if (user.tier !== "T1" && user.tier !== "T2") return reply(env, 403, { error: "forbidden" });
+  if (url.pathname === "/api/budget/bills") {
+    // The Awaiting Payment list from Xero for the lines whose amount changes every bill (PMFA, WEX Motorpass, Microsoft). The Expenses screen matches these to the week they fall due.
+    if (request.method !== "GET") return reply(env, 404, { error: "not found" });
+    try {
+      const bills = [];
+      for (let page = 1; page <= 3; page++) {
+        const res = await xeroFetch(env, `api.xro/2.0/Invoices?where=${encodeURIComponent('Type=="ACCPAY" AND Status=="AUTHORISED"')}&page=${page}`);
+        if (!res.ok) return reply(env, 200, { ok: false, error: `Xero ${res.status}`, bills: [] });
+        const j = await res.json();
+        const list = j && j.Invoices || [];
+        for (const inv of list) {
+          const name = String(inv.Contact && inv.Contact.Name || "");
+          const kind = /pmfa/i.test(name) ? "pmfa" : /wex/i.test(name) ? "wex" : /microsoft/i.test(name) ? "microsoft" : "";
+          if (!kind) continue;
+          const amount = Number(inv.AmountDue);
+          const due = xeroDate(inv.DueDateString || inv.DueDate);
+          if (!due || !(amount > 0)) continue;
+          bills.push({ kind, due, amount: Math.round(amount * 100) / 100, number: String(inv.InvoiceNumber || ""), contact: name });
+        }
+        if (list.length < 100) break;
+      }
+      return reply(env, 200, { ok: true, bills });
+    } catch (e) {
+      return reply(env, 200, { ok: false, error: String(e && e.message || e).slice(0, 200), bills: [] });
+    }
+  }
   await settingsTable(env);
   if (request.method === "GET") {
     const row = await env.DB.prepare("SELECT value, by_name, at FROM app_settings WHERE key = 'budget.state'").first();
