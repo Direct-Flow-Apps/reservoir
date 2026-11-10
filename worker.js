@@ -3017,20 +3017,35 @@ async function xeroBillFromPdf(env, rule, bytes, fileName, parsed) {
     const body = { Invoices: [{ Type: "ACCPAY", Contact: { ContactID: contact.contact_id }, InvoiceNumber: parsed.number, Date: parsed.date, LineAmountTypes: "Exclusive", Status: status, LineItems: [line] }] };
     return xeroFetch(env, "api.xro/2.0/Invoices?summarizeErrors=false", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
   };
+  const created = async (status) => {
+    const res = await make(status);
+    if (!res.ok) return { err: `Xero ${res.status}: ${String(await res.text()).slice(0, 160)}` };
+    const inv = (((await res.json()).Invoices) || [])[0] || {};
+    const msgs = [...(inv.ValidationErrors || []), ...(((inv.Warnings) || []))].map((e) => e.Message).filter(Boolean).join("; ");
+    if (!inv.InvoiceID || /^0+(-0+)*$/.test(inv.InvoiceID) || inv.StatusAttributeString === "ERROR") return { err: msgs || "Xero did not save the bill" };
+    return { inv };
+  };
   let status = "AUTHORISED";
-  let res = account ? await make("AUTHORISED") : null;
   let why = account ? "" : "no purchases account set for the contact";
-  if (res && !res.ok) { why = `Xero ${res.status}`; res = null; }
-  if (!res) { status = "DRAFT"; res = await make("DRAFT"); }
-  if (!res.ok) return { ok: false, note: `Xero ${res.status}: ${String(await res.text()).slice(0, 160)}` };
-  const inv = (((await res.json()).Invoices) || [])[0] || {};
-  const invErr = (inv.ValidationErrors || []).map((e) => e.Message).join("; ");
-  if (!inv.InvoiceID) return { ok: false, note: `Xero would not create it. ${invErr}`.trim() };
-  if (Math.abs(Number(inv.Total) - parsed.inc) > 0.02) return { ok: true, status: inv.Status, id: inv.InvoiceID, note: `created but Xero total ${inv.Total} differs from the PDF ${parsed.inc}` };
+  let r = account ? await created("AUTHORISED") : { err: why };
+  if (r.err) { why = r.err; status = "DRAFT"; r = await created("DRAFT"); }
+  if (r.err) return { ok: false, note: `${why ? why + ". " : ""}${r.err}`.slice(0, 220) };
+  const inv = r.inv;
+  // Read the bill back from Xero so the screen can say which organisation it landed in and what its status is.
+  let seen = "";
+  try {
+    const rb = await xeroFetch(env, `api.xro/2.0/Invoices/${inv.InvoiceID}`);
+    const rj = rb.ok ? await rb.json() : null;
+    const got = rj && rj.Invoices && rj.Invoices[0];
+    const og = await xeroFetch(env, "api.xro/2.0/Organisation");
+    const oj = og.ok ? await og.json() : null;
+    const org = oj && oj.Organisations && oj.Organisations[0] && oj.Organisations[0].Name;
+    seen = got ? `read back from ${org || "Xero"}: ${got.Status}, ${got.Contact && got.Contact.Name}, total ${got.Total}` : "could not read it back from Xero";
+  } catch (e) { seen = "could not read it back from Xero"; }
   let attached = "";
   const at = await xeroFetch(env, `api.xro/2.0/Invoices/${inv.InvoiceID}/Attachments/${encodeURIComponent(fileName)}`, { method: "PUT", headers: { "Content-Type": "application/pdf" }, body: bytes });
-  if (!at.ok) attached = `PDF not attached (Xero ${at.status})`;
-  return { ok: true, status: inv.Status, id: inv.InvoiceID, note: [status === "DRAFT" && why ? `left as draft (${why})` : "", attached].filter(Boolean).join(". ") };
+  if (!at.ok) attached = `PDF not attached (Xero ${at.status}: ${String(await at.text()).replace(/\s+/g, " ").slice(0, 120)})`;
+  return { ok: true, status: inv.Status, id: inv.InvoiceID, note: [status === "DRAFT" && why ? `left as draft (${why})` : "", seen, attached].filter(Boolean).join(". ") };
 }
 const INVOICE_MAIL_RULES = [{ from: "burnetts-noreply@mail.myframeworks.com.au", subject: "BURNETTS PLUMBING SUPPLIES INVOICE", contact: "burnett", account: "" }];
 const MAILBOXES = [
@@ -7091,9 +7106,9 @@ export default {
         const items = [];
         await settingsTable(env);
         // One time reset of the markers from the first test, so that invoice goes to AroFlo and Xero again.
-        if (!(await env.DB.prepare("SELECT key FROM app_settings WHERE key = 'oneoff.invmail_reset_20261111'").first())) {
+        if (!(await env.DB.prepare("SELECT key FROM app_settings WHERE key = 'oneoff.invmail_reset_20261111b'").first())) {
           await env.DB.prepare("DELETE FROM app_settings WHERE key LIKE 'invmail.%'").run();
-          await env.DB.prepare("INSERT OR REPLACE INTO app_settings (key, value, detail, by_name, at) VALUES ('oneoff.invmail_reset_20261111', '1', 'reset', 'One off', datetime('now'))").run();
+          await env.DB.prepare("INSERT OR REPLACE INTO app_settings (key, value, detail, by_name, at) VALUES ('oneoff.invmail_reset_20261111b', '1', 'reset', 'One off', datetime('now'))").run();
         }
         const done = async (k) => !!(await env.DB.prepare("SELECT key FROM app_settings WHERE key = ?").bind(k).first());
         const mark = (k, d) => env.DB.prepare("INSERT OR REPLACE INTO app_settings (key, value, detail, by_name, at) VALUES (?, '1', ?, ?, datetime('now'))").bind(k, String(d).slice(0, 200), user.name).run();
