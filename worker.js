@@ -7088,35 +7088,53 @@ export default {
         if (!at.ok) return reply(env, 200, { ok: false, error: mailWhy(at) });
         const pdfs = ((at.json && at.json.value) || []).filter((x) => !x.isInline && (/pdf/i.test(x.contentType || "") || /\.pdf$/i.test(x.name || "")));
         const failed = [];
-        const notes = [];
-        let sentFiles = 0;
+        const items = [];
         await settingsTable(env);
+        // One time reset of the markers from the first test, so that invoice goes to AroFlo and Xero again.
+        if (!(await env.DB.prepare("SELECT key FROM app_settings WHERE key = 'oneoff.invmail_reset_20261111'").first())) {
+          await env.DB.prepare("DELETE FROM app_settings WHERE key LIKE 'invmail.%'").run();
+          await env.DB.prepare("INSERT OR REPLACE INTO app_settings (key, value, detail, by_name, at) VALUES ('oneoff.invmail_reset_20261111', '1', 'reset', 'One off', datetime('now'))").run();
+        }
         const done = async (k) => !!(await env.DB.prepare("SELECT key FROM app_settings WHERE key = ?").bind(k).first());
         const mark = (k, d) => env.DB.prepare("INSERT OR REPLACE INTO app_settings (key, value, detail, by_name, at) VALUES (?, '1', ?, ?, datetime('now'))").bind(k, String(d).slice(0, 200), user.name).run();
+        let allOk = pdfs.length > 0;
         for (const p of pdfs) {
-          if (Number(p.size || 0) > MAX_EMAIL) { failed.push(`${p.name} is over 3.5 MB`); continue; }
+          const fname = String(p.name || "invoice.pdf").slice(0, 150);
+          const it = { file: fname, number: "", aroflo: "", xero: "", xeroNote: "" };
+          items.push(it);
+          if (Number(p.size || 0) > MAX_EMAIL) { failed.push(`${fname} is over 3.5 MB`); allOk = false; continue; }
           const res = await graphFetch(env, `/users/${encodeURIComponent(addr)}/messages/${encodeURIComponent(hit.id)}/attachments/${encodeURIComponent(p.id)}/$value`);
-          if (!res.ok) { failed.push(`${p.name} could not be read`); continue; }
+          if (!res.ok) { failed.push(`${fname} could not be read`); allOk = false; continue; }
           const buf = await res.arrayBuffer();
           const b64 = toB64(buf);
-          const fname = String(p.name || "invoice.pdf").slice(0, 150);
+          let parsed = null;
+          try { parsed = await burnettsParse(buf); } catch (e) { parsed = null; }
+          it.number = parsed ? parsed.number : "";
           const key = `invmail.${hit.id.slice(-40)}.${p.id.slice(-20)}`;
-          let ok = true;
-          if (await done(key + ".aroflo")) notes.push(`${fname} already sent to AroFlo`);
-          else { try { await mailAttachment(env, user, to[0], fname, "application/pdf", b64); await mark(key + ".aroflo", "sent"); } catch (e) { ok = false; failed.push(`${fname} to AroFlo: ${String(e.message || "").slice(0, 80)}`); } }
-          if (await done(key + ".xero")) notes.push(`${fname} already in Xero`);
+          if (await done(key + ".aroflo")) it.aroflo = "already sent";
+          else { try { await mailAttachment(env, user, to[0], fname, "application/pdf", b64); await mark(key + ".aroflo", "sent"); it.aroflo = "sent"; } catch (e) { allOk = false; it.aroflo = "failed"; failed.push(`AroFlo: ${String(e.message || "").slice(0, 80)}`); } }
+          if (await done(key + ".xero")) it.xero = "already done";
           else {
-            let x = { ok: false, note: "not read" };
-            try { const parsed = await burnettsParse(buf); x = parsed ? await xeroBillFromPdf(env, rule, buf, fname, parsed) : { ok: false, note: "the PDF could not be read" }; } catch (e) { x = { ok: false, note: String(e && e.message || e).slice(0, 120) }; }
-            if (x.ok) { await mark(key + ".xero", x.status || "ok"); notes.push(`Xero ${String(x.status || "").toLowerCase()}${x.note ? `, ${x.note}` : ""}`); }
+            let x = { ok: false, note: "the PDF could not be read" };
+            try { if (parsed) x = await xeroBillFromPdf(env, rule, buf, fname, parsed); } catch (e) { x = { ok: false, note: String(e && e.message || e).slice(0, 160) }; }
+            if (x.ok && x.status === "AUTHORISED") { await mark(key + ".xero", "approved"); it.xero = "approved"; it.xeroNote = x.note || ""; }
+            else if (x.ok && x.status === "EXISTS") { await mark(key + ".xero", "exists"); it.xero = "already in Xero"; }
+            else if (x.ok) { await mark(key + ".xero", "draft"); it.xero = "draft"; it.xeroNote = x.note || ""; }
             else {
-              notes.push(`Xero API failed (${x.note}), sent by email as a draft`);
-              try { await mailAttachment(env, user, to[1], fname, "application/pdf", b64); await mark(key + ".xero", "emailed draft"); } catch (e) { ok = false; failed.push(`${fname} to Xero: ${String(e.message || "").slice(0, 80)}`); }
+              // The API route failed. Send it by email so it still reaches Xero as a draft, but do not mark it done.
+              it.xero = "failed, emailed as a draft";
+              it.xeroNote = x.note || "";
+              try { await mailAttachment(env, user, to[1], fname, "application/pdf", b64); } catch (e) { it.xero = "failed"; failed.push(`Xero: ${String(e.message || "").slice(0, 80)}`); }
+              allOk = false;
             }
           }
-          if (ok) sentFiles++;
         }
-        return reply(env, 200, { ok: true, found: true, subject: String(hit.subject || "").slice(0, 120), files: sentFiles, notes: notes.join(". "), failed: failed.join(". ") });
+        let archived = "";
+        if (allOk) {
+          const mv = await graphFetch(env, `/users/${encodeURIComponent(addr)}/messages/${encodeURIComponent(hit.id)}/move`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ destinationId: "archive" }) });
+          archived = mv.ok ? "archived" : `not archived (Microsoft ${mv.status})`;
+        }
+        return reply(env, 200, { ok: true, found: true, subject: String(hit.subject || "").slice(0, 120), received: hit.receivedDateTime || "", items, archived, failed: failed.join(". ") });
       } catch (e) {
         return reply(env, 502, { error: "mailbox failed", detail: String(e.message || "").slice(0, 200) });
       }
