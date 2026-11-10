@@ -2945,6 +2945,7 @@ async function arofloDiscover(env) {
   return found;
 }
 // ---- Email Accounts. Read only view and new mail pings for four DFP mailboxes, through the same Microsoft Graph app as SharePoint. The app registration needs the Mail.Read application permission (admin consent), ideally limited to these mailboxes. ----
+const INVOICE_MAIL_RULES = [{ from: "burnetts-noreply@mail.myframeworks.com.au", subject: "BURNETTS PLUMBING SUPPLIES INVOICE" }];
 const MAILBOXES = [
   { id: "tayler", label: "Tayler", address: "tayler@directflow.com.au", only: ["tayler@directflow.com.au"] },
   { id: "jobs", label: "DFP Jobs", address: "dfpjobs@directflow.com.au", tiers: ["T1", "T2"] },
@@ -6978,6 +6979,43 @@ export default {
         return reply(env, 200, { ok: true });
       } catch (e) {
         return reply(env, 502, { error: "delete failed" });
+      }
+    }
+
+    if (url.pathname === "/api/invoices/mailbox" && request.method === "POST") {
+      // Pick the latest matching supplier email in the Accounts mailbox and send its PDF to AroFlo and Xero.
+      if (user.tier !== "T1") return reply(env, 403, { error: "forbidden" });
+      if (user.viewAs) return reply(env, 403, { error: "Viewing as someone else is read only." });
+      const to = [env.AROFLO_BILLS_EMAIL, env.XERO_BILLS_EMAIL];
+      if (!to[0] || !to[1]) return reply(env, 501, { error: "not set", detail: "AROFLO_BILLS_EMAIL or XERO_BILLS_EMAIL is not set on the Worker" });
+      try {
+        const box = MAILBOXES.find((x) => x.id === "accounts");
+        const addr = mailAddress(env, box);
+        const rule = INVOICE_MAIL_RULES[0];
+        const f = `receivedDateTime ge 1900-01-01T00:00:00Z and hasAttachments eq true and from/emailAddress/address eq '${rule.from}'`;
+        const r = await mailGraph(env, addr, `/mailFolders/inbox/messages?$top=25&$select=subject,receivedDateTime&$filter=${encodeURIComponent(f)}&$orderby=receivedDateTime desc`);
+        if (!r.ok) return reply(env, 200, { ok: false, error: mailWhy(r) });
+        const hit = ((r.json && r.json.value) || []).find((m) => String(m.subject || "").toLowerCase().includes(rule.subject.toLowerCase()));
+        if (!hit) return reply(env, 200, { ok: true, found: false });
+        const at = await mailGraph(env, addr, `/messages/${encodeURIComponent(hit.id)}/attachments?$select=id,name,contentType,size,isInline`);
+        if (!at.ok) return reply(env, 200, { ok: false, error: mailWhy(at) });
+        const pdfs = ((at.json && at.json.value) || []).filter((x) => !x.isInline && (/pdf/i.test(x.contentType || "") || /\.pdf$/i.test(x.name || "")));
+        const failed = [];
+        let sentFiles = 0;
+        for (const p of pdfs) {
+          if (Number(p.size || 0) > MAX_EMAIL) { failed.push(`${p.name} is over 3.5 MB`); continue; }
+          const res = await graphFetch(env, `/users/${encodeURIComponent(addr)}/messages/${encodeURIComponent(hit.id)}/attachments/${encodeURIComponent(p.id)}/$value`);
+          if (!res.ok) { failed.push(`${p.name} could not be read`); continue; }
+          const b64 = toB64(await res.arrayBuffer());
+          let ok = true;
+          for (const dest of to) {
+            try { await mailAttachment(env, user, dest, String(p.name || "invoice.pdf").slice(0, 150), "application/pdf", b64); } catch (e) { ok = false; failed.push(`${p.name} to ${dest === to[0] ? "AroFlo" : "Xero"}: ${String(e.message || "").slice(0, 80)}`); }
+          }
+          if (ok) sentFiles++;
+        }
+        return reply(env, 200, { ok: true, found: true, subject: String(hit.subject || "").slice(0, 120), files: sentFiles, failed: failed.join(". ") });
+      } catch (e) {
+        return reply(env, 502, { error: "mailbox failed", detail: String(e.message || "").slice(0, 200) });
       }
     }
 
