@@ -3000,6 +3000,13 @@ async function burnettsParse(bytes) {
   return { number, date: `${dm[3]}-${String(mi + 1).padStart(2, "0")}-${String(dm[1]).padStart(2, "0")}`, ex, gst, inc, order: near("Cust Order #.", 380) };
 }
 // Creates the bill in Xero as approved (falls back to draft if Xero will not approve it) and attaches the PDF. Returns { ok, status, id, note }.
+// Due on the last business day (Monday to Friday) of the month after the invoice month.
+function billDueDate(iso) {
+  const [y, m] = iso.split("-").map(Number);
+  const d = new Date(Date.UTC(y, m + 1, 0));
+  while (d.getUTCDay() === 0 || d.getUTCDay() === 6) d.setUTCDate(d.getUTCDate() - 1);
+  return d.toISOString().slice(0, 10);
+}
 async function xeroBillFromPdf(env, rule, bytes, fileName, parsed) {
   await xeroContactsTable(env);
   const rows = ((await env.DB.prepare("SELECT contact_id, name FROM xero_contacts WHERE name_lc LIKE ?").bind(`%${rule.contact.toLowerCase()}%`).all()).results) || [];
@@ -3014,7 +3021,7 @@ async function xeroBillFromPdf(env, rule, bytes, fileName, parsed) {
   const make = async (status) => {
     const line = { Description: `${rule.contact} invoice ${parsed.number}${parsed.order ? ` (order ${parsed.order})` : ""}`, Quantity: 1, UnitAmount: parsed.ex, TaxType: "INPUT" };
     if (account) line.AccountCode = account;
-    const body = { Invoices: [{ Type: "ACCPAY", Contact: { ContactID: contact.contact_id }, InvoiceNumber: parsed.number, Date: parsed.date, LineAmountTypes: "Exclusive", Status: status, LineItems: [line] }] };
+    const body = { Invoices: [{ Type: "ACCPAY", Contact: { ContactID: contact.contact_id }, InvoiceNumber: parsed.number, Date: parsed.date, DueDate: billDueDate(parsed.date), LineAmountTypes: "Exclusive", Status: status, LineItems: [line] }] };
     return xeroFetch(env, "api.xro/2.0/Invoices?summarizeErrors=false", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
   };
   const created = async (status) => {
@@ -7106,9 +7113,9 @@ export default {
         const items = [];
         await settingsTable(env);
         // One time reset of the markers from the first test, so that invoice goes to AroFlo and Xero again.
-        if (!(await env.DB.prepare("SELECT key FROM app_settings WHERE key = 'oneoff.invmail_reset_20261111b'").first())) {
+        if (!(await env.DB.prepare("SELECT key FROM app_settings WHERE key = 'oneoff.invmail_reset_20261111c'").first())) {
           await env.DB.prepare("DELETE FROM app_settings WHERE key LIKE 'invmail.%'").run();
-          await env.DB.prepare("INSERT OR REPLACE INTO app_settings (key, value, detail, by_name, at) VALUES ('oneoff.invmail_reset_20261111b', '1', 'reset', 'One off', datetime('now'))").run();
+          await env.DB.prepare("INSERT OR REPLACE INTO app_settings (key, value, detail, by_name, at) VALUES ('oneoff.invmail_reset_20261111c', '1', 'reset', 'One off', datetime('now'))").run();
         }
         const done = async (k) => !!(await env.DB.prepare("SELECT key FROM app_settings WHERE key = ?").bind(k).first());
         const mark = (k, d) => env.DB.prepare("INSERT OR REPLACE INTO app_settings (key, value, detail, by_name, at) VALUES (?, '1', ?, ?, datetime('now'))").bind(k, String(d).slice(0, 200), user.name).run();
