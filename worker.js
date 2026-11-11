@@ -3107,11 +3107,12 @@ async function pdfTextRuns(bytes) {
     const unesc = (s) => s.replace(/\\([0-7]{1,3}|.)/g, (_, c) => (/^[0-7]+$/.test(c) ? String.fromCharCode(parseInt(c, 8)) : c === "n" ? "\n" : c === "r" ? "\r" : c === "t" ? "\t" : c));
     const bt = /BT([\s\S]*?)ET/g;
     let b;
+    let font = "", fsize = 0; // text state carries over between BT blocks
     while ((b = bt.exec(text))) {
       let x = 0, y = 0, lead = 0;
       const nums = [];
       const tok = /\[((?:\((?:\\.|[^\\)])*\)|[^\]])*)\]|\(((?:\\.|[^\\)])*)\)|<([0-9A-Fa-f\s]+)>|\/([A-Za-z0-9_.+-]+)|(-?[\d.]+)|([A-Za-z*'"]+)/g;
-      let t, last = null, font = "", fsize = 0;
+      let t, last = null;
       const emit = async (str, hex) => {
         if (hex) {
           // Hex strings are glyph numbers, two bytes each, turned into text by the font's ToUnicode map.
@@ -3413,6 +3414,24 @@ async function adamsonsParse(bytes) {
   if (!/^\d{5,}$/.test(number) || !dm || mi < 0 || !/^\d{1,2}$/.test(dm[0]) || !/^\d{4}$/.test(dm[2]) || !(ex > 0) || !(inc > 0) || Math.abs(ex + gst - inc) > 0.02) return null;
   return { number, date: `${dm[2]}-${String(mi + 1).padStart(2, "0")}-${String(dm[0]).padStart(2, "0")}`, due: dmi >= 0 ? `${due[3]}-${String(dmi + 1).padStart(2, "0")}-${String(due[1]).padStart(2, "0")}` : undefined, ex, gst, inc, order: "" };
 }
+async function superloopParse(bytes) {
+  const items = await pdfTextRuns(bytes);
+  if (!items.length) return null;
+  const isNeg = (t) => /^\(.*\)$|^-|-$|CR$/i.test(String(t).trim());
+  const money = (t) => { const n = Number(String(t).replace(/[^0-9.]/g, "")); return isNeg(t) ? -n : n; };
+  const label = (name) => items.filter((i) => i.t.trim().toLowerCase() === name.toLowerCase()).sort((a, b) => b.y - a.y)[0];
+  const side = (name) => { const l = label(name); if (!l) return ""; const v = items.filter((i) => i.page === l.page && Math.abs(i.y - l.y) < 4 && i.x > l.x + 20 && /\d/.test(i.t)).sort((a, b) => a.x - b.x)[0]; return v ? v.t.trim() : ""; };
+  const mon = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+  const dateOf = (t) => { const m = String(t).trim().match(/^(\d{1,2})\s+([A-Za-z]{3})[a-z]*\s+(\d{4})$/); const mi = m ? mon.indexOf(m[2].toLowerCase()) : -1; return m && mi >= 0 ? `${m[3]}-${String(mi + 1).padStart(2, "0")}-${String(m[1]).padStart(2, "0")}` : ""; };
+  const incT = side("This Bill:"), gstT = side("Includes GST");
+  const inc = money(incT), gst = money(gstT);
+  if (isNeg(incT) || inc < 0 || items.some((i) => /credit note/i.test(i.t))) return { credit: true };
+  const number = side("Invoice Number:");
+  const date = dateOf(side("Date of Issue:")), due = dateOf(side("This Bill Due:"));
+  const ex = Math.round((inc - gst) * 100) / 100;
+  if (!/^[A-Z]?\d{5,}$/i.test(number) || !date || !(inc > 0) || !(gst >= 0) || !(ex > 0)) return null;
+  return { number, date, due: due || undefined, ex, gst, inc, order: "" };
+}
 // Due on the last business day (Monday to Friday) of the month after the invoice month.
 function billDueDate(iso) {
   const [y, m] = iso.split("-").map(Number);
@@ -3480,7 +3499,8 @@ const INVOICE_MAIL_RULES = [
   { name: "Bunnings", from: "creditedelivery@edelivery.bunnings.com.au", subject: "your bunnings statement", contact: "bunnings", account: "", xeroOnly: true, parse: (b) => bunningsParse(b) },
   { name: "JJ's Waste", from: "ar.melbourne@jjswaste.com.au", subject: "invoice for customer", contact: "jjs waste", account: "", xeroOnly: true, parse: (b) => jjsParse(b) },
   { name: "AroFlo", from: "billing@aroflo.com", subject: "aroflo billing", contact: "aroflo", account: "", xeroOnly: true, parse: (b) => aroFloParse(b) },
-  { name: "Adamsons", from: "messaging-service@post.xero.com", subject: "from adamsons tax", contact: "adamsons", account: "", xeroOnly: true, parse: (b) => adamsonsParse(b) }
+  { name: "Adamsons", from: "messaging-service@post.xero.com", subject: "from adamsons tax", contact: "adamsons", account: "", xeroOnly: true, parse: (b) => adamsonsParse(b) },
+  { name: "Superloop", from: "noreply@superloop.com", subject: "your superloop bill", contact: "superloop", account: "", xeroOnly: true, parse: (b) => superloopParse(b) }
 ];
 const MAILBOXES = [
   { id: "tayler", label: "Tayler", address: "tayler@directflow.com.au", only: ["tayler@directflow.com.au"] },
