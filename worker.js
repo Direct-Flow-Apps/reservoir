@@ -3024,6 +3024,58 @@ async function harrisParse(bytes) {
   return { number, date: `${yr}-${String(dt[2]).padStart(2, "0")}-${String(dt[1]).padStart(2, "0")}`, ex, gst, inc, order: row("Order No") };
 }
 // Reader for PDFs that position text with Tm and kerned TJ arrays (Samios). Each item carries its page number (order of the content streams).
+// Small inflate used when the built in DecompressionStream refuses a stream (some generators write a window size the header does not match).
+function inflateBytes(src) {
+  let pos = 2, bitBuf = 0, bitCnt = 0;
+  const out = [];
+  const bits = (n) => { while (bitCnt < n) { if (pos >= src.length) throw new Error("eof"); bitBuf |= src[pos++] << bitCnt; bitCnt += 8; } const v = bitBuf & ((1 << n) - 1); bitBuf >>>= n; bitCnt -= n; return v; };
+  const build = (lens) => { const count = new Array(16).fill(0), offs = new Array(16).fill(0), syms = []; for (const l of lens) count[l]++; count[0] = 0; for (let i = 1; i < 16; i++) offs[i] = offs[i - 1] + count[i - 1]; lens.forEach((l, i) => { if (l) syms[offs[l]++] = i; }); return { count, syms }; };
+  const decode = (h) => { let code = 0, first = 0, index = 0; for (let len = 1; len < 16; len++) { code |= bits(1); const c = h.count[len]; if (code - c < first) return h.syms[index + (code - first)]; index += c; first += c; first <<= 1; code <<= 1; } throw new Error("bad code"); };
+  const LB = [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258], LE = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0];
+  const DB = [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577], DE = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13];
+  let fixedL = null, fixedD = null;
+  for (let last = 0; !last;) {
+    last = bits(1);
+    const type = bits(2);
+    if (type === 0) {
+      bitBuf = 0; bitCnt = 0;
+      const len = src[pos] | (src[pos + 1] << 8); pos += 4;
+      for (let i = 0; i < len; i++) out.push(src[pos++]);
+      continue;
+    }
+    let hl, hd;
+    if (type === 1) {
+      if (!fixedL) { const l = []; for (let i = 0; i < 144; i++) l.push(8); for (let i = 144; i < 256; i++) l.push(9); for (let i = 256; i < 280; i++) l.push(7); for (let i = 280; i < 288; i++) l.push(8); fixedL = build(l); fixedD = build(new Array(30).fill(5)); }
+      hl = fixedL; hd = fixedD;
+    } else if (type === 2) {
+      const nlen = bits(5) + 257, ndist = bits(5) + 1, ncode = bits(4) + 4;
+      const order = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15];
+      const cl = new Array(19).fill(0);
+      for (let i = 0; i < ncode; i++) cl[order[i]] = bits(3);
+      const ch = build(cl);
+      const lens = [];
+      while (lens.length < nlen + ndist) {
+        const sym = decode(ch);
+        if (sym < 16) lens.push(sym);
+        else { let prev = 0, rep; if (sym === 16) { prev = lens[lens.length - 1]; rep = 3 + bits(2); } else if (sym === 17) rep = 3 + bits(3); else rep = 11 + bits(7); for (let i = 0; i < rep; i++) lens.push(prev); }
+      }
+      hl = build(lens.slice(0, nlen)); hd = build(lens.slice(nlen));
+    } else throw new Error("bad block");
+    for (;;) {
+      const sym = decode(hl);
+      if (sym < 256) out.push(sym);
+      else if (sym === 256) break;
+      else {
+        const li = sym - 257; const len = LB[li] + bits(LE[li]);
+        const di = decode(hd); const dist = DB[di] + bits(DE[di]);
+        const from = out.length - dist;
+        if (from < 0) throw new Error("bad distance");
+        for (let i = 0; i < len; i++) out.push(out[from + i]);
+      }
+    }
+  }
+  return Uint8Array.from(out);
+}
 async function pdfTextRuns(bytes) {
   const raw = new Uint8Array(bytes);
   const bin = new TextDecoder("latin1").decode(raw);
@@ -3096,6 +3148,7 @@ async function pdfTextRuns(bytes) {
         let stop = data.length;
         if (trim) while (stop > 0 && (data[stop - 1] === 10 || data[stop - 1] === 13)) stop--;
         try { text = new TextDecoder("latin1").decode(await new Response(new Blob([data.slice(0, stop)]).stream().pipeThrough(new DecompressionStream("deflate"))).arrayBuffer()); break; } catch (e) { text = ""; }
+        if (!text) { try { text = new TextDecoder("latin1").decode(inflateBytes(data.slice(0, stop))); break; } catch (e) { text = ""; } }
       }
     } else {
       // Older PDFs (WEX) keep the page content uncompressed.
@@ -3432,6 +3485,21 @@ async function superloopParse(bytes) {
   if (!/^[A-Z]?\d{5,}$/i.test(number) || !date || !(inc > 0) || !(gst >= 0) || !(ex > 0)) return null;
   return { number, date, due: due || undefined, ex, gst, inc, order: "" };
 }
+async function soilworxParse(bytes) {
+  const items = await pdfTextRuns(bytes);
+  if (!items.length) return null;
+  const isNeg = (t) => /^\(.*\)$|^-|-$|CR$/i.test(String(t).trim());
+  const money = (t) => { const n = Number(String(t).replace(/[^0-9.]/g, "")); return isNeg(t) ? -n : n; };
+  const label = (name) => items.filter((i) => i.t.trim().toLowerCase() === name.toLowerCase()).sort((a, b) => a.y - b.y)[0];
+  const side = (name) => { const l = label(name); if (!l) return ""; const v = items.filter((i) => i.page === l.page && Math.abs(i.y - l.y) < 4 && i.x > l.x + 20 && /\d/.test(i.t)).sort((a, b) => a.x - b.x)[0]; return v ? v.t.trim() : ""; };
+  const subT = side("Sub Total"), extT = side("Total Extras"), gstT = side("Total Tax"), incT = side("Total");
+  const ex = Math.round((money(subT) + money(extT)) * 100) / 100, gst = money(gstT), inc = money(incT);
+  if (isNeg(incT) || inc < 0 || isNeg(subT) || items.some((i) => /credit note/i.test(i.t))) return { credit: true };
+  const number = side("INVOICE NO.");
+  const dt = side("DATE").match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (!/^INV\d{5,}$/i.test(number) || !dt || !(ex > 0) || !(inc > 0) || Math.abs(ex + gst - inc) > 0.02) return null;
+  return { number, date: `${dt[3]}-${String(dt[2]).padStart(2, "0")}-${String(dt[1]).padStart(2, "0")}`, ex, gst, inc, order: side("Cust. Ref.") };
+}
 // Due on the last business day (Monday to Friday) of the month after the invoice month.
 function billDueDate(iso) {
   const [y, m] = iso.split("-").map(Number);
@@ -3500,7 +3568,8 @@ const INVOICE_MAIL_RULES = [
   { name: "JJ's Waste", from: "ar.melbourne@jjswaste.com.au", subject: "invoice for customer", contact: "jjs waste", account: "", xeroOnly: true, parse: (b) => jjsParse(b) },
   { name: "AroFlo", from: "billing@aroflo.com", subject: "aroflo billing", contact: "aroflo", account: "", xeroOnly: true, parse: (b) => aroFloParse(b) },
   { name: "Adamsons", from: "messaging-service@post.xero.com", subject: "from adamsons tax", contact: "adamsons", account: "", xeroOnly: true, parse: (b) => adamsonsParse(b) },
-  { name: "Superloop", from: "noreply@superloop.com", subject: "your superloop bill", contact: "superloop", account: "", xeroOnly: true, parse: (b) => superloopParse(b) }
+  { name: "Superloop", from: "noreply@superloop.com", subject: "your superloop bill", contact: "superloop", account: "", xeroOnly: true, parse: (b) => superloopParse(b) },
+  { name: "Soilworx", from: "accounts@soilworx.com.au", subject: "inv", contact: "soilworx", account: "", parse: (b) => soilworxParse(b) }
 ];
 const MAILBOXES = [
   { id: "tayler", label: "Tayler", address: "tayler@directflow.com.au", only: ["tayler@directflow.com.au"] },
