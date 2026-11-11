@@ -3896,6 +3896,7 @@ const MAIL_ALIAS = { "inbox": "inbox", "sent items": "sentitems", "drafts": "dra
 const MAIL_HIDE = /^(conversation history|sync issues|conflicts|local failures|server failures|outbox|rss feeds|rss subscriptions|clutter|scheduled|yammer|quick step settings|social activity notifications|personmetadata|externalcontacts)/i;
 const mailPart = (x) => ({ name: String((x && x.emailAddress && x.emailAddress.name) || "").slice(0, 80), address: String((x && x.emailAddress && x.emailAddress.address) || "").slice(0, 120) });
 const mailShow = (x) => { const a = mailPart(x); return a.name || a.address; };
+const mailFlag = (f) => (f && (f.flagStatus === "flagged" || f.flagStatus === "complete")) ? f.flagStatus : "";
 const mailId = (v) => { const t = String(v || ""); return t && t.length < 600 ? t : ""; };
 const mailFolderId = (v) => { const t = String(v || "inbox"); return /^[A-Za-z0-9_\-=+\/.]{1,300}$/.test(t) ? t : "inbox"; };
 function mailRecipients(v) {
@@ -3917,7 +3918,7 @@ async function mailRoutes(request, env, user, url) {
     if (url.pathname === "/api/mail/boxes" && !post) {
       const out = await Promise.all(mine.map(async (b) => {
         const r = await mailGraph(env, mailAddress(env, b), "/mailFolders/inbox?$select=unreadItemCount");
-        return { id: b.id, label: b.label, unread: r.ok && r.json ? Number(r.json.unreadItemCount || 0) : 0, error: r.ok ? "" : mailWhy(r) };
+        return { id: b.id, label: b.label, personal: !!b.only, unread: r.ok && r.json ? Number(r.json.unreadItemCount || 0) : 0, error: r.ok ? "" : mailWhy(r) };
       }));
       return reply(env, 200, { boxes: out, worker: WORKER_BUILD });
     }
@@ -3957,7 +3958,7 @@ async function mailRoutes(request, env, user, url) {
       }
       const r = await mailGraph(env, addr, qs);
       if (!r.ok) return reply(env, 200, { ok: false, error: mailWhy(r), worker: WORKER_BUILD });
-      const list = ((r.json && r.json.value) || []).map((m) => ({ id: m.id, from: mailShow(m.from).slice(0, 80), to: ((m.toRecipients || []).map(mailShow).join(", ")).slice(0, 120), subject: String(m.subject || "(no subject)").slice(0, 160), at: m.receivedDateTime || "", read: !!m.isRead, attach: !!m.hasAttachments, categories: (m.categories || []).slice(0, 6).map((c) => String(c).slice(0, 40)), flag: !!(m.flag && m.flag.flagStatus === "flagged"), preview: String(m.bodyPreview || "").replace(/\s+/g, " ").slice(0, 140) }));
+      const list = ((r.json && r.json.value) || []).map((m) => ({ id: m.id, from: mailShow(m.from).slice(0, 80), fromAddr: mailPart(m.from).address.toLowerCase(), to: ((m.toRecipients || []).map(mailShow).join(", ")).slice(0, 120), subject: String(m.subject || "(no subject)").slice(0, 160), at: m.receivedDateTime || "", read: !!m.isRead, attach: !!m.hasAttachments, categories: (m.categories || []).slice(0, 6).map((c) => String(c).slice(0, 40)), flag: mailFlag(m.flag), preview: String(m.bodyPreview || "").replace(/\s+/g, " ").slice(0, 140) }));
       return reply(env, 200, { ok: true, label: box.label, messages: list, more: list.length >= top && !q, worker: WORKER_BUILD });
     }
     if (url.pathname === "/api/mail/message" && !post) {
@@ -3982,7 +3983,7 @@ async function mailRoutes(request, env, user, url) {
           } catch (e) {}
         }
       }
-      return reply(env, 200, { ok: true, id: m.id, subject: String(m.subject || "(no subject)"), from: mailPart(m.from), to: (m.toRecipients || []).map(mailPart), cc: (m.ccRecipients || []).map(mailPart), at: m.receivedDateTime || m.sentDateTime || "", read: !!m.isRead, categories: (m.categories || []).slice(0, 6).map((c) => String(c).slice(0, 40)), flag: !!(m.flag && m.flag.flagStatus === "flagged"), html, body: shown, attachments: (m.attachments || []).filter((a) => !a.isInline).map((a) => ({ id: a.id, name: String(a.name || "attachment").slice(0, 160), size: Number(a.size || 0), type: String(a.contentType || "") })), worker: WORKER_BUILD });
+      return reply(env, 200, { ok: true, id: m.id, subject: String(m.subject || "(no subject)"), from: mailPart(m.from), to: (m.toRecipients || []).map(mailPart), cc: (m.ccRecipients || []).map(mailPart), at: m.receivedDateTime || m.sentDateTime || "", read: !!m.isRead, categories: (m.categories || []).slice(0, 6).map((c) => String(c).slice(0, 40)), flag: mailFlag(m.flag), html, body: shown, attachments: (m.attachments || []).filter((a) => !a.isInline).map((a) => ({ id: a.id, name: String(a.name || "attachment").slice(0, 160), size: Number(a.size || 0), type: String(a.contentType || "") })), worker: WORKER_BUILD });
     }
     if (url.pathname === "/api/mail/categories" && !post) {
       const r = await mailGraph(env, addr, "/outlook/masterCategories");
@@ -4001,6 +4002,19 @@ async function mailRoutes(request, env, user, url) {
       const seen = new Set(), out = [];
       for (const c of found.flat()) { const k = (c.emails[0] || c.name).toLowerCase(); if (seen.has(k) || !c.emails.length) continue; seen.add(k); out.push(c); }
       return reply(env, 200, { ok: true, contacts: out.slice(0, 8), worker: WORKER_BUILD });
+    }
+    if (url.pathname === "/api/mail/senderphoto" && !post) {
+      const em = String(url.searchParams.get("email") || "").toLowerCase();
+      if (!/^[^\s@'"<>]+@[^\s@'"<>]+$/.test(em)) return new Response(null, { status: 404, headers: cors(env) });
+      for (const ob of mine) {
+        const owner = encodeURIComponent(mailAddress(env, ob));
+        const f = await graphFetch(env, `/users/${owner}/contacts?$filter=${encodeURIComponent(`emailAddresses/any(a:a/address eq '${em}')`)}&$select=id&$top=1`);
+        const cid = f.ok ? (((await f.json()).value || [])[0] || {}).id : "";
+        if (!cid) continue;
+        const res = await graphFetch(env, `/users/${owner}/contacts/${encodeURIComponent(cid)}/photo/$value`);
+        if (res.ok) return new Response(res.body, { status: 200, headers: { ...cors(env), "Content-Type": res.headers.get("Content-Type") || "image/jpeg", "Cache-Control": "private, max-age=3600" } });
+      }
+      return new Response(null, { status: 404, headers: cors(env) });
     }
     if (url.pathname === "/api/mail/contactphoto" && !post) {
       const cid = mailId(url.searchParams.get("cid"));
@@ -4023,7 +4037,7 @@ async function mailRoutes(request, env, user, url) {
       const done = (r) => r.ok ? reply(env, 200, { ok: true, worker: WORKER_BUILD }) : reply(env, 200, { ok: false, error: mailWhy(r, true), worker: WORKER_BUILD });
       if (act === "read" && msg) return done(await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}`, "PATCH", { isRead: !!body.read }));
       if (act === "archive" && msg) return done(await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}/move`, "POST", { destinationId: "archive" }));
-      if (act === "flag" && msg) return done(await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}`, "PATCH", { flag: { flagStatus: body.flagged ? "flagged" : "notFlagged" } }));
+      if (act === "flag" && msg) return done(await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}`, "PATCH", { flag: body.status === "complete" ? { flagStatus: "complete", completedDateTime: { dateTime: new Date().toISOString().slice(0, 19), timeZone: "UTC" } } : { flagStatus: body.status === "flagged" ? "flagged" : "notFlagged" } }));
       if (act === "categories" && msg) return done(await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}`, "PATCH", { categories: (Array.isArray(body.categories) ? body.categories : []).map((c) => String(c).slice(0, 40)).slice(0, 12) }));
       if (act === "delete" && msg) return done(await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}/move`, "POST", { destinationId: "deleteditems" }));
       if (act === "reply" && msg) return done(await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}/reply`, "POST", { comment: String(body.comment || "").slice(0, 200000) }));
