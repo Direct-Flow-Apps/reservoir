@@ -4767,6 +4767,17 @@ async function todosTable(env) {
   await env.DB.prepare("CREATE TABLE IF NOT EXISTS todo_workspaces (name TEXT PRIMARY KEY, members TEXT NOT NULL DEFAULT '[]', by_name TEXT, created_at TEXT, updated_at TEXT)").run();
   await env.DB.prepare("CREATE TABLE IF NOT EXISTS todo_items (id TEXT PRIMARY KEY, title TEXT NOT NULL, note TEXT, assigned_to TEXT, ws TEXT, due TEXT, repeat TEXT, done INTEGER NOT NULL DEFAULT 0, by_name TEXT, created TEXT, updated_at TEXT)").run();
   try { await env.DB.prepare("ALTER TABLE todo_items ADD COLUMN ord INTEGER NOT NULL DEFAULT 0").run(); } catch (e) {}
+  // One time: the finance tasks are moved into the Finance workspace.
+  try {
+    if (!(await migDone(env, "todo_finance_ws_v1"))) {
+      const now = new Date().toISOString();
+      await env.DB.prepare("INSERT OR IGNORE INTO todo_workspaces (name, members, by_name, created_at, updated_at) VALUES ('Finance', '[]', 'Tayler', ?, ?)").bind(now, now).run();
+      const titles = ["Bills to Pay", "Xero Reconciliations", "Accounts Receivables", "Amex Payment", "Expenses Transfer", "Monday Money to Andrew", "Client Invoice Statements"];
+      let n = 0;
+      for (const t of titles) { const r = await env.DB.prepare("UPDATE todo_items SET ws = 'Finance', updated_at = ? WHERE lower(title) = lower(?)").bind(now, t).run(); n += (r.meta && r.meta.changes) || 0; }
+      await migMark(env, "todo_finance_ws_v1", `${n} tasks moved to Finance`);
+    }
+  } catch (e) { todosReady = false; }
 }
 async function todosRoutes(request, env, user, url) {
   const m = url.pathname.match(/^\/api\/todos(?:\/(items|workspaces)\/([^/]{1,80}))?$/);
