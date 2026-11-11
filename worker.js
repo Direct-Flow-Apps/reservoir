@@ -7143,6 +7143,8 @@ export default {
           const hits = ((r.json && r.json.value) || []).filter((m) => String(m.subject || "").toLowerCase().includes(rule.subject.toLowerCase())).slice(0, 10);
           for (const hit of hits) {
             if ((hit.categories || []).some((c) => String(c).toLowerCase() === "credit")) { credits++; continue; }
+            // An email Reservoir tagged ERROR! waits until the tag is removed in Outlook.
+            if ((hit.categories || []).some((c) => String(c).toLowerCase() === "error!")) continue;
             const at = await mailGraph(env, addr, `/messages/${encodeURIComponent(hit.id)}/attachments?$select=id,name,contentType,size,isInline`);
             if (!at.ok) { lastErr = mailWhy(at); continue; }
             const pdfs = ((at.json && at.json.value) || []).filter((x) => !x.isInline && (/pdf/i.test(x.contentType || "") || /\.pdf$/i.test(x.name || "")));
@@ -7193,6 +7195,10 @@ export default {
               }
             }
             let archived = "";
+            if (!allOk) {
+              const tag = await graphFetch(env, `/users/${encodeURIComponent(addr)}/messages/${encodeURIComponent(hit.id)}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ categories: [...new Set([...(hit.categories || []), "ERROR!"])] }) }).catch(() => null);
+              archived = tag && tag.ok ? "left in the mailbox and tagged ERROR!" : "left in the mailbox (could not tag it ERROR!)";
+            }
             if (allOk) {
               const mv = await graphFetch(env, `/users/${encodeURIComponent(addr)}/messages/${encodeURIComponent(hit.id)}/move`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ destinationId: "archive" }) });
               archived = mv.ok ? "archived" : `not archived (Microsoft ${mv.status})`;
