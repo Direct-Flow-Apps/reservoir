@@ -3347,6 +3347,21 @@ async function bunningsParse(bytes) {
   const gst = Math.round((inc / 11) * 100) / 100;
   return { number: `${acct}-${String(dm[1]).padStart(2, "0")}${String(mi + 1).padStart(2, "0")}${dm[3].slice(2)}`, date, due: d.toISOString().slice(0, 10), ex: Math.round((inc - gst) * 100) / 100, gst, inc, inclusive: true, order: "" };
 }
+async function jjsParse(bytes) {
+  const items = await pdfTextRuns(bytes);
+  if (!items.length) return null;
+  const all = items.map((i) => i.t);
+  const first = (re) => { for (const t of all) { const m = t.match(re); if (m) return m; } return null; };
+  const num = first(/Invoice No:\s*(\d{6,})/i), iss = first(/Issue Date:\s*(\d{1,2})\/(\d{1,2})\/(\d{4})/i), due = first(/Due By:\s*(\d{1,2})\/(\d{1,2})\/(\d{4})/i);
+  const tot = first(/Total Due:\s*(-?)\$\s*([\d,.]+)\s*(cr)?/i), gstM = first(/Total GST for this invoice\s*\$\s*([\d,.]+)/i);
+  if (tot && (tot[1] || tot[3])) return { credit: true };
+  if (!num || !iss || !tot || !gstM) return null;
+  const inc = Number(tot[2].replace(/,/g, "")), gst = Number(gstM[1].replace(/,/g, ""));
+  const ex = Math.round((inc - gst) * 100) / 100;
+  if (!(inc > 0) || !(ex > 0) || !(gst >= 0)) return null;
+  const iso = (m) => `${m[3]}-${String(m[2]).padStart(2, "0")}-${String(m[1]).padStart(2, "0")}`;
+  return { number: num[1], date: iso(iss), due: due ? iso(due) : undefined, ex, gst, inc, order: "" };
+}
 // Due on the last business day (Monday to Friday) of the month after the invoice month.
 function billDueDate(iso) {
   const [y, m] = iso.split("-").map(Number);
@@ -3356,7 +3371,7 @@ function billDueDate(iso) {
 }
 async function xeroBillFromPdf(env, rule, bytes, fileName, parsed) {
   await xeroContactsTable(env);
-  const rows = ((await env.DB.prepare("SELECT contact_id, name FROM xero_contacts WHERE name_lc LIKE ?").bind(`%${rule.contact.toLowerCase()}%`).all()).results) || [];
+  const rows = ((await env.DB.prepare("SELECT contact_id, name FROM xero_contacts WHERE REPLACE(REPLACE(name_lc, char(8217), ''), char(39), '') LIKE ?").bind(`%${rule.contact.toLowerCase()}%`).all()).results) || [];
   if (rows.length !== 1) return { ok: false, note: rows.length ? `${rows.length} Xero contacts match ${rule.contact}` : `no Xero contact matches ${rule.contact}` };
   const contact = rows[0];
   const dup = await xeroFetch(env, `api.xro/2.0/Invoices?where=${encodeURIComponent(`Type=="ACCPAY" AND InvoiceNumber=="${parsed.number}" AND Contact.ContactID==Guid("${contact.contact_id}")`)}`);
@@ -3411,7 +3426,8 @@ const INVOICE_MAIL_RULES = [
   { name: "WEX Motorpass", from: "enquiries@motorpass.com.au", subject: "wex motorpass statement", contact: "wex", account: "", xeroOnly: true, parse: (b) => wexParse(b) },
   { name: "Daisys", from: "notifications@daisysgarden.com.au", subject: "daisys garden supplies pty ltd invoice", contact: "daisy", account: "", parse: (b) => daisysParse(b) },
   { name: "Plumbhaus", from: "messaging-service@post.xero.com", subject: "from plumbhaus co pty ltd", contact: "plumbhaus", account: "", parse: (b) => plumbhausParse(b) },
-  { name: "Bunnings", from: "creditedelivery@edelivery.bunnings.com.au", subject: "your bunnings statement", contact: "bunnings", account: "", xeroOnly: true, parse: (b) => bunningsParse(b) }
+  { name: "Bunnings", from: "creditedelivery@edelivery.bunnings.com.au", subject: "your bunnings statement", contact: "bunnings", account: "", xeroOnly: true, parse: (b) => bunningsParse(b) },
+  { name: "JJ's Waste", from: "ar.melbourne@jjswaste.com.au", subject: "invoice for customer", contact: "jjs waste", account: "", xeroOnly: true, parse: (b) => jjsParse(b) }
 ];
 const MAILBOXES = [
   { id: "tayler", label: "Tayler", address: "tayler@directflow.com.au", only: ["tayler@directflow.com.au"] },
