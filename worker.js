@@ -4778,6 +4778,19 @@ async function todosTable(env) {
       await migMark(env, "todo_finance_ws_v1", `${n} tasks moved to Finance`);
     }
   } catch (e) { todosReady = false; }
+  // One time: Finance and Payroll workspaces are combined as Payroll & Finance, like the home screen.
+  try {
+    if (!(await migDone(env, "todo_payfin_ws_v1"))) {
+      const now = new Date().toISOString();
+      const old = ((await env.DB.prepare("SELECT name, members FROM todo_workspaces WHERE lower(name) IN ('finance', 'payroll', 'payroll and finance', 'payroll & finance')").all()).results) || [];
+      const members = new Set();
+      for (const w of old) { try { for (const x of JSON.parse(w.members || "[]")) members.add(x); } catch (e) {} }
+      await env.DB.prepare("INSERT INTO todo_workspaces (name, members, by_name, created_at, updated_at) VALUES ('Payroll & Finance', ?, 'Tayler', ?, ?) ON CONFLICT(name) DO UPDATE SET members = excluded.members, updated_at = excluded.updated_at").bind(JSON.stringify([...members]), now, now).run();
+      await env.DB.prepare("UPDATE todo_items SET ws = 'Payroll & Finance', updated_at = ? WHERE lower(ws) IN ('finance', 'payroll', 'payroll and finance')").bind(now).run();
+      await env.DB.prepare("DELETE FROM todo_workspaces WHERE lower(name) IN ('finance', 'payroll', 'payroll and finance')").run();
+      await migMark(env, "todo_payfin_ws_v1", "Finance and Payroll combined");
+    }
+  } catch (e) { todosReady = false; }
 }
 async function todosRoutes(request, env, user, url) {
   const m = url.pathname.match(/^\/api\/todos(?:\/(items|workspaces)\/([^/]{1,80}))?$/);
