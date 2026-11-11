@@ -681,7 +681,7 @@ async function personalEmailFor(env, email) {
 }
 async function xeroTokenCall(env, params) {
   const res = await fetch("https://identity.xero.com/connect/token", { method: "POST", headers: { Authorization: xeroBasic(env), "Content-Type": "application/x-www-form-urlencoded" }, body: new URLSearchParams(params) });
-  if (!res.ok) throw new Error("xero token " + res.status + " " + (await res.text()).slice(0, 200));
+  if (!res.ok) throw new Error("xero token " + res.status + " " + (await res.text()).replace(/\s+/g, " ").slice(0, 500));
   return res.json();
 }
 // Returns a valid access token and tenant id, refreshing (and saving the rotated refresh token) when needed.
@@ -6067,14 +6067,27 @@ const invRulesSorted = () => [...INVOICE_MAIL_RULES].sort((a, b) => a.name.local
 let invFolderCache = "";
 async function invHistoryTable(env) {
   await env.DB.prepare("CREATE TABLE IF NOT EXISTS invoice_history (id INTEGER PRIMARY KEY AUTOINCREMENT, msg TEXT, supplier TEXT, number TEXT, status TEXT, detail TEXT, at TEXT DEFAULT (datetime('now')), month TEXT)").run();
-  try { await env.DB.prepare("ALTER TABLE invoice_history ADD COLUMN imid TEXT").run(); } catch (e) { /* already there */ }
+  for (const col of ["imid TEXT", "retried INTEGER", "manual INTEGER"]) { try { await env.DB.prepare(`ALTER TABLE invoice_history ADD COLUMN ${col}`).run(); } catch (e) { /* already there */ } }
 }
 async function invHistoryAdd(env, msg, supplier, number, status, detail, imid) {
   try {
     await invHistoryTable(env);
     if (msg) await env.DB.prepare("DELETE FROM invoice_history WHERE msg = ? AND status = 'error'").bind(msg).run();
-    await env.DB.prepare("INSERT INTO invoice_history (msg, supplier, number, status, detail, month, imid) VALUES (?, ?, ?, ?, ?, strftime('%Y-%m', 'now', '+11 hours'), ?)").bind(msg || "", supplier || "", String(number || "").slice(0, 80), status, String(detail || "").slice(0, 300), String(imid || "").slice(0, 400)).run();
+    await env.DB.prepare("INSERT INTO invoice_history (msg, supplier, number, status, detail, month, imid) VALUES (?, ?, ?, ?, ?, strftime('%Y-%m', 'now', '+11 hours'), ?)").bind(msg || "", supplier || "", String(number || "").slice(0, 80), status, String(detail || "").slice(0, 800), String(imid || "").slice(0, 400)).run();
   } catch (e) { console.log("invoice history failed", String(e && e.message || e)); }
+}
+// What the Uploaded Invoices screen shows: the successes (manual marks one that was entered by hand and ticked off) and the errors (retried marks one whose retry has failed, which gets the tick in place of the retry).
+async function invHistoryList(env) {
+  await invHistoryTidy(env);
+  const rows = ((await env.DB.prepare("SELECT id, supplier, number, status, detail, at, retried, manual FROM invoice_history ORDER BY id DESC LIMIT 300").all()).results) || [];
+  const out = (r) => ({ id: r.id, supplier: r.supplier, number: r.number, detail: r.detail || "", at: r.at, retried: !!r.retried, manual: !!r.manual || r.detail === "Rectified" });
+  return { done: rows.filter((r) => r.status === "done").map(out), errors: rows.filter((r) => r.status === "error").map(out) };
+}
+// The tick: the retry failed and the invoice was entered by hand, so the line moves to the successful history marked manual. Only a line whose retry has failed can be ticked.
+async function invManual(env, id) {
+  await invHistoryTable(env);
+  const r = await env.DB.prepare("UPDATE invoice_history SET status = 'done', manual = 1, detail = '' WHERE id = ? AND status = 'error' AND retried = 1").bind(id).run();
+  return !!(r.meta && r.meta.changes > 0);
 }
 // Successful invoices are kept for the current month and the one before it, so November goes on 1 January. Errors stay until someone clears them.
 async function invHistoryTidy(env) {
@@ -6149,7 +6162,7 @@ async function invProcessHit(env, actor, addr, rule, hit, inFolder, redo) {
     if (await done(key + ".xero")) { it.xero = "already done"; inXero = true; }
     else {
       let x = { ok: false, note: "the PDF could not be read" };
-      try { if (g.parsed) x = await xeroBillFromPdf(env, rule, g.buf, fname, g.parsed); } catch (e) { x = { ok: false, note: String(e && e.message || e).slice(0, 160) }; }
+      try { if (g.parsed) x = await xeroBillFromPdf(env, rule, g.buf, fname, g.parsed); } catch (e) { x = { ok: false, note: String(e && e.message || e).slice(0, 600) }; }
       if (x.ok && x.status === "AUTHORISED") { await mark(key + ".xero", "approved"); it.xero = "approved"; it.xeroNote = x.note || ""; inXero = true; }
       else if (x.ok && x.status === "EXISTS") { await mark(key + ".xero", "exists"); it.xero = "already in Xero"; inXero = true; }
       else if (x.ok) { await mark(key + ".xero", "draft"); it.xero = "draft"; it.xeroNote = x.note || ""; inXero = true; }
@@ -6199,6 +6212,7 @@ async function invFindEmail(env, addr, folderId, msgKey, imid) {
   return err ? { err } : { m: null };
 }
 // Retry a failed invoice from scratch: forget what was sent, take the ERROR! tag off the email and run it again, Xero first. The line moves to the successful history, or stays under errors with the new reason.
+// A line gets one retry. If it fails, the line is flagged retried and the screen swaps the retry for a tick, so the invoice is entered by hand and ticked off.
 async function invRetry(env, actor, id) {
   await settingsTable(env);
   await invHistoryTable(env);
@@ -6207,24 +6221,37 @@ async function invRetry(env, actor, id) {
   const [msgKey, fileKey] = String(row.msg || "").split(":");
   const lock = "invmail.retry." + msgKey;
   if (!msgKey || !(await invClaim(env, lock))) return { ok: false, error: "That invoice is already being retried." };
+  // The retry never ran the email: say why on the line itself, and put the ERROR! tag back if it was taken off, so nothing picks the email up again by itself.
+  let retag = null;
+  const stop = async (error, tagged) => {
+    if (retag && !tagged) await retag();
+    await env.DB.prepare("UPDATE invoice_history SET retried = 1, detail = ? WHERE id = ? AND status = 'error'").bind(String(error).slice(0, 800), row.id).run();
+    return { ok: false, error };
+  };
   try {
     const addr = mailAddress(env, MAILBOXES.find((x) => x.id === "accounts"));
     const folderId = await invFolderId(env, addr);
     const found = await invFindEmail(env, addr, folderId, msgKey, row.imid);
-    if (found.err) return { ok: false, error: found.err };
+    if (found.err) return stop(found.err);
     const hit = found.m;
-    if (!hit) return { ok: false, error: "The email for this invoice could not be found in the Accounts mailbox." };
+    if (!hit) return stop("The email for this invoice could not be found in the Accounts mailbox.");
     const rule = invMatchRule(hit);
-    if (!rule) return { ok: false, error: "No supplier rule matches that email any more." };
+    if (!rule) return stop("No supplier rule matches that email any more.");
     const cats = (hit.categories || []).filter((c) => String(c).toLowerCase() !== "error!");
     if (cats.length !== (hit.categories || []).length) {
-      await graphFetch(env, `/users/${encodeURIComponent(addr)}/messages/${encodeURIComponent(hit.id)}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ categories: cats }) }).catch(() => null);
+      const tag = (list) => graphFetch(env, `/users/${encodeURIComponent(addr)}/messages/${encodeURIComponent(hit.id)}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ categories: list }) }).catch(() => null);
+      await tag(cats);
       hit.categories = cats;
+      retag = () => tag([...cats, "ERROR!"]);
     }
+    // One press has to be enough, so the Xero login is tried up to three times here to get past a one off refusal.
+    for (let i = 0; i < 3; i++) { try { await xeroAccess(env); break; } catch (e) { if (i < 2) await xeroSleep(1500); } }
     const res = await invProcessHit(env, actor, addr, rule, hit, !!folderId && hit.parentFolderId === folderId, fileKey || true);
-    if (!res) return { ok: false, error: "That email no longer has a PDF attached." };
-    if (res.lastErr) return { ok: false, error: res.lastErr };
-    if (res.credit) return { ok: false, error: "That email is a credit, so it was tagged Credit and left in the inbox." };
+    if (!res) return stop("That email no longer has a PDF attached.");
+    if (res.lastErr) return stop(res.lastErr);
+    if (res.credit) return stop("That email is a credit, so it was tagged Credit and left in the inbox.", true);
+    // Every line of this email that is still an error has now had its retry.
+    await env.DB.prepare("UPDATE invoice_history SET retried = 1 WHERE status = 'error' AND (msg = ? OR msg LIKE ?)").bind(msgKey, msgKey + ":%").run();
     const still = await env.DB.prepare("SELECT detail FROM invoice_history WHERE msg = ? AND status = 'error'").bind(row.msg).first();
     return { ok: !still, error: still ? String(still.detail || "It did not go through.") : "", items: res.items, archived: res.archived };
   } finally {
@@ -8123,10 +8150,7 @@ export default {
     if (url.pathname === "/api/invoices/history" && request.method === "GET") {
       // What the mailbox pickup has done. Successes for this month and last, errors until they are cleared.
       if (user.tier !== "T1") return reply(env, 403, { error: "forbidden" });
-      await invHistoryTidy(env);
-      const rows = ((await env.DB.prepare("SELECT id, supplier, number, status, detail, at FROM invoice_history ORDER BY id DESC LIMIT 300").all()).results) || [];
-      const out = (r) => ({ id: r.id, supplier: r.supplier, number: r.number, detail: r.detail || "", at: r.at });
-      return reply(env, 200, { done: rows.filter((r) => r.status === "done").map(out), errors: rows.filter((r) => r.status === "error").map(out) });
+      return reply(env, 200, await invHistoryList(env));
     }
     const ih = url.pathname.match(/^\/api\/invoices\/history\/(\d{1,12})$/);
     if (ih && request.method === "DELETE") {
@@ -8137,6 +8161,12 @@ export default {
       return reply(env, 200, { ok: true });
     }
 
+    if (ih && request.method === "PATCH") {
+      // Tick: the retry failed, the invoice was entered by hand, so the line moves to the successful history marked Manual.
+      if (user.tier !== "T1") return reply(env, 403, { error: "forbidden" });
+      if (user.viewAs) return reply(env, 403, { error: "Viewing as someone else is read only." });
+      return reply(env, 200, { ok: await invManual(env, Number(ih[1])) });
+    }
     const iry = url.pathname.match(/^\/api\/invoices\/history\/(\d{1,12})\/retry$/);
     if (iry && request.method === "POST") {
       if (user.tier !== "T1") return reply(env, 403, { error: "forbidden" });
