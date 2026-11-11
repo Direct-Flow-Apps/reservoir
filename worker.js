@@ -3145,6 +3145,28 @@ async function reeceParse(bytes) {
   const yr = dt[3].length === 2 ? 2000 + Number(dt[3]) : Number(dt[3]);
   return { number, date: `${yr}-${String(dt[2]).padStart(2, "0")}-${String(dt[1]).padStart(2, "0")}`, ex, gst, inc, order: valueOf("Order No.") };
 }
+async function tradelinkParse(bytes) {
+  const items = await pdfTextRuns(bytes);
+  if (!items.length) return null;
+  const valueOf = (label) => {
+    const ls = items.filter((i) => i.t.trim().toLowerCase() === label.toLowerCase());
+    const l = ls[ls.length - 1];
+    if (!l) return "";
+    const v = items.filter((i) => i.page === l.page && Math.abs(i.y - l.y) < 4 && i.x > l.x + 20 && i !== l && i.t.trim()).sort((a, b) => a.x - b.x)[0];
+    return v ? v.t.trim() : "";
+  };
+  const isNeg = (t) => /^\(.*\)$|^-|-$|CR$/i.test(String(t).trim());
+  const money = (t) => { const n = Number(String(t).replace(/[^0-9.]/g, "")); return isNeg(t) ? -n : n; };
+  const exT = valueOf("Total Exclusive of GST $"), gstT = valueOf("GST $"), incT = valueOf("Total Incl. GST $");
+  const ex = money(exT), gst = money(gstT), inc = money(incT);
+  const credit = isNeg(exT) || isNeg(incT) || ex < 0 || inc < 0 || items.some((i) => /credit note|tax credit/i.test(i.t));
+  if (credit) return { credit: true };
+  const number = valueOf("Invoice Number:");
+  const dt = valueOf("Invoice Date:").match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/);
+  if (!/^\d{5,}$/.test(number) || !dt || !(ex > 0) || !(inc > 0) || Math.abs(ex + gst - inc) > 0.02) return null;
+  const yr = dt[3].length === 2 ? 2000 + Number(dt[3]) : Number(dt[3]);
+  return { number, date: `${yr}-${String(dt[2]).padStart(2, "0")}-${String(dt[1]).padStart(2, "0")}`, ex, gst, inc, order: valueOf("Customer PO:") };
+}
 // Due on the last business day (Monday to Friday) of the month after the invoice month.
 function billDueDate(iso) {
   const [y, m] = iso.split("-").map(Number);
@@ -3203,7 +3225,8 @@ const INVOICE_MAIL_RULES = [
   { name: "Burnett's", from: "burnetts-noreply@mail.myframeworks.com.au", subject: "BURNETTS PLUMBING SUPPLIES INVOICE", contact: "burnett", account: "", parse: (b) => burnettsParse(b) },
   { name: "Harris", from: "mailouts@harristps.com.au", subject: "invoice", contact: "harris", account: "", parse: (b) => harrisParse(b) },
   { name: "Samios", fromDomain: "samios.net.au", subject: "invoice", contact: "samios", account: "", parse: (b) => samiosParse(b) },
-  { name: "Reece", fromDomain: "reece.com.au", subject: "reece transactions", contact: "reece", account: "", parse: (b) => reeceParse(b) }
+  { name: "Reece", fromDomain: "reece.com.au", subject: "reece transactions", contact: "reece", account: "", parse: (b) => reeceParse(b) },
+  { name: "Tradelink", from: "donotreply@tradelink.com.au", subject: "tax invoice", contact: "tradelink", account: "", parse: (b) => tradelinkParse(b) }
 ];
 const MAILBOXES = [
   { id: "tayler", label: "Tayler", address: "tayler@directflow.com.au", only: ["tayler@directflow.com.au"] },
