@@ -7149,7 +7149,7 @@ export default {
       try {
         await reservoirTables(env);
         const row = await env.DB.prepare("SELECT email, name FROM dfp_xero WHERE lower(email) = ?").bind(email).first();
-        if (!row) return reply(env, 404, { error: "That person is not in the staff list" });
+        if (!row) return reply(env, 404, { error: "That person is not in the team list" });
         await reservoirOwnSet(env, row.email, row.name, { birth_time: when || null }, (user.email || "").toLowerCase());
         return reply(env, 200, { ok: true, birthTime: when });
       } catch (e) {
@@ -7168,7 +7168,7 @@ export default {
       try {
         await reservoirTables(env);
         const row = await env.DB.prepare("SELECT email, name FROM dfp_xero WHERE lower(email) = ?").bind(email).first();
-        if (!row) return reply(env, 404, { error: "That person is not in the staff list" });
+        if (!row) return reply(env, 404, { error: "That person is not in the team list" });
         await reservoirOwnSet(env, row.email, row.name, { preferred_name: preferred || null }, (user.email || "").toLowerCase());
         return reply(env, 200, { ok: true, preferredName: preferred });
       } catch (e) {
@@ -7277,7 +7277,7 @@ export default {
         if (bytes.byteLength > MAX_UPLOAD) return reply(env, 413, { error: "file too large" });
         await reservoirTables(env);
         const person = await env.DB.prepare("SELECT x.name AS name, r.preferred_name AS preferred_name FROM dfp_xero x LEFT JOIN dfp_reservoir r ON lower(r.email) = lower(x.email) WHERE lower(x.email) = ?").bind(email).first();
-        if (!person || !person.name) return reply(env, 404, { error: "That person is not in the staff list" });
+        if (!person || !person.name) return reply(env, 404, { error: "That person is not in the team list" });
         const parts = String(person.name).trim().split(/\s+/);
         const first = parts[0], last = parts.slice(1).join(" ");
         const sr = await staffRoot(env);
