@@ -3500,6 +3500,24 @@ async function soilworxParse(bytes) {
   if (!/^INV\d{5,}$/i.test(number) || !dt || !(ex > 0) || !(inc > 0) || Math.abs(ex + gst - inc) > 0.02) return null;
   return { number, date: `${dt[3]}-${String(dt[2]).padStart(2, "0")}-${String(dt[1]).padStart(2, "0")}`, ex, gst, inc, order: side("Cust. Ref.") };
 }
+async function estimateOneParse(bytes) {
+  const items = await pdfTextRuns(bytes);
+  if (!items.length) return null;
+  // No usable line positions in this generator, so read the items in order: a label, then its value.
+  const t = items.map((i) => i.t.trim());
+  const nextOf = (label) => { const k = t.indexOf(label); return k < 0 ? "" : t[k + 1] || ""; };
+  const isNeg = (x) => /^\(.*\)$|^-|-$|CR$/i.test(String(x).trim());
+  const money = (x) => { const n = Number(String(x).replace(/[^0-9.]/g, "")); return isNeg(x) ? -n : n; };
+  const mon = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+  const dateOf = (x) => { const m = String(x).trim().match(/^([A-Za-z]{3})[a-z]*\s+(\d{1,2}),\s*(\d{4})$/); const mi = m ? mon.indexOf(m[1].toLowerCase()) : -1; return m && mi >= 0 ? `${m[3]}-${String(mi + 1).padStart(2, "0")}-${String(m[2]).padStart(2, "0")}` : ""; };
+  const exT = nextOf("Sub Total"), gstT = nextOf("GST @ 10%"), incT = nextOf("Invoice Amount");
+  const ex = money(exT), gst = money(gstT), inc = money(incT);
+  if (isNeg(incT) || inc < 0 || items.some((i) => /credit note/i.test(i.t))) return { credit: true };
+  const number = nextOf("Invoice #");
+  const date = dateOf(nextOf("Invoice Date")), dueRaw = dateOf(nextOf("Invoice Due Date"));
+  if (!/^\d{4,}$/.test(number) || !date || !(ex > 0) || !(inc > 0) || Math.abs(ex + gst - inc) > 0.02) return null;
+  return { number, date, due: dueRaw || date, ex, gst, inc, order: "" };
+}
 // Due on the last business day (Monday to Friday) of the month after the invoice month.
 function billDueDate(iso) {
   const [y, m] = iso.split("-").map(Number);
@@ -3569,7 +3587,8 @@ const INVOICE_MAIL_RULES = [
   { name: "AroFlo", from: "billing@aroflo.com", subject: "aroflo billing", contact: "aroflo", account: "", xeroOnly: true, parse: (b) => aroFloParse(b) },
   { name: "Adamsons", from: "messaging-service@post.xero.com", subject: "from adamsons tax", contact: "adamsons", account: "", xeroOnly: true, parse: (b) => adamsonsParse(b) },
   { name: "Superloop", from: "noreply@superloop.com", subject: "your superloop bill", contact: "superloop", account: "", xeroOnly: true, parse: (b) => superloopParse(b) },
-  { name: "Soilworx", from: "accounts@soilworx.com.au", subject: "inv", contact: "soilworx", account: "", parse: (b) => soilworxParse(b) }
+  { name: "Soilworx", from: "accounts@soilworx.com.au", subject: "inv", contact: "soilworx", account: "", parse: (b) => soilworxParse(b) },
+  { name: "Estimate One", from: "accounts@estimateone.com", subject: "your e1 invoice", contact: "estimate one", account: "", xeroOnly: true, parse: (b) => estimateOneParse(b) }
 ];
 const MAILBOXES = [
   { id: "tayler", label: "Tayler", address: "tayler@directflow.com.au", only: ["tayler@directflow.com.au"] },
