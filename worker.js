@@ -3028,6 +3028,43 @@ async function pdfTextRuns(bytes) {
   const raw = new Uint8Array(bytes);
   const bin = new TextDecoder("latin1").decode(raw);
   const items = [];
+  // Fonts that show glyph numbers in hex (Odoo, Qt) need the font's ToUnicode map to turn them back into text.
+  const inflate = async (st, en) => {
+    let cut = en;
+    while (cut > st && (raw[cut - 1] === 10 || raw[cut - 1] === 13)) cut--;
+    for (const stop of [cut, en]) {
+      try { return new TextDecoder("latin1").decode(await new Response(new Blob([raw.slice(st, stop)]).stream().pipeThrough(new DecompressionStream("deflate"))).arrayBuffer()); } catch (e) { /* try the next end */ }
+    }
+    return bin.slice(st, en);
+  };
+  const objBody = {};
+  for (const om of bin.matchAll(/(\d+)\s+0\s+obj([\s\S]*?)endobj/g)) objBody[om[1]] = { head: om[2], at: om.index + om[0].indexOf(om[2]) };
+  const fontObj = {};
+  for (const fm of bin.matchAll(/\/Font\s*<<([^>]*)>>/g)) for (const p of fm[1].matchAll(/\/([A-Za-z0-9_.+-]+)\s+(\d+)\s+0\s+R/g)) fontObj[p[1]] = p[2];
+  const cmaps = {};
+  const cmapOf = async (fname) => {
+    if (fname in cmaps) return cmaps[fname];
+    cmaps[fname] = null;
+    const fo = objBody[fontObj[fname]];
+    const tu = fo && fo.head.match(/\/ToUnicode\s+(\d+)\s+0\s+R/);
+    const co = tu && objBody[tu[1]];
+    if (!co) return null;
+    const sp = co.head.indexOf("stream");
+    if (sp < 0) return null;
+    const st = co.at + sp + 6 + (co.head[sp + 6] === "\r" ? 2 : 1);
+    const en = co.at + co.head.lastIndexOf("endstream");
+    const txt = await inflate(st, en);
+    const map = {};
+    const u16 = (h) => { let o = ""; for (let k = 0; k + 3 < h.length; k += 4) o += String.fromCharCode(parseInt(h.slice(k, k + 4), 16)); return o; };
+    for (const bm of txt.matchAll(/beginbfchar([\s\S]*?)endbfchar/g)) for (const p of bm[1].matchAll(/<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>/g)) map[parseInt(p[1], 16)] = u16(p[2]);
+    for (const bm of txt.matchAll(/beginbfrange([\s\S]*?)endbfrange/g)) for (const p of bm[1].matchAll(/<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*(?:<([0-9A-Fa-f]+)>|\[([^\]]*)\])/g)) {
+      const lo = parseInt(p[1], 16), hi = parseInt(p[2], 16);
+      if (p[3]) { const base = u16(p[3]); for (let c = lo; c <= hi; c++) map[c] = base.slice(0, -1) + String.fromCharCode(base.charCodeAt(base.length - 1) + (c - lo)); }
+      else { const arr = [...p[4].matchAll(/<([0-9A-Fa-f]+)>/g)].map((q) => u16(q[1])); for (let c = lo; c <= hi && c - lo < arr.length; c++) map[c] = arr[c - lo]; }
+    }
+    cmaps[fname] = map;
+    return map;
+  };
   const re = /stream\r?\n/g;
   let m, page = 0;
   while ((m = re.exec(bin))) {
@@ -3056,38 +3093,53 @@ async function pdfTextRuns(bytes) {
     while ((b = bt.exec(text))) {
       let x = 0, y = 0, lead = 0;
       const nums = [];
-      const tok = /\[((?:\((?:\\.|[^\\)])*\)|[^\]])*)\]|\(((?:\\.|[^\\)])*)\)|(-?[\d.]+)|([A-Za-z*'"]+)/g;
-      let t, last = null;
-      const emit = (str) => {
+      const tok = /\[((?:\((?:\\.|[^\\)])*\)|[^\]])*)\]|\(((?:\\.|[^\\)])*)\)|<([0-9A-Fa-f\s]+)>|\/([A-Za-z0-9_.+-]+)|(-?[\d.]+)|([A-Za-z*'"]+)/g;
+      let t, last = null, font = "";
+      const emit = async (str, hex) => {
+        if (hex) {
+          // Hex strings are glyph numbers, two bytes each, turned into text by the font's ToUnicode map.
+          const cm = await cmapOf(font);
+          const h = str.replace(/\s+/g, "");
+          let o = "";
+          if (cm) { for (let k = 0; k + 3 < h.length; k += 4) o += cm[parseInt(h.slice(k, k + 4), 16)] || ""; }
+          else for (let k = 0; k + 1 < h.length; k += 2) o += String.fromCharCode(parseInt(h.slice(k, k + 2), 16));
+          str = o;
+        }
         // Two byte glyph codes (Reece): every other byte is zero and the glyph number is the character code less 29.
         if (str.length >= 2 && str.length % 2 === 0 && /^(?:\0[\s\S])+$/.test(str)) { let o = ""; for (let k = 1; k < str.length; k += 2) o += String.fromCharCode(str.charCodeAt(k) + 29); str = o; }
+        if (!str) return;
+        // One glyph per Tj (Odoo): glyphs on the same line a short way apart belong to the same word or phrase.
+        if (hex && last && last.page === page && Math.abs(last.y - y) < 0.5 && x >= last.lastX && x - last.lastX < 25) { last.t += str; last.lastX = x; return; }
         if (!str.trim()) return;
         if (last && last.x === x && last.y === y && last.page === page) last.t += str;
-        else { last = { x, y, t: str, page }; items.push(last); }
+        else { last = { x, y, t: str, page, lastX: x }; items.push(last); }
       };
       while ((t = tok.exec(b[1]))) {
-        if (t[3] !== undefined) { nums.push(Number(t[3])); continue; }
-        if (t[1] !== undefined || t[2] !== undefined) {
+        if (t[5] !== undefined) { nums.push(Number(t[5])); continue; }
+        if (t[4] !== undefined) { nums.push({ name: t[4] }); continue; }
+        if (t[1] !== undefined || t[2] !== undefined || t[3] !== undefined) {
           // string operands are shown by the next Tj or TJ operator
-          nums.push(t[1] !== undefined ? { arr: t[1] } : { str: t[2] });
+          nums.push(t[1] !== undefined ? { arr: t[1] } : t[2] !== undefined ? { str: t[2] } : { hex: t[3] });
           continue;
         }
-        const op = t[4];
-        if (op === "Tm" && nums.length >= 6) { x = nums[nums.length - 2]; y = nums[nums.length - 1]; }
+        const op = t[6];
+        if (op === "Tf") { const n = nums.find((q) => q && q.name !== undefined); if (n) font = n.name; }
+        else if (op === "Tm" && nums.length >= 6) { x = nums[nums.length - 2]; y = nums[nums.length - 1]; }
         else if ((op === "Td" || op === "TD") && nums.length >= 2) { x += nums[nums.length - 2]; y += nums[nums.length - 1]; if (op === "TD") lead = -nums[nums.length - 1]; }
         else if (op === "TL" && nums.length) lead = nums[nums.length - 1];
         else if (op === "T*") y -= lead;
         else if (op === "Tj" || op === "TJ" || op === "'" || op === '"') {
           if (op === "'" || op === '"') y -= lead;
           const a = nums[nums.length - 1];
-          if (a && a.str !== undefined) emit(unesc(a.str));
+          if (a && a.str !== undefined) await emit(unesc(a.str));
+          else if (a && a.hex !== undefined) await emit(a.hex, true);
           else if (a && a.arr !== undefined) {
             let out = "";
             for (const p of a.arr.matchAll(/\(((?:\\.|[^\\)])*)\)|(-?[\d.]+)/g)) {
               if (p[1] !== undefined) out += unesc(p[1]);
               else if (Number(p[2]) <= -250) out += " ";
             }
-            emit(out);
+            await emit(out);
           }
         }
         nums.length = 0;
@@ -3210,6 +3262,25 @@ async function wexParse(bytes) {
   if (!date || !due || !(inc > 0) || !(ex > 0) || Math.abs(ex + gst - inc) > 0.02) return null;
   return { number: stamp, date, due, ex, gst, inc, order: "" };
 }
+async function daisysParse(bytes) {
+  const items = await pdfTextRuns(bytes);
+  if (!items.length) return null;
+  const isNeg = (t) => /^\(.*\)$|^-|-$|CR$/i.test(String(t).trim());
+  const money = (t) => { const n = Number(String(t).replace(/[^0-9.]/g, "")); return isNeg(t) ? -n : n; };
+  const label = (name) => { const ls = items.filter((i) => i.t.trim().toLowerCase() === name.toLowerCase()); return ls[ls.length - 1]; };
+  const side = (name) => { const l = label(name); if (!l) return ""; const v = items.filter((i) => i.page === l.page && Math.abs(i.y - l.y) < 4 && i.x > l.x + 20 && /\d/.test(i.t)).sort((a, b) => b.x - a.x)[0]; return v ? v.t.trim() : ""; };
+  const sideText = (name) => { const l = label(name); if (!l) return ""; const v = items.filter((i) => i.page === l.page && Math.abs(i.y - l.y) < 4 && i.x > l.x + 20 && i.t.trim()).sort((a, b) => a.x - b.x)[0]; return v ? v.t.trim() : ""; };
+  const belowText = (name) => { const l = label(name); if (!l) return ""; const v = items.filter((i) => i.page === l.page && Math.abs(i.x - l.x) < 3 && Math.abs(i.y - l.y) > 5 && Math.abs(i.y - l.y) < 40).sort((a, b) => Math.abs(a.y - l.y) - Math.abs(b.y - l.y))[0]; return v ? v.t.trim() : ""; };
+  const incT = side("Total"), gstT = side("GST 10%");
+  const inc = money(incT), gst = money(gstT);
+  if (isNeg(incT) || inc < 0 || items.some((i) => /credit note|tax credit/i.test(i.t))) return { credit: true };
+  const number = sideText("Invoice Number");
+  const dt = belowText("Invoice Date:").match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/);
+  const ex = Math.round((inc - gst) * 100) / 100;
+  if (!/^INV\d{5,}$/.test(number) || !dt || !(inc > 0) || !(gst >= 0) || !(ex > 0)) return null;
+  const yr = dt[3].length === 2 ? 2000 + Number(dt[3]) : Number(dt[3]);
+  return { number, date: `${yr}-${String(dt[2]).padStart(2, "0")}-${String(dt[1]).padStart(2, "0")}`, ex, gst, inc, order: belowText("PO#:") };
+}
 // Due on the last business day (Monday to Friday) of the month after the invoice month.
 function billDueDate(iso) {
   const [y, m] = iso.split("-").map(Number);
@@ -3271,7 +3342,8 @@ const INVOICE_MAIL_RULES = [
   { name: "Reece", fromDomain: "reece.com.au", subject: "reece transactions", contact: "reece", account: "", parse: (b) => reeceParse(b) },
   { name: "Tradelink", from: "donotreply@tradelink.com.au", subject: "tax invoice", contact: "tradelink", account: "", parse: (b) => tradelinkParse(b) },
   { name: "Momentum", from: "hello@mail.momentum.com.au", subject: "your electricity bill", contact: "momentum", account: "", xeroOnly: true, parse: (b) => momentumParse(b) },
-  { name: "WEX Motorpass", from: "enquiries@motorpass.com.au", subject: "wex motorpass statement", contact: "wex", account: "", xeroOnly: true, parse: (b) => wexParse(b) }
+  { name: "WEX Motorpass", from: "enquiries@motorpass.com.au", subject: "wex motorpass statement", contact: "wex", account: "", xeroOnly: true, parse: (b) => wexParse(b) },
+  { name: "Daisys", from: "notifications@daisysgarden.com.au", subject: "daisys garden supplies pty ltd invoice", contact: "daisy", account: "", parse: (b) => daisysParse(b) }
 ];
 const MAILBOXES = [
   { id: "tayler", label: "Tayler", address: "tayler@directflow.com.au", only: ["tayler@directflow.com.au"] },
