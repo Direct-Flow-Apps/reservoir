@@ -3023,6 +3023,101 @@ async function harrisParse(bytes) {
   const yr = dt[3].length === 2 ? 2000 + Number(dt[3]) : Number(dt[3]);
   return { number, date: `${yr}-${String(dt[2]).padStart(2, "0")}-${String(dt[1]).padStart(2, "0")}`, ex, gst, inc, order: row("Order No") };
 }
+// Reader for PDFs that position text with Tm and kerned TJ arrays (Samios). Each item carries its page number (order of the content streams).
+async function pdfTextRuns(bytes) {
+  const raw = new Uint8Array(bytes);
+  const bin = new TextDecoder("latin1").decode(raw);
+  const items = [];
+  const re = /stream\r?\n/g;
+  let m, page = 0;
+  while ((m = re.exec(bin))) {
+    const start = m.index + m[0].length;
+    const end = bin.indexOf("endstream", start);
+    if (end < 0) break;
+    re.lastIndex = end + 9;
+    let text = "";
+    let cut = end;
+    while (cut > start && (raw[cut - 1] === 10 || raw[cut - 1] === 13)) cut--;
+    for (const stop of [cut, end]) {
+      try {
+        const ds = new DecompressionStream("deflate");
+        const out = new Response(new Blob([raw.slice(start, stop)]).stream().pipeThrough(ds));
+        text = new TextDecoder("latin1").decode(await out.arrayBuffer());
+        break;
+      } catch (e) { text = ""; }
+    }
+    if (!text || !/\bTj\b|\bTJ\b/.test(text)) continue;
+    page++;
+    const unesc = (s) => s.replace(/\\([0-7]{1,3}|.)/g, (_, c) => (/^[0-7]+$/.test(c) ? String.fromCharCode(parseInt(c, 8)) : c === "n" ? "\n" : c === "r" ? "\r" : c === "t" ? "\t" : c));
+    const bt = /BT([\s\S]*?)ET/g;
+    let b;
+    while ((b = bt.exec(text))) {
+      let x = 0, y = 0, lead = 0;
+      const nums = [];
+      const tok = /\[((?:\((?:\\.|[^\\)])*\)|[^\]])*)\]|\(((?:\\.|[^\\)])*)\)|(-?[\d.]+)|([A-Za-z*'"]+)/g;
+      let t, last = null;
+      const emit = (str) => {
+        if (!str.trim()) return;
+        if (last && last.x === x && last.y === y && last.page === page) last.t += str;
+        else { last = { x, y, t: str, page }; items.push(last); }
+      };
+      while ((t = tok.exec(b[1]))) {
+        if (t[3] !== undefined) { nums.push(Number(t[3])); continue; }
+        if (t[1] !== undefined || t[2] !== undefined) {
+          // string operands are shown by the next Tj or TJ operator
+          nums.push(t[1] !== undefined ? { arr: t[1] } : { str: t[2] });
+          continue;
+        }
+        const op = t[4];
+        if (op === "Tm" && nums.length >= 6) { x = nums[nums.length - 2]; y = nums[nums.length - 1]; }
+        else if ((op === "Td" || op === "TD") && nums.length >= 2) { x += nums[nums.length - 2]; y += nums[nums.length - 1]; if (op === "TD") lead = -nums[nums.length - 1]; }
+        else if (op === "TL" && nums.length) lead = nums[nums.length - 1];
+        else if (op === "T*") y -= lead;
+        else if (op === "Tj" || op === "TJ" || op === "'" || op === '"') {
+          if (op === "'" || op === '"') y -= lead;
+          const a = nums[nums.length - 1];
+          if (a && a.str !== undefined) emit(unesc(a.str));
+          else if (a && a.arr !== undefined) {
+            let out = "";
+            for (const p of a.arr.matchAll(/\(((?:\\.|[^\\)])*)\)|(-?[\d.]+)/g)) {
+              if (p[1] !== undefined) out += unesc(p[1]);
+              else if (Number(p[2]) <= -250) out += " ";
+            }
+            emit(out);
+          }
+        }
+        nums.length = 0;
+      }
+    }
+  }
+  return items;
+}
+async function samiosParse(bytes) {
+  const items = await pdfTextRuns(bytes);
+  if (!items.length) return null;
+  const all = items.map((i) => i.t);
+  const money = (t) => { const s = String(t).trim(); const n = Number(s.replace(/[^0-9.]/g, "")); return /^\(.*\)$|^-|-$|CR$/i.test(s) ? -n : n; };
+  const first = (re) => { for (const t of all) { const m = t.match(re); if (m) return m[1].trim(); } return ""; };
+  // Totals sit on the last page of a multi page invoice, so take the last match.
+  const lastOf = (re) => { let v = ""; for (const t of all) { const m = t.match(re); if (m) v = m[1].trim(); } return v; };
+  const number = first(/^Invoice:\s*(\d+)\b/i);
+  // Totals are a label with the amount to its right on the same line.
+  const valueOf = (label) => {
+    const ls = items.filter((i) => i.t.trim().toLowerCase() === label.toLowerCase());
+    const l = ls[ls.length - 1];
+    if (!l) return "";
+    const v = items.filter((i) => i.page === l.page && Math.abs(i.y - l.y) < 4 && i.x > l.x + 20 && /\d/.test(i.t)).sort((a, b) => a.x - b.x)[0];
+    return v ? v.t : "";
+  };
+  const exT = valueOf("Total Ex GST:"), gstT = valueOf("GST:"), incT = valueOf("Total Inc GST:");
+  const ex = money(exT), gst = money(gstT), inc = money(incT);
+  const credit = /^\(.*\)$|^-|-$|CR$/i.test(exT) || /^\(.*\)$|^-|-$|CR$/i.test(incT) || ex < 0 || inc < 0 || all.some((t) => /credit note|tax credit/i.test(t));
+  if (credit) return { credit: true };
+  const dt = first(/^Date:\s*(\d{1,2}\/\d{1,2}\/\d{2,4})$/i).match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/);
+  if (!/^\d{5,}$/.test(number) || !dt || !(ex > 0) || !(inc > 0) || Math.abs(ex + gst - inc) > 0.02) return null;
+  const yr = dt[3].length === 2 ? 2000 + Number(dt[3]) : Number(dt[3]);
+  return { number, date: `${yr}-${String(dt[2]).padStart(2, "0")}-${String(dt[1]).padStart(2, "0")}`, ex, gst, inc, order: "" };
+}
 // Due on the last business day (Monday to Friday) of the month after the invoice month.
 function billDueDate(iso) {
   const [y, m] = iso.split("-").map(Number);
@@ -3079,7 +3174,8 @@ async function xeroBillFromPdf(env, rule, bytes, fileName, parsed) {
 }
 const INVOICE_MAIL_RULES = [
   { name: "Burnett's", from: "burnetts-noreply@mail.myframeworks.com.au", subject: "BURNETTS PLUMBING SUPPLIES INVOICE", contact: "burnett", account: "", parse: (b) => burnettsParse(b) },
-  { name: "Harris", from: "mailouts@harristps.com.au", subject: "invoice", contact: "harris", account: "", parse: (b) => harrisParse(b) }
+  { name: "Harris", from: "mailouts@harristps.com.au", subject: "invoice", contact: "harris", account: "", parse: (b) => harrisParse(b) },
+  { name: "Samios", fromDomain: "samios.net.au", subject: "invoice", contact: "samios", account: "", parse: (b) => samiosParse(b) }
 ];
 const MAILBOXES = [
   { id: "tayler", label: "Tayler", address: "tayler@directflow.com.au", only: ["tayler@directflow.com.au"] },
@@ -7137,10 +7233,12 @@ export default {
         let credits = 0;
         let lastErr = "";
         for (const rule of INVOICE_MAIL_RULES) {
-          const f = `receivedDateTime ge 1900-01-01T00:00:00Z and hasAttachments eq true and from/emailAddress/address eq '${rule.from}'`;
-          const r = await mailGraph(env, addr, `/mailFolders/inbox/messages?$top=25&$select=subject,receivedDateTime,categories&$filter=${encodeURIComponent(f)}&$orderby=receivedDateTime desc`);
+          // A rule matches one exact sender address, or any address on a sender domain (Samios branches each have their own).
+          const f = `receivedDateTime ge 1900-01-01T00:00:00Z and hasAttachments eq true${rule.from ? ` and from/emailAddress/address eq '${rule.from}'` : ""}`;
+          const r = await mailGraph(env, addr, `/mailFolders/inbox/messages?$top=${rule.fromDomain ? 50 : 25}&$select=subject,receivedDateTime,categories,from&$filter=${encodeURIComponent(f)}&$orderby=receivedDateTime desc`);
           if (!r.ok) { lastErr = mailWhy(r); continue; }
-          const hits = ((r.json && r.json.value) || []).filter((m) => String(m.subject || "").toLowerCase().includes(rule.subject.toLowerCase())).slice(0, 10);
+          const dom = rule.fromDomain ? "@" + rule.fromDomain.toLowerCase() : "";
+          const hits = ((r.json && r.json.value) || []).filter((m) => (!dom || String((m.from && m.from.emailAddress && m.from.emailAddress.address) || "").toLowerCase().endsWith(dom)) && String(m.subject || "").toLowerCase().includes(rule.subject.toLowerCase())).slice(0, 10);
           for (const hit of hits) {
             if ((hit.categories || []).some((c) => String(c).toLowerCase() === "credit")) { credits++; continue; }
             // An email Reservoir tagged ERROR! waits until the tag is removed in Outlook.
