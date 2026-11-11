@@ -3650,8 +3650,10 @@ const MAILBOXES = [
 const mailAddress = (env, b) => String((env && env["MAILBOX_" + b.id.toUpperCase()]) || b.address).toLowerCase();
 const mailAllowed = (b, user) => b.only ? b.only.includes(String(user.email || "").toLowerCase()) : b.tiers.includes(user.tier);
 async function mailGraph(env, address, qs) {
-  let res = await graphFetch(env, `/users/${encodeURIComponent(address)}${qs}`);
-  if (res.status === 401 || res.status === 403) { graphToken = { value: null, at: 0 }; res = await graphFetch(env, `/users/${encodeURIComponent(address)}${qs}`); }
+  // qs is a path inside the mailbox, or the full next page link Graph handed back.
+  const target = qs.startsWith(GRAPH + "/") ? qs : `/users/${encodeURIComponent(address)}${qs}`;
+  let res = await graphFetch(env, target);
+  if (res.status === 401 || res.status === 403) { graphToken = { value: null, at: 0 }; res = await graphFetch(env, target); }
   const text = await res.text();
   let json = null;
   try { json = JSON.parse(text); } catch (e) { json = null; }
@@ -3893,6 +3895,9 @@ async function mailDo(env, address, path, method, bodyObj) {
   return { ok: res.ok, status: res.status, json, text };
 }
 const MAIL_ALIAS = { "inbox": "inbox", "sent items": "sentitems", "drafts": "drafts", "deleted items": "deleteditems", "junk email": "junkemail", "archive": "archive" };
+// A mail search asks Graph for 250 results a page and keeps following its next page link, up to this many pages.
+const MAIL_SEARCH_PAGE = 250;
+const MAIL_SEARCH_PAGES = 20;
 const MAIL_HIDE = /^(conversation history|sync issues|conflicts|local failures|server failures|outbox|rss feeds|rss subscriptions|clutter|scheduled|yammer|quick step settings|social activity notifications|personmetadata|externalcontacts)/i;
 const mailPart = (x) => ({ name: String((x && x.emailAddress && x.emailAddress.name) || "").slice(0, 80), address: String((x && x.emailAddress && x.emailAddress.address) || "").slice(0, 120) });
 const mailShow = (x) => { const a = mailPart(x); return a.name || a.address; };
@@ -3948,19 +3953,30 @@ async function mailRoutes(request, env, user, url) {
       const top = Math.max(1, Math.min(200, Number(url.searchParams.get("top")) || 40));
       const filter = url.searchParams.get("filter") || "";
       const q = String(url.searchParams.get("q") || "").replace(/["\\]/g, " ").trim().slice(0, 100);
-      let qs = `${q ? "" : "/mailFolders/" + encodeURIComponent(folder)}/messages?$top=${top}&$select=subject,from,toRecipients,receivedDateTime,isRead,bodyPreview,hasAttachments,categories,flag`;
-      if (q) qs += `&$search=${encodeURIComponent('"' + q + '"')}`;
-      else {
+      const fields = "$select=subject,from,toRecipients,receivedDateTime,isRead,bodyPreview,hasAttachments,categories,flag";
+      let rows = [];
+      if (q) {
+        // A search covers every folder in the mailbox and reads every page of results Graph offers, so older matches are never left out. Graph itself stops a message search at 1,000 results.
+        const seen = new Set();
+        let next = `/messages?$top=${MAIL_SEARCH_PAGE}&${fields}&$search=${encodeURIComponent('"' + q + '"')}`;
+        for (let page = 0; next && page < MAIL_SEARCH_PAGES; page++) {
+          const r = await mailGraph(env, addr, next);
+          if (!r.ok) return reply(env, 200, { ok: false, error: mailWhy(r), worker: WORKER_BUILD });
+          ((r.json && r.json.value) || []).forEach((m) => { if (m && m.id && !seen.has(m.id)) { seen.add(m.id); rows.push(m); } });
+          const link = r.json && r.json["@odata.nextLink"];
+          next = typeof link === "string" && link.startsWith(GRAPH + "/") ? link : "";
+        }
+        rows.sort((x, y) => String(y.receivedDateTime || "").localeCompare(String(x.receivedDateTime || "")));
+      } else {
         const f = ["receivedDateTime ge 1900-01-01T00:00:00Z"];
         if (filter === "unread") f.push("isRead eq false");
         if (filter === "attachments") f.push("hasAttachments eq true");
-        qs += `&$filter=${encodeURIComponent(f.join(" and "))}&$orderby=receivedDateTime desc`;
+        const r = await mailGraph(env, addr, `/mailFolders/${encodeURIComponent(folder)}/messages?$top=${top}&${fields}&$filter=${encodeURIComponent(f.join(" and "))}&$orderby=receivedDateTime desc`);
+        if (!r.ok) return reply(env, 200, { ok: false, error: mailWhy(r), worker: WORKER_BUILD });
+        rows = (r.json && r.json.value) || [];
       }
-      const r = await mailGraph(env, addr, qs);
-      if (!r.ok) return reply(env, 200, { ok: false, error: mailWhy(r), worker: WORKER_BUILD });
-      if (q && r.json && Array.isArray(r.json.value)) r.json.value.sort((x, y) => String(y.receivedDateTime || "").localeCompare(String(x.receivedDateTime || "")));
-      const list = ((r.json && r.json.value) || []).map((m) => ({ id: m.id, from: mailShow(m.from).slice(0, 80), fromAddr: mailPart(m.from).address.toLowerCase(), to: ((m.toRecipients || []).map(mailShow).join(", ")).slice(0, 120), subject: String(m.subject || "(no subject)").slice(0, 160), at: m.receivedDateTime || "", read: !!m.isRead, attach: !!m.hasAttachments, categories: (m.categories || []).slice(0, 6).map((c) => String(c).slice(0, 40)), flag: mailFlag(m.flag), preview: String(m.bodyPreview || "").replace(/\s+/g, " ").slice(0, 140) }));
-      return reply(env, 200, { ok: true, label: box.label, messages: list, more: list.length >= top && !q, worker: WORKER_BUILD });
+      const list = rows.map((m) => ({ id: m.id, from: mailShow(m.from).slice(0, 80), fromAddr: mailPart(m.from).address.toLowerCase(), to: ((m.toRecipients || []).map(mailShow).join(", ")).slice(0, 120), subject: String(m.subject || "(no subject)").slice(0, 160), at: m.receivedDateTime || "", read: !!m.isRead, attach: !!m.hasAttachments, categories: (m.categories || []).slice(0, 6).map((c) => String(c).slice(0, 40)), flag: mailFlag(m.flag), preview: String(m.bodyPreview || "").replace(/\s+/g, " ").slice(0, 140) }));
+      return reply(env, 200, { ok: true, label: box.label, messages: list, more: !q && list.length >= top, worker: WORKER_BUILD });
     }
     if (url.pathname === "/api/mail/message" && !post) {
       const msg = mailId(url.searchParams.get("msg"));
