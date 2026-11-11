@@ -2996,10 +2996,33 @@ async function burnettsParse(bytes) {
   const ex = money(near("Total Exc GST", 300)), gst = money(near("GST", 300)), inc = money(near("Total Inc GST", 300));
   const dm = dateText.match(/^(\d{1,2})\s+([A-Za-z]{3})[a-z]*\s+(\d{4})$/);
   const mi = dm ? ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"].indexOf(dm[2].toLowerCase()) : -1;
+  const neg = [near("Total Exc GST", 300), near("Total Inc GST", 300)].some((t) => /^\(.*\)$|^-|-$|CR$/i.test(String(t).trim())) || items.some((i) => /credit/i.test(i.t) && /note|tax credit/i.test(i.t));
+  if (neg || ex < 0 || inc < 0) return { credit: true };
   if (!/^\d{4,}$/.test(number) || !dm || mi < 0 || !(ex > 0) || !(inc > 0) || Math.abs(ex + gst - inc) > 0.02) return null;
   return { number, date: `${dm[3]}-${String(mi + 1).padStart(2, "0")}-${String(dm[1]).padStart(2, "0")}`, ex, gst, inc, order: near("Cust Order #.", 380) };
 }
 // Creates the bill in Xero as approved (falls back to draft if Xero will not approve it) and attaches the PDF. Returns { ok, status, id, note }.
+async function harrisParse(bytes) {
+  const items = await pdfTextItems(bytes);
+  if (!items.length) return null;
+  const row = (label) => {
+    const l = items.find((i) => i.t.toLowerCase() === label.toLowerCase());
+    if (!l) return "";
+    const v = items.filter((i) => Math.abs(i.y - l.y) < 4 && i.x > l.x + 20 && i !== l && /\d/.test(i.t)).sort((a, b) => b.x - a.x)[0];
+    return v ? v.t : "";
+  };
+  const negText = (t) => /^\(.*\)$|^-|-$|CR$/i.test(String(t).trim());
+  const money = (t) => { const n = Number(String(t).replace(/[^0-9.]/g, "")); return negText(t) ? -n : n; };
+  const exT = row("TOTAL excl. GST"), gstT = row("GST @ 10%"), incT = row("AMOUNT DUE");
+  const ex = money(exT), gst = money(gstT), inc = money(incT);
+  const credit = negText(exT) || negText(incT) || ex < 0 || inc < 0 || items.some((i) => /credit note|tax credit|^credit$/i.test(i.t));
+  if (credit) return { credit: true };
+  const number = row("Invoice No");
+  const dt = row("Invoice Date").match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/);
+  if (!/^\d{5,}(\/\d+)?$/.test(number) || !dt || !(ex > 0) || !(inc > 0) || Math.abs(ex + gst - inc) > 0.02) return null;
+  const yr = dt[3].length === 2 ? 2000 + Number(dt[3]) : Number(dt[3]);
+  return { number, date: `${yr}-${String(dt[2]).padStart(2, "0")}-${String(dt[1]).padStart(2, "0")}`, ex, gst, inc, order: row("Order No") };
+}
 // Due on the last business day (Monday to Friday) of the month after the invoice month.
 function billDueDate(iso) {
   const [y, m] = iso.split("-").map(Number);
@@ -3019,7 +3042,7 @@ async function xeroBillFromPdf(env, rule, bytes, fileName, parsed) {
   if (cr.ok) { const cj = await cr.json(); const c = (cj.Contacts || [])[0] || {}; account = String(c.PurchasesDefaultAccountCode || (c.PurchasesDefaultAccount && c.PurchasesDefaultAccount.Code) || ""); }
   if (!account) account = String(rule.account || "");
   const make = async (status) => {
-    const line = { Description: `${rule.contact} invoice ${parsed.number}${parsed.order ? ` (order ${parsed.order})` : ""}`, Quantity: 1, UnitAmount: parsed.ex, TaxType: "INPUT" };
+    const line = { Description: `${rule.name} invoice ${parsed.number}${parsed.order ? ` (order ${parsed.order})` : ""}`, Quantity: 1, UnitAmount: parsed.ex, TaxType: "INPUT" };
     if (account) line.AccountCode = account;
     const body = { Invoices: [{ Type: "ACCPAY", Contact: { ContactID: contact.contact_id }, InvoiceNumber: parsed.number, Date: parsed.date, DueDate: billDueDate(parsed.date), LineAmountTypes: "Exclusive", Status: status, LineItems: [line] }] };
     return xeroFetch(env, "api.xro/2.0/Invoices?summarizeErrors=false", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
@@ -3054,7 +3077,10 @@ async function xeroBillFromPdf(env, rule, bytes, fileName, parsed) {
   if (!at.ok) attached = `PDF not attached (Xero ${at.status}: ${String(await at.text()).replace(/\s+/g, " ").slice(0, 120)})`;
   return { ok: true, status: inv.Status, id: inv.InvoiceID, note: [status === "DRAFT" && why ? `left as draft (${why})` : "", seen, attached].filter(Boolean).join(". ") };
 }
-const INVOICE_MAIL_RULES = [{ from: "burnetts-noreply@mail.myframeworks.com.au", subject: "BURNETTS PLUMBING SUPPLIES INVOICE", contact: "burnett", account: "" }];
+const INVOICE_MAIL_RULES = [
+  { name: "Burnett's", from: "burnetts-noreply@mail.myframeworks.com.au", subject: "BURNETTS PLUMBING SUPPLIES INVOICE", contact: "burnett", account: "", parse: (b) => burnettsParse(b) },
+  { name: "Harris", from: "mailouts@harristps.com.au", subject: "invoice", contact: "harris", account: "", parse: (b) => harrisParse(b) }
+];
 const MAILBOXES = [
   { id: "tayler", label: "Tayler", address: "tayler@directflow.com.au", only: ["tayler@directflow.com.au"] },
   { id: "jobs", label: "DFP Jobs", address: "dfpjobs@directflow.com.au", tiers: ["T1", "T2"] },
@@ -7100,63 +7126,77 @@ export default {
       try {
         const box = MAILBOXES.find((x) => x.id === "accounts");
         const addr = mailAddress(env, box);
-        const rule = INVOICE_MAIL_RULES[0];
-        const f = `receivedDateTime ge 1900-01-01T00:00:00Z and hasAttachments eq true and from/emailAddress/address eq '${rule.from}'`;
-        const r = await mailGraph(env, addr, `/mailFolders/inbox/messages?$top=25&$select=subject,receivedDateTime&$filter=${encodeURIComponent(f)}&$orderby=receivedDateTime desc`);
-        if (!r.ok) return reply(env, 200, { ok: false, error: mailWhy(r) });
-        const hit = ((r.json && r.json.value) || []).find((m) => String(m.subject || "").toLowerCase().includes(rule.subject.toLowerCase()));
-        if (!hit) return reply(env, 200, { ok: true, found: false });
-        const at = await mailGraph(env, addr, `/messages/${encodeURIComponent(hit.id)}/attachments?$select=id,name,contentType,size,isInline`);
-        if (!at.ok) return reply(env, 200, { ok: false, error: mailWhy(at) });
-        const pdfs = ((at.json && at.json.value) || []).filter((x) => !x.isInline && (/pdf/i.test(x.contentType || "") || /\.pdf$/i.test(x.name || "")));
-        const failed = [];
-        const items = [];
         await settingsTable(env);
-        // One time reset of the markers from the first test, so that invoice goes to AroFlo and Xero again.
+        // One time reset of the markers from the first tests, so that invoice goes to AroFlo and Xero again.
         if (!(await env.DB.prepare("SELECT key FROM app_settings WHERE key = 'oneoff.invmail_reset_20261111c'").first())) {
           await env.DB.prepare("DELETE FROM app_settings WHERE key LIKE 'invmail.%'").run();
           await env.DB.prepare("INSERT OR REPLACE INTO app_settings (key, value, detail, by_name, at) VALUES ('oneoff.invmail_reset_20261111c', '1', 'reset', 'One off', datetime('now'))").run();
         }
         const done = async (k) => !!(await env.DB.prepare("SELECT key FROM app_settings WHERE key = ?").bind(k).first());
         const mark = (k, d) => env.DB.prepare("INSERT OR REPLACE INTO app_settings (key, value, detail, by_name, at) VALUES (?, '1', ?, ?, datetime('now'))").bind(k, String(d).slice(0, 200), user.name).run();
-        let allOk = pdfs.length > 0;
-        for (const p of pdfs) {
-          const fname = String(p.name || "invoice.pdf").slice(0, 150);
-          const it = { file: fname, number: "", aroflo: "", xero: "", xeroNote: "" };
-          items.push(it);
-          if (Number(p.size || 0) > MAX_EMAIL) { failed.push(`${fname} is over 3.5 MB`); allOk = false; continue; }
-          const res = await graphFetch(env, `/users/${encodeURIComponent(addr)}/messages/${encodeURIComponent(hit.id)}/attachments/${encodeURIComponent(p.id)}/$value`);
-          if (!res.ok) { failed.push(`${fname} could not be read`); allOk = false; continue; }
-          const buf = await res.arrayBuffer();
-          const b64 = toB64(buf);
-          let parsed = null;
-          try { parsed = await burnettsParse(buf); } catch (e) { parsed = null; }
-          it.number = parsed ? parsed.number : "";
-          const key = `invmail.${hit.id.slice(-40)}.${p.id.slice(-20)}`;
-          if (await done(key + ".aroflo")) it.aroflo = "already sent";
-          else { try { await mailAttachment(env, user, to[0], fname, "application/pdf", b64); await mark(key + ".aroflo", "sent"); it.aroflo = "sent"; } catch (e) { allOk = false; it.aroflo = "failed"; failed.push(`AroFlo: ${String(e.message || "").slice(0, 80)}`); } }
-          if (await done(key + ".xero")) it.xero = "already done";
-          else {
-            let x = { ok: false, note: "the PDF could not be read" };
-            try { if (parsed) x = await xeroBillFromPdf(env, rule, buf, fname, parsed); } catch (e) { x = { ok: false, note: String(e && e.message || e).slice(0, 160) }; }
-            if (x.ok && x.status === "AUTHORISED") { await mark(key + ".xero", "approved"); it.xero = "approved"; it.xeroNote = x.note || ""; }
-            else if (x.ok && x.status === "EXISTS") { await mark(key + ".xero", "exists"); it.xero = "already in Xero"; }
-            else if (x.ok) { await mark(key + ".xero", "draft"); it.xero = "draft"; it.xeroNote = x.note || ""; }
-            else {
-              // The API route failed. Send it by email so it still reaches Xero as a draft, but do not mark it done.
-              it.xero = "failed, emailed as a draft";
-              it.xeroNote = x.note || "";
-              try { await mailAttachment(env, user, to[1], fname, "application/pdf", b64); } catch (e) { it.xero = "failed"; failed.push(`Xero: ${String(e.message || "").slice(0, 80)}`); }
-              allOk = false;
+        let credits = 0;
+        let lastErr = "";
+        for (const rule of INVOICE_MAIL_RULES) {
+          const f = `receivedDateTime ge 1900-01-01T00:00:00Z and hasAttachments eq true and from/emailAddress/address eq '${rule.from}'`;
+          const r = await mailGraph(env, addr, `/mailFolders/inbox/messages?$top=25&$select=subject,receivedDateTime&$filter=${encodeURIComponent(f)}&$orderby=receivedDateTime desc`);
+          if (!r.ok) { lastErr = mailWhy(r); continue; }
+          const hits = ((r.json && r.json.value) || []).filter((m) => String(m.subject || "").toLowerCase().includes(rule.subject.toLowerCase())).slice(0, 10);
+          for (const hit of hits) {
+            const at = await mailGraph(env, addr, `/messages/${encodeURIComponent(hit.id)}/attachments?$select=id,name,contentType,size,isInline`);
+            if (!at.ok) { lastErr = mailWhy(at); continue; }
+            const pdfs = ((at.json && at.json.value) || []).filter((x) => !x.isInline && (/pdf/i.test(x.contentType || "") || /\.pdf$/i.test(x.name || "")));
+            if (!pdfs.length) continue;
+            const got = [];
+            for (const p of pdfs) {
+              if (Number(p.size || 0) > MAX_EMAIL) { got.push({ p, big: true }); continue; }
+              const res = await graphFetch(env, `/users/${encodeURIComponent(addr)}/messages/${encodeURIComponent(hit.id)}/attachments/${encodeURIComponent(p.id)}/$value`);
+              if (!res.ok) { got.push({ p, bad: true }); continue; }
+              const buf = await res.arrayBuffer();
+              let parsed = null;
+              try { parsed = await rule.parse(buf); } catch (e) { parsed = null; }
+              got.push({ p, buf, parsed });
             }
+            // A credit stays in the mailbox untouched.
+            if (got.some((g) => g.parsed && g.parsed.credit)) { credits++; continue; }
+            const failed = [];
+            const items = [];
+            let allOk = true;
+            for (const g of got) {
+              const p = g.p;
+              const fname = String(p.name || "invoice.pdf").slice(0, 150);
+              const it = { file: fname, supplier: rule.name, number: g.parsed ? g.parsed.number : "", aroflo: "", xero: "", xeroNote: "" };
+              items.push(it);
+              if (g.big) { failed.push(`${fname} is over 3.5 MB`); allOk = false; continue; }
+              if (g.bad) { failed.push(`${fname} could not be read`); allOk = false; continue; }
+              const b64 = toB64(g.buf);
+              const key = `invmail.${hit.id.slice(-40)}.${p.id.slice(-20)}`;
+              if (await done(key + ".aroflo")) it.aroflo = "already sent";
+              else { try { await mailAttachment(env, user, to[0], fname, "application/pdf", b64); await mark(key + ".aroflo", "sent"); it.aroflo = "sent"; } catch (e) { allOk = false; it.aroflo = "failed"; failed.push(`AroFlo: ${String(e.message || "").slice(0, 80)}`); } }
+              if (await done(key + ".xero")) it.xero = "already done";
+              else {
+                let x = { ok: false, note: "the PDF could not be read" };
+                try { if (g.parsed) x = await xeroBillFromPdf(env, rule, g.buf, fname, g.parsed); } catch (e) { x = { ok: false, note: String(e && e.message || e).slice(0, 160) }; }
+                if (x.ok && x.status === "AUTHORISED") { await mark(key + ".xero", "approved"); it.xero = "approved"; it.xeroNote = x.note || ""; }
+                else if (x.ok && x.status === "EXISTS") { await mark(key + ".xero", "exists"); it.xero = "already in Xero"; }
+                else if (x.ok) { await mark(key + ".xero", "draft"); it.xero = "draft"; it.xeroNote = x.note || ""; }
+                else {
+                  it.xero = "failed, emailed as a draft";
+                  it.xeroNote = x.note || "";
+                  try { await mailAttachment(env, user, to[1], fname, "application/pdf", b64); } catch (e) { it.xero = "failed"; failed.push(`Xero: ${String(e.message || "").slice(0, 80)}`); }
+                  allOk = false;
+                }
+              }
+            }
+            let archived = "";
+            if (allOk) {
+              const mv = await graphFetch(env, `/users/${encodeURIComponent(addr)}/messages/${encodeURIComponent(hit.id)}/move`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ destinationId: "archive" }) });
+              archived = mv.ok ? "archived" : `not archived (Microsoft ${mv.status})`;
+            }
+            return reply(env, 200, { ok: true, found: true, subject: String(hit.subject || "").slice(0, 120), received: hit.receivedDateTime || "", items, archived, credits, failed: failed.join(". ") });
           }
         }
-        let archived = "";
-        if (allOk) {
-          const mv = await graphFetch(env, `/users/${encodeURIComponent(addr)}/messages/${encodeURIComponent(hit.id)}/move`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ destinationId: "archive" }) });
-          archived = mv.ok ? "archived" : `not archived (Microsoft ${mv.status})`;
-        }
-        return reply(env, 200, { ok: true, found: true, subject: String(hit.subject || "").slice(0, 120), received: hit.receivedDateTime || "", items, archived, failed: failed.join(". ") });
+        if (lastErr) return reply(env, 200, { ok: false, error: lastErr });
+        return reply(env, 200, { ok: true, found: false, credits });
       } catch (e) {
         return reply(env, 502, { error: "mailbox failed", detail: String(e.message || "").slice(0, 200) });
       }
