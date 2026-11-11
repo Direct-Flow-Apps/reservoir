@@ -3947,7 +3947,7 @@ async function mailRoutes(request, env, user, url) {
       const top = Math.max(1, Math.min(200, Number(url.searchParams.get("top")) || 40));
       const filter = url.searchParams.get("filter") || "";
       const q = String(url.searchParams.get("q") || "").replace(/["\\]/g, " ").trim().slice(0, 100);
-      let qs = `/mailFolders/${encodeURIComponent(folder)}/messages?$top=${top}&$select=subject,from,toRecipients,receivedDateTime,isRead,bodyPreview,hasAttachments`;
+      let qs = `/mailFolders/${encodeURIComponent(folder)}/messages?$top=${top}&$select=subject,from,toRecipients,receivedDateTime,isRead,bodyPreview,hasAttachments,categories,flag`;
       if (q) qs += `&$search=${encodeURIComponent('"' + q + '"')}`;
       else {
         const f = ["receivedDateTime ge 1900-01-01T00:00:00Z"];
@@ -3957,13 +3957,13 @@ async function mailRoutes(request, env, user, url) {
       }
       const r = await mailGraph(env, addr, qs);
       if (!r.ok) return reply(env, 200, { ok: false, error: mailWhy(r), worker: WORKER_BUILD });
-      const list = ((r.json && r.json.value) || []).map((m) => ({ id: m.id, from: mailShow(m.from).slice(0, 80), to: ((m.toRecipients || []).map(mailShow).join(", ")).slice(0, 120), subject: String(m.subject || "(no subject)").slice(0, 160), at: m.receivedDateTime || "", read: !!m.isRead, attach: !!m.hasAttachments, preview: String(m.bodyPreview || "").replace(/\s+/g, " ").slice(0, 140) }));
+      const list = ((r.json && r.json.value) || []).map((m) => ({ id: m.id, from: mailShow(m.from).slice(0, 80), to: ((m.toRecipients || []).map(mailShow).join(", ")).slice(0, 120), subject: String(m.subject || "(no subject)").slice(0, 160), at: m.receivedDateTime || "", read: !!m.isRead, attach: !!m.hasAttachments, categories: (m.categories || []).slice(0, 6).map((c) => String(c).slice(0, 40)), flag: !!(m.flag && m.flag.flagStatus === "flagged"), preview: String(m.bodyPreview || "").replace(/\s+/g, " ").slice(0, 140) }));
       return reply(env, 200, { ok: true, label: box.label, messages: list, more: list.length >= top && !q, worker: WORKER_BUILD });
     }
     if (url.pathname === "/api/mail/message" && !post) {
       const msg = mailId(url.searchParams.get("msg"));
       if (!msg) return reply(env, 400, { error: "bad request" });
-      const r = await mailGraph(env, addr, `/messages/${encodeURIComponent(msg)}?$select=subject,from,toRecipients,ccRecipients,receivedDateTime,sentDateTime,body,hasAttachments,isRead&$expand=attachments($select=id,name,size,contentType,isInline)`);
+      const r = await mailGraph(env, addr, `/messages/${encodeURIComponent(msg)}?$select=subject,from,toRecipients,ccRecipients,receivedDateTime,sentDateTime,body,hasAttachments,isRead,categories,flag&$expand=attachments($select=id,name,size,contentType,isInline)`);
       if (!r.ok) return reply(env, 200, { ok: false, error: mailWhy(r), worker: WORKER_BUILD });
       const m = r.json || {};
       const html = !!(m.body && String(m.body.contentType || "").toLowerCase() === "html");
@@ -3982,7 +3982,33 @@ async function mailRoutes(request, env, user, url) {
           } catch (e) {}
         }
       }
-      return reply(env, 200, { ok: true, id: m.id, subject: String(m.subject || "(no subject)"), from: mailPart(m.from), to: (m.toRecipients || []).map(mailPart), cc: (m.ccRecipients || []).map(mailPart), at: m.receivedDateTime || m.sentDateTime || "", read: !!m.isRead, html, body: shown, attachments: (m.attachments || []).filter((a) => !a.isInline).map((a) => ({ id: a.id, name: String(a.name || "attachment").slice(0, 160), size: Number(a.size || 0), type: String(a.contentType || "") })), worker: WORKER_BUILD });
+      return reply(env, 200, { ok: true, id: m.id, subject: String(m.subject || "(no subject)"), from: mailPart(m.from), to: (m.toRecipients || []).map(mailPart), cc: (m.ccRecipients || []).map(mailPart), at: m.receivedDateTime || m.sentDateTime || "", read: !!m.isRead, categories: (m.categories || []).slice(0, 6).map((c) => String(c).slice(0, 40)), flag: !!(m.flag && m.flag.flagStatus === "flagged"), html, body: shown, attachments: (m.attachments || []).filter((a) => !a.isInline).map((a) => ({ id: a.id, name: String(a.name || "attachment").slice(0, 160), size: Number(a.size || 0), type: String(a.contentType || "") })), worker: WORKER_BUILD });
+    }
+    if (url.pathname === "/api/mail/categories" && !post) {
+      const r = await mailGraph(env, addr, "/outlook/masterCategories");
+      if (!r.ok) return reply(env, 200, { ok: false, error: mailWhy(r), worker: WORKER_BUILD });
+      return reply(env, 200, { ok: true, categories: ((r.json && r.json.value) || []).map((c) => ({ name: String(c.displayName || "").slice(0, 40), color: String(c.color || "") })), worker: WORKER_BUILD });
+    }
+    if (url.pathname === "/api/mail/contacts" && !post) {
+      const q = String(url.searchParams.get("q") || "").replace(/['"\\]/g, " ").trim().slice(0, 60);
+      if (q.length < 1) return reply(env, 200, { ok: true, contacts: [], worker: WORKER_BUILD });
+      const f = encodeURIComponent(`startswith(displayName,'${q}') or startswith(givenName,'${q}') or startswith(surname,'${q}') or startswith(companyName,'${q}')`);
+      const found = await Promise.all(mine.map(async (bx) => {
+        const ad = mailAddress(env, bx);
+        const r = await mailGraph(env, ad, `/contacts?$top=8&$select=id,displayName,emailAddresses,companyName,photo&$filter=${f}`);
+        return ((r.ok && r.json && r.json.value) || []).map((c) => ({ id: c.id, box: bx.id, name: String(c.displayName || "").slice(0, 80), company: String(c.companyName || "").slice(0, 60), emails: (c.emailAddresses || []).map((e) => String(e.address || "")).filter(Boolean).slice(0, 4) }));
+      }));
+      const seen = new Set(), out = [];
+      for (const c of found.flat()) { const k = (c.emails[0] || c.name).toLowerCase(); if (seen.has(k) || !c.emails.length) continue; seen.add(k); out.push(c); }
+      return reply(env, 200, { ok: true, contacts: out.slice(0, 8), worker: WORKER_BUILD });
+    }
+    if (url.pathname === "/api/mail/contactphoto" && !post) {
+      const cid = mailId(url.searchParams.get("cid"));
+      const owner = mine.find((x) => x.id === (url.searchParams.get("owner") || "")) || box;
+      if (!cid) return reply(env, 400, { error: "bad request" });
+      const res = await graphFetch(env, `/users/${encodeURIComponent(mailAddress(env, owner))}/contacts/${encodeURIComponent(cid)}/photo/$value`);
+      if (!res.ok) return new Response(null, { status: 404, headers: cors(env) });
+      return new Response(res.body, { status: 200, headers: { ...cors(env), "Content-Type": res.headers.get("Content-Type") || "image/jpeg", "Cache-Control": "private, max-age=3600" } });
     }
     if (url.pathname === "/api/mail/attachment" && !post) {
       const msg = mailId(url.searchParams.get("msg")), att = mailId(url.searchParams.get("att"));
@@ -3996,6 +4022,9 @@ async function mailRoutes(request, env, user, url) {
       const msg = mailId(body && body.msg);
       const done = (r) => r.ok ? reply(env, 200, { ok: true, worker: WORKER_BUILD }) : reply(env, 200, { ok: false, error: mailWhy(r, true), worker: WORKER_BUILD });
       if (act === "read" && msg) return done(await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}`, "PATCH", { isRead: !!body.read }));
+      if (act === "archive" && msg) return done(await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}/move`, "POST", { destinationId: "archive" }));
+      if (act === "flag" && msg) return done(await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}`, "PATCH", { flag: { flagStatus: body.flagged ? "flagged" : "notFlagged" } }));
+      if (act === "categories" && msg) return done(await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}`, "PATCH", { categories: (Array.isArray(body.categories) ? body.categories : []).map((c) => String(c).slice(0, 40)).slice(0, 12) }));
       if (act === "delete" && msg) return done(await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}/move`, "POST", { destinationId: "deleteditems" }));
       if (act === "reply" && msg) return done(await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}/reply`, "POST", { comment: String(body.comment || "").slice(0, 200000) }));
       if (act === "forward" && msg) {
