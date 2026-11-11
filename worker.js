@@ -3948,7 +3948,7 @@ async function mailRoutes(request, env, user, url) {
       const top = Math.max(1, Math.min(200, Number(url.searchParams.get("top")) || 40));
       const filter = url.searchParams.get("filter") || "";
       const q = String(url.searchParams.get("q") || "").replace(/["\\]/g, " ").trim().slice(0, 100);
-      let qs = `/mailFolders/${encodeURIComponent(folder)}/messages?$top=${top}&$select=subject,from,toRecipients,receivedDateTime,isRead,bodyPreview,hasAttachments,categories,flag`;
+      let qs = `${q ? "" : "/mailFolders/" + encodeURIComponent(folder)}/messages?$top=${top}&$select=subject,from,toRecipients,receivedDateTime,isRead,bodyPreview,hasAttachments,categories,flag`;
       if (q) qs += `&$search=${encodeURIComponent('"' + q + '"')}`;
       else {
         const f = ["receivedDateTime ge 1900-01-01T00:00:00Z"];
@@ -3958,6 +3958,7 @@ async function mailRoutes(request, env, user, url) {
       }
       const r = await mailGraph(env, addr, qs);
       if (!r.ok) return reply(env, 200, { ok: false, error: mailWhy(r), worker: WORKER_BUILD });
+      if (q && r.json && Array.isArray(r.json.value)) r.json.value.sort((x, y) => String(y.receivedDateTime || "").localeCompare(String(x.receivedDateTime || "")));
       const list = ((r.json && r.json.value) || []).map((m) => ({ id: m.id, from: mailShow(m.from).slice(0, 80), fromAddr: mailPart(m.from).address.toLowerCase(), to: ((m.toRecipients || []).map(mailShow).join(", ")).slice(0, 120), subject: String(m.subject || "(no subject)").slice(0, 160), at: m.receivedDateTime || "", read: !!m.isRead, attach: !!m.hasAttachments, categories: (m.categories || []).slice(0, 6).map((c) => String(c).slice(0, 40)), flag: mailFlag(m.flag), preview: String(m.bodyPreview || "").replace(/\s+/g, " ").slice(0, 140) }));
       return reply(env, 200, { ok: true, label: box.label, messages: list, more: list.length >= top && !q, worker: WORKER_BUILD });
     }
