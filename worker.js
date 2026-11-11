@@ -108,7 +108,7 @@ async function verifyToken(request, env) {
 const cors = (env) => ({
   "Access-Control-Allow-Origin": env.ALLOWED_ORIGIN,
   "Access-Control-Allow-Headers": "Authorization, Content-Type, X-View-As",
-  "Access-Control-Allow-Methods": "GET, PUT, POST, DELETE, OPTIONS",
+  "Access-Control-Allow-Methods": "GET, PUT, POST, PATCH, DELETE, OPTIONS",
   "Access-Control-Max-Age": "86400",
   Vary: "Origin"
 });
@@ -7961,6 +7961,15 @@ export default {
       if (user.viewAs) return reply(env, 403, { error: "Viewing as someone else is read only." });
       await invHistoryTable(env);
       await env.DB.prepare("DELETE FROM invoice_history WHERE id = ?").bind(Number(ih[1])).run();
+      return reply(env, 200, { ok: true });
+    }
+
+    if (ih && request.method === "PATCH") {
+      // Tick as rectified: the error moves down into the successful history.
+      if (user.tier !== "T1") return reply(env, 403, { error: "forbidden" });
+      if (user.viewAs) return reply(env, 403, { error: "Viewing as someone else is read only." });
+      await invHistoryTable(env);
+      await env.DB.prepare("UPDATE invoice_history SET status = 'done', detail = 'Rectified' WHERE id = ? AND status = 'error'").bind(Number(ih[1])).run();
       return reply(env, 200, { ok: true });
     }
 
