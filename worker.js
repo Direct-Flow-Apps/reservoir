@@ -3362,6 +3362,22 @@ async function jjsParse(bytes) {
   const iso = (m) => `${m[3]}-${String(m[2]).padStart(2, "0")}-${String(m[1]).padStart(2, "0")}`;
   return { number: num[1], date: iso(iss), due: due ? iso(due) : undefined, ex, gst, inc, order: "" };
 }
+async function aroFloParse(bytes) {
+  const items = await pdfTextRuns(bytes);
+  if (!items.length) return null;
+  const isNeg = (t) => /^\(.*\)$|^-|-$|CR$/i.test(String(t).trim());
+  const money = (t) => { const n = Number(String(t).replace(/[^0-9.]/g, "")); return isNeg(t) ? -n : n; };
+  const label = (name) => items.filter((i) => i.t.trim().toLowerCase() === name.toLowerCase()).sort((a, b) => b.y - a.y)[0];
+  const side = (name) => { const l = label(name); if (!l) return ""; const v = items.filter((i) => i.page === l.page && Math.abs(i.y - l.y) < 4 && i.x > l.x + 20 && /\d/.test(i.t)).sort((a, b) => a.x - b.x)[0]; return v ? v.t.trim() : ""; };
+  const exT = side("Subtotal:"), gstT = side("GST:"), incT = side("AUD Total:");
+  const ex = money(exT), gst = money(gstT), inc = money(incT);
+  if (isNeg(incT) || inc < 0 || items.some((i) => /credit note/i.test(i.t))) return { credit: true };
+  const number = side("Invoice No:");
+  const dm = side("Date:").match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/), dd = side("Due Date:").match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (!/^\d{4,}$/.test(number) || !dm || !(ex > 0) || !(inc > 0) || Math.abs(ex + gst - inc) > 0.02) return null;
+  const iso = (m) => `${m[3]}-${String(m[2]).padStart(2, "0")}-${String(m[1]).padStart(2, "0")}`;
+  return { number, date: iso(dm), due: dd ? iso(dd) : undefined, ex, gst, inc, order: "" };
+}
 // Due on the last business day (Monday to Friday) of the month after the invoice month.
 function billDueDate(iso) {
   const [y, m] = iso.split("-").map(Number);
@@ -3427,7 +3443,8 @@ const INVOICE_MAIL_RULES = [
   { name: "Daisys", from: "notifications@daisysgarden.com.au", subject: "daisys garden supplies pty ltd invoice", contact: "daisy", account: "", parse: (b) => daisysParse(b) },
   { name: "Plumbhaus", from: "messaging-service@post.xero.com", subject: "from plumbhaus co pty ltd", contact: "plumbhaus", account: "", parse: (b) => plumbhausParse(b) },
   { name: "Bunnings", from: "creditedelivery@edelivery.bunnings.com.au", subject: "your bunnings statement", contact: "bunnings", account: "", xeroOnly: true, parse: (b) => bunningsParse(b) },
-  { name: "JJ's Waste", from: "ar.melbourne@jjswaste.com.au", subject: "invoice for customer", contact: "jjs waste", account: "", xeroOnly: true, parse: (b) => jjsParse(b) }
+  { name: "JJ's Waste", from: "ar.melbourne@jjswaste.com.au", subject: "invoice for customer", contact: "jjs waste", account: "", xeroOnly: true, parse: (b) => jjsParse(b) },
+  { name: "AroFlo", from: "billing@aroflo.com", subject: "aroflo billing", contact: "aroflo", account: "", xeroOnly: true, parse: (b) => aroFloParse(b) }
 ];
 const MAILBOXES = [
   { id: "tayler", label: "Tayler", address: "tayler@directflow.com.au", only: ["tayler@directflow.com.au"] },
