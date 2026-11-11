@@ -7138,10 +7138,11 @@ export default {
         let lastErr = "";
         for (const rule of INVOICE_MAIL_RULES) {
           const f = `receivedDateTime ge 1900-01-01T00:00:00Z and hasAttachments eq true and from/emailAddress/address eq '${rule.from}'`;
-          const r = await mailGraph(env, addr, `/mailFolders/inbox/messages?$top=25&$select=subject,receivedDateTime&$filter=${encodeURIComponent(f)}&$orderby=receivedDateTime desc`);
+          const r = await mailGraph(env, addr, `/mailFolders/inbox/messages?$top=25&$select=subject,receivedDateTime,categories&$filter=${encodeURIComponent(f)}&$orderby=receivedDateTime desc`);
           if (!r.ok) { lastErr = mailWhy(r); continue; }
           const hits = ((r.json && r.json.value) || []).filter((m) => String(m.subject || "").toLowerCase().includes(rule.subject.toLowerCase())).slice(0, 10);
           for (const hit of hits) {
+            if ((hit.categories || []).some((c) => String(c).toLowerCase() === "credit")) { credits++; continue; }
             const at = await mailGraph(env, addr, `/messages/${encodeURIComponent(hit.id)}/attachments?$select=id,name,contentType,size,isInline`);
             if (!at.ok) { lastErr = mailWhy(at); continue; }
             const pdfs = ((at.json && at.json.value) || []).filter((x) => !x.isInline && (/pdf/i.test(x.contentType || "") || /\.pdf$/i.test(x.name || "")));
@@ -7157,7 +7158,11 @@ export default {
               got.push({ p, buf, parsed });
             }
             // A credit stays in the mailbox untouched.
-            if (got.some((g) => g.parsed && g.parsed.credit)) { credits++; continue; }
+            if (got.some((g) => g.parsed && g.parsed.credit)) {
+              credits++;
+              await graphFetch(env, `/users/${encodeURIComponent(addr)}/messages/${encodeURIComponent(hit.id)}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ categories: [...new Set([...(hit.categories || []), "Credit"])] }) }).catch(() => null);
+              continue;
+            }
             const failed = [];
             const items = [];
             let allOk = true;
