@@ -4058,6 +4058,7 @@ async function mailRoutes(request, env, user, url) {
       if (act === "categories" && msg) return done(await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}`, "PATCH", { categories: (Array.isArray(body.categories) ? body.categories : []).map((c) => String(c).slice(0, 40)).slice(0, 12) }));
       if (act === "delete" && msg) return done(await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}/move`, "POST", { destinationId: "deleteditems" }));
       if (act === "reply" && msg) return done(await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}/reply`, "POST", { comment: String(body.comment || "").slice(0, 200000) }));
+      if (act === "replyall" && msg) return done(await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}/replyAll`, "POST", { comment: String(body.comment || "").slice(0, 200000) }));
       if (act === "forward" && msg) {
         const to = mailRecipients(body.to);
         if (!to.length) return reply(env, 200, { ok: false, error: "Add at least one valid email address to forward to.", worker: WORKER_BUILD });
