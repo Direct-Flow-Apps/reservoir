@@ -3540,6 +3540,27 @@ async function geelongCommercialParse(bytes) {
   const date = dateOf(side("Issued:")), due = dateOf(side("Due Date:"));
   const ex = Math.round((inc - gst) * 100) / 100;
   if (!/^\d{4,}$/.test(number) || !date || !(inc > 0) || !(gst >= 0) || !(ex > 0)) return null;
+  // GST comes from the invoice. If it is neither nil nor a tenth of the ex GST amount, the invoice mixes lines, so flag it for a person.
+  if (gst > 0 && Math.abs(gst - ex * 0.1) > 0.02) return null;
+  return { number, date, due: due || undefined, ex, gst, inc, order: "" };
+}
+async function telecaParse(bytes) {
+  const items = await pdfTextRuns(bytes);
+  if (!items.length) return null;
+  const isNeg = (t) => /^\(.*\)$|^-|-$|CR$/i.test(String(t).trim());
+  const money = (t) => { const n = Number(String(t).replace(/[^0-9.]/g, "")); return isNeg(t) ? -n : n; };
+  const label = (name) => items.filter((i) => i.t.trim().toLowerCase() === name.toLowerCase()).sort((a, b) => a.page - b.page || b.y - a.y)[0];
+  // Boxed figures: the value sits just under its label, roughly centred.
+  const below = (name) => { const l = label(name); if (!l) return ""; const v = items.filter((i) => i.page === l.page && i.y < l.y && l.y - i.y < 18 && Math.abs(i.x - l.x) < 60).sort((a, b) => (l.y - a.y) - (l.y - b.y))[0]; return v ? v.t.trim() : ""; };
+  const row = (name) => { const l = label(name); if (!l) return []; return items.filter((i) => i.page === l.page && Math.abs(i.y - l.y) < 4 && i.x > l.x + 20 && /\d/.test(i.t)).sort((a, b) => a.x - b.x).map((i) => i.t.trim()); };
+  // Only this period's charges are billed. Amount Owing also carries last month's balance, already billed.
+  const incT = below("Current Charges"), tot = row("TOTAL"), gstRow = row("GST included in total *");
+  const inc = money(incT), ex = money(tot[0] || ""), gst = money(gstRow[0] || "");
+  if (isNeg(incT) || inc < 0 || items.some((i) => /credit note/i.test(i.t))) return { credit: true };
+  const number = below("Statement Number");
+  const dateOf = (t) => { const m = String(t).trim().match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/); return m ? `${m[3]}-${String(m[2]).padStart(2, "0")}-${String(m[1]).padStart(2, "0")}` : ""; };
+  const date = dateOf(below("Issue Date")), due = dateOf(below("Payment Due By"));
+  if (!/^\d{6,}[-\d]*$/.test(number) || !date || !(inc > 0) || !(ex > 0) || Math.abs(ex + gst - inc) > 0.02 || Math.abs(money(tot[1] || "") - inc) > 0.02) return null;
   return { number, date, due: due || undefined, ex, gst, inc, order: "" };
 }
 // Due on the last business day (Monday to Friday) of the month after the invoice month.
@@ -3613,7 +3634,8 @@ const INVOICE_MAIL_RULES = [
   { name: "Superloop", from: "noreply@superloop.com", subject: "your superloop bill", contact: "superloop", account: "", xeroOnly: true, parse: (b) => superloopParse(b) },
   { name: "Soilworx", from: "accounts@soilworx.com.au", subject: "inv", contact: "soilworx", account: "", parse: (b) => soilworxParse(b) },
   { name: "Estimate One", from: "accounts@estimateone.com", subject: "your e1 invoice", contact: "estimate one", account: "", xeroOnly: true, parse: (b) => estimateOneParse(b) },
-  { name: "Geelong Commercial", from: "emaildelivery@console.com.au", subject: "invoice for 41 seaside pde", contact: "geelong commercial", account: "", xeroOnly: true, parse: (b) => geelongCommercialParse(b) }
+  { name: "Geelong Commercial", from: "emaildelivery@console.com.au", subject: "invoice for 41 seaside pde", contact: "geelong commercial", account: "", xeroOnly: true, parse: (b) => geelongCommercialParse(b) },
+  { name: "Teleca", from: "cs@teleca.com.au", subject: "telephone billing", contact: "teleca", account: "", xeroOnly: true, parse: (b) => telecaParse(b) }
 ];
 const MAILBOXES = [
   { id: "tayler", label: "Tayler", address: "tayler@directflow.com.au", only: ["tayler@directflow.com.au"] },
