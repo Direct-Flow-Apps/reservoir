@@ -3587,6 +3587,8 @@ async function xeroBillFromPdf(env, rule, bytes, fileName, parsed) {
   const make = async (status) => {
     const line = { Description: `${rule.name} ${parsed.inclusive ? "statement" : "invoice"} ${parsed.number}${parsed.order ? ` (order ${parsed.order})` : ""}`, Quantity: 1, UnitAmount: parsed.inclusive ? parsed.inc : parsed.ex, TaxType: parsed.gst === 0 ? "EXEMPTEXPENSES" : "INPUT" };
     if (account) line.AccountCode = account;
+    // Xero rounds GST itself and can land a cent off the supplier invoice, so the invoice GST is sent as the line tax.
+    if (!parsed.inclusive && parsed.gst > 0) line.TaxAmount = parsed.gst;
     const body = { Invoices: [{ Type: "ACCPAY", Contact: { ContactID: contact.contact_id }, InvoiceNumber: parsed.number, Date: parsed.date, DueDate: parsed.due || billDueDate(parsed.date), LineAmountTypes: parsed.inclusive ? "Inclusive" : "Exclusive", Status: status, LineItems: [line] }] };
     return xeroFetch(env, "api.xro/2.0/Invoices?summarizeErrors=false", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
   };
