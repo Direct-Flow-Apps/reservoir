@@ -3046,6 +3046,8 @@ async function pdfTextRuns(bytes) {
         break;
       } catch (e) { text = ""; }
     }
+    // Older PDFs (WEX) keep the page content uncompressed.
+    if (!text) { const plain = bin.slice(start, end); if (/\bBT\b/.test(plain) && /\bTj\b|\bTJ\b/.test(plain)) text = plain; }
     if (!text || !/\bTj\b|\bTJ\b/.test(text)) continue;
     page++;
     const unesc = (s) => s.replace(/\\([0-7]{1,3}|.)/g, (_, c) => (/^[0-7]+$/.test(c) ? String.fromCharCode(parseInt(c, 8)) : c === "n" ? "\n" : c === "r" ? "\r" : c === "t" ? "\t" : c));
@@ -3189,6 +3191,25 @@ async function momentumParse(bytes) {
   if (!/^\d{5,}$/.test(number) || !dm || mi < 0 || !(inc > 0) || !(gst >= 0) || !(ex > 0)) return null;
   return { number, date: `${dm[3]}-${String(mi + 1).padStart(2, "0")}-${String(dm[1]).padStart(2, "0")}`, ex, gst, inc, order: "" };
 }
+async function wexParse(bytes) {
+  const items = await pdfTextRuns(bytes);
+  if (!items.length) return null;
+  const isNeg = (t) => /^\(.*\)$|^-|-$|CR$/i.test(String(t).trim());
+  const money = (t) => { const n = Number(String(t).replace(/[^0-9.]/g, "")); return isNeg(t) ? -n : n; };
+  const mon = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+  const side = (name) => { const ls = items.filter((i) => i.t.trim().toLowerCase() === name.toLowerCase()); const l = ls[ls.length - 1]; if (!l) return ""; const v = items.filter((i) => i.page === l.page && Math.abs(i.y - l.y) < 4 && i.x > l.x + 20 && i.t.trim()).sort((a, b) => a.x - b.x)[0]; return v ? v.t.trim() : ""; };
+  const dateOf = (t) => { const m = String(t).trim().match(/^(\d{1,2})\s+([A-Za-z]{3})[A-Za-z]*\s+(\d{2,4})$/); const mi = m ? mon.indexOf(m[2].toLowerCase()) : -1; if (!m || mi < 0) return ""; const y = m[3].length === 2 ? 2000 + Number(m[3]) : Number(m[3]); return `${y}-${String(mi + 1).padStart(2, "0")}-${String(m[1]).padStart(2, "0")}`; };
+  const dueT = side("AMOUNT DUE");
+  const inc = money(dueT);
+  let ex = 0, gst = 0;
+  for (const i of items) { const m = i.t.trim().match(/^TOTAL EXPENDITURE\s+([\d,.]+)\s+([\d,.]+)\s+([\d,.]+)\s+([\d,.]+)$/i); if (m) { ex = money(m[2]); gst = money(m[3]); if (Math.abs(money(m[4]) - inc) > 0.02) return null; } }
+  if (isNeg(dueT) || inc < 0) return { credit: true };
+  const date = dateOf(side("Period Ending"));
+  const due = dateOf(side("DATE DUE"));
+  const stamp = date ? date.slice(8, 10) + date.slice(5, 7) + date.slice(2, 4) : "";
+  if (!date || !due || !(inc > 0) || !(ex > 0) || Math.abs(ex + gst - inc) > 0.02) return null;
+  return { number: stamp, date, due, ex, gst, inc, order: "" };
+}
 // Due on the last business day (Monday to Friday) of the month after the invoice month.
 function billDueDate(iso) {
   const [y, m] = iso.split("-").map(Number);
@@ -3210,7 +3231,7 @@ async function xeroBillFromPdf(env, rule, bytes, fileName, parsed) {
   const make = async (status) => {
     const line = { Description: `${rule.name} invoice ${parsed.number}${parsed.order ? ` (order ${parsed.order})` : ""}`, Quantity: 1, UnitAmount: parsed.ex, TaxType: "INPUT" };
     if (account) line.AccountCode = account;
-    const body = { Invoices: [{ Type: "ACCPAY", Contact: { ContactID: contact.contact_id }, InvoiceNumber: parsed.number, Date: parsed.date, DueDate: billDueDate(parsed.date), LineAmountTypes: "Exclusive", Status: status, LineItems: [line] }] };
+    const body = { Invoices: [{ Type: "ACCPAY", Contact: { ContactID: contact.contact_id }, InvoiceNumber: parsed.number, Date: parsed.date, DueDate: parsed.due || billDueDate(parsed.date), LineAmountTypes: "Exclusive", Status: status, LineItems: [line] }] };
     return xeroFetch(env, "api.xro/2.0/Invoices?summarizeErrors=false", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
   };
   const created = async (status) => {
@@ -3249,7 +3270,8 @@ const INVOICE_MAIL_RULES = [
   { name: "Samios", fromDomain: "samios.net.au", subject: "invoice", contact: "samios", account: "", parse: (b) => samiosParse(b) },
   { name: "Reece", fromDomain: "reece.com.au", subject: "reece transactions", contact: "reece", account: "", parse: (b) => reeceParse(b) },
   { name: "Tradelink", from: "donotreply@tradelink.com.au", subject: "tax invoice", contact: "tradelink", account: "", parse: (b) => tradelinkParse(b) },
-  { name: "Momentum", from: "hello@mail.momentum.com.au", subject: "your electricity bill", contact: "momentum", account: "", xeroOnly: true, parse: (b) => momentumParse(b) }
+  { name: "Momentum", from: "hello@mail.momentum.com.au", subject: "your electricity bill", contact: "momentum", account: "", xeroOnly: true, parse: (b) => momentumParse(b) },
+  { name: "WEX Motorpass", from: "enquiries@motorpass.com.au", subject: "wex motorpass statement", contact: "wex", account: "", xeroOnly: true, parse: (b) => wexParse(b) }
 ];
 const MAILBOXES = [
   { id: "tayler", label: "Tayler", address: "tayler@directflow.com.au", only: ["tayler@directflow.com.au"] },
