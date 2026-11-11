@@ -3167,6 +3167,28 @@ async function tradelinkParse(bytes) {
   const yr = dt[3].length === 2 ? 2000 + Number(dt[3]) : Number(dt[3]);
   return { number, date: `${yr}-${String(dt[2]).padStart(2, "0")}-${String(dt[1]).padStart(2, "0")}`, ex, gst, inc, order: valueOf("Customer PO:") };
 }
+async function momentumParse(bytes) {
+  const items = await pdfTextRuns(bytes);
+  if (!items.length) return null;
+  const isNeg = (t) => /^\(.*\)$|^-|-$|CR$/i.test(String(t).trim());
+  const money = (t) => { const n = Number(String(t).replace(/[^0-9.]/g, "")); return isNeg(t) ? -n : n; };
+  const label = (name) => { const ls = items.filter((i) => i.t.trim().toLowerCase() === name.toLowerCase()); return ls[ls.length - 1]; };
+  // Invoice No and Issue date have their value on the line below, same left edge.
+  const below = (name) => { const l = label(name); if (!l) return ""; const v = items.filter((i) => i.page === l.page && Math.abs(i.x - l.x) < 3 && i.y < l.y && i.y > l.y - 30).sort((a, b) => b.y - a.y)[0]; return v ? v.t.trim() : ""; };
+  const side = (name) => { const l = label(name); if (!l) return ""; const v = items.filter((i) => i.page === l.page && Math.abs(i.y - l.y) < 4 && i.x > l.x + 20 && /\d/.test(i.t)).sort((a, b) => a.x - b.x)[0]; return v ? v.t.trim() : ""; };
+  const incT = side("Total Amount Due");
+  const inc = money(incT);
+  let gst = 0;
+  for (const i of items) { const m = i.t.match(/GST included on the invoice\s*\$\s*([\d,.]+)/i); if (m) gst = Number(m[1].replace(/,/g, "")); }
+  const credit = isNeg(incT) || inc < 0 || items.some((i) => /tax credit|credit note/i.test(i.t));
+  if (credit) return { credit: true };
+  const number = below("Invoice No");
+  const dm = below("Issue date").match(/^(\d{1,2})\s+([A-Za-z]{3})[a-z]*\s+(\d{4})$/);
+  const mi = dm ? ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"].indexOf(dm[2].toLowerCase()) : -1;
+  const ex = Math.round((inc - gst) * 100) / 100;
+  if (!/^\d{5,}$/.test(number) || !dm || mi < 0 || !(inc > 0) || !(gst >= 0) || !(ex > 0)) return null;
+  return { number, date: `${dm[3]}-${String(mi + 1).padStart(2, "0")}-${String(dm[1]).padStart(2, "0")}`, ex, gst, inc, order: "" };
+}
 // Due on the last business day (Monday to Friday) of the month after the invoice month.
 function billDueDate(iso) {
   const [y, m] = iso.split("-").map(Number);
@@ -3226,7 +3248,8 @@ const INVOICE_MAIL_RULES = [
   { name: "Harris", from: "mailouts@harristps.com.au", subject: "invoice", contact: "harris", account: "", parse: (b) => harrisParse(b) },
   { name: "Samios", fromDomain: "samios.net.au", subject: "invoice", contact: "samios", account: "", parse: (b) => samiosParse(b) },
   { name: "Reece", fromDomain: "reece.com.au", subject: "reece transactions", contact: "reece", account: "", parse: (b) => reeceParse(b) },
-  { name: "Tradelink", from: "donotreply@tradelink.com.au", subject: "tax invoice", contact: "tradelink", account: "", parse: (b) => tradelinkParse(b) }
+  { name: "Tradelink", from: "donotreply@tradelink.com.au", subject: "tax invoice", contact: "tradelink", account: "", parse: (b) => tradelinkParse(b) },
+  { name: "Momentum", from: "hello@mail.momentum.com.au", subject: "your electricity bill", contact: "momentum", account: "", xeroOnly: true, parse: (b) => momentumParse(b) }
 ];
 const MAILBOXES = [
   { id: "tayler", label: "Tayler", address: "tayler@directflow.com.au", only: ["tayler@directflow.com.au"] },
@@ -7326,7 +7349,8 @@ export default {
               if (g.bad) { failed.push(`${fname} could not be read`); allOk = false; continue; }
               const b64 = toB64(g.buf);
               const key = `invmail.${hit.id.slice(-40)}.${p.id.slice(-20)}`;
-              if (await done(key + ".aroflo")) it.aroflo = "already sent";
+              if (rule.xeroOnly) it.aroflo = "not needed";
+              else if (await done(key + ".aroflo")) it.aroflo = "already sent";
               else { try { await mailAttachment(env, user, to[0], fname, "application/pdf", b64); await mark(key + ".aroflo", "sent"); it.aroflo = "sent"; } catch (e) { allOk = false; it.aroflo = "failed"; failed.push(`AroFlo: ${String(e.message || "").slice(0, 80)}`); } }
               if (await done(key + ".xero")) it.xero = "already done";
               else {
