@@ -3057,6 +3057,8 @@ async function pdfTextRuns(bytes) {
       const tok = /\[((?:\((?:\\.|[^\\)])*\)|[^\]])*)\]|\(((?:\\.|[^\\)])*)\)|(-?[\d.]+)|([A-Za-z*'"]+)/g;
       let t, last = null;
       const emit = (str) => {
+        // Two byte glyph codes (Reece): every other byte is zero and the glyph number is the character code less 29.
+        if (str.length >= 2 && str.length % 2 === 0 && /^(?:\0[\s\S])+$/.test(str)) { let o = ""; for (let k = 1; k < str.length; k += 2) o += String.fromCharCode(str.charCodeAt(k) + 29); str = o; }
         if (!str.trim()) return;
         if (last && last.x === x && last.y === y && last.page === page) last.t += str;
         else { last = { x, y, t: str, page }; items.push(last); }
@@ -3118,6 +3120,31 @@ async function samiosParse(bytes) {
   const yr = dt[3].length === 2 ? 2000 + Number(dt[3]) : Number(dt[3]);
   return { number, date: `${yr}-${String(dt[2]).padStart(2, "0")}-${String(dt[1]).padStart(2, "0")}`, ex, gst, inc, order: "" };
 }
+async function reeceParse(bytes) {
+  const items = await pdfTextRuns(bytes);
+  if (!items.length) return null;
+  const valueOf = (label) => {
+    const ls = items.filter((i) => i.t.trim().toLowerCase() === label.toLowerCase());
+    const l = ls[ls.length - 1];
+    if (!l) return "";
+    const v = items.filter((i) => i.page === l.page && Math.abs(i.y - l.y) < 4 && i.x > l.x + 20 && i !== l).sort((a, b) => a.x - b.x)[0];
+    return v ? v.t.trim() : "";
+  };
+  const isNeg = (t) => /^\(.*\)$|^-|-$|CR$/i.test(String(t).trim());
+  const money = (t) => { const n = Number(String(t).replace(/[^0-9.]/g, "")); return isNeg(t) ? -n : n; };
+  const dl = items.filter((i) => i.t.trim().toLowerCase() === "document total");
+  const d = dl[dl.length - 1];
+  const nums = d ? items.filter((i) => i.page === d.page && Math.abs(i.y - d.y) < 4 && i.x > d.x + 20).sort((a, b) => a.x - b.x).map((i) => i.t.trim()) : [];
+  const ex = money(nums[0] || ""), gst = money(nums[1] || ""), inc = money(nums[2] || "");
+  const credit = nums.slice(0, 3).some(isNeg) || ex < 0 || inc < 0 || items.some((i) => /^tax credit|credit note/i.test(i.t.trim()));
+  if (credit) return { credit: true };
+  let number = "";
+  for (const i of items) { const m = i.t.match(/^Invoice No\.\s+(\d+)\s*$/i); if (m) { number = m[1]; break; } }
+  const dt = valueOf("Date").match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/);
+  if (!/^\d{5,}$/.test(number) || !dt || nums.length < 3 || !(ex > 0) || !(inc > 0) || Math.abs(ex + gst - inc) > 0.02) return null;
+  const yr = dt[3].length === 2 ? 2000 + Number(dt[3]) : Number(dt[3]);
+  return { number, date: `${yr}-${String(dt[2]).padStart(2, "0")}-${String(dt[1]).padStart(2, "0")}`, ex, gst, inc, order: valueOf("Order No.") };
+}
 // Due on the last business day (Monday to Friday) of the month after the invoice month.
 function billDueDate(iso) {
   const [y, m] = iso.split("-").map(Number);
@@ -3175,7 +3202,8 @@ async function xeroBillFromPdf(env, rule, bytes, fileName, parsed) {
 const INVOICE_MAIL_RULES = [
   { name: "Burnett's", from: "burnetts-noreply@mail.myframeworks.com.au", subject: "BURNETTS PLUMBING SUPPLIES INVOICE", contact: "burnett", account: "", parse: (b) => burnettsParse(b) },
   { name: "Harris", from: "mailouts@harristps.com.au", subject: "invoice", contact: "harris", account: "", parse: (b) => harrisParse(b) },
-  { name: "Samios", fromDomain: "samios.net.au", subject: "invoice", contact: "samios", account: "", parse: (b) => samiosParse(b) }
+  { name: "Samios", fromDomain: "samios.net.au", subject: "invoice", contact: "samios", account: "", parse: (b) => samiosParse(b) },
+  { name: "Reece", fromDomain: "reece.com.au", subject: "reece transactions", contact: "reece", account: "", parse: (b) => reeceParse(b) }
 ];
 const MAILBOXES = [
   { id: "tayler", label: "Tayler", address: "tayler@directflow.com.au", only: ["tayler@directflow.com.au"] },
