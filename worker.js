@@ -3062,6 +3062,7 @@ async function pdfTextRuns(bytes) {
       if (p[3]) { const base = u16(p[3]); for (let c = lo; c <= hi; c++) map[c] = base.slice(0, -1) + String.fromCharCode(base.charCodeAt(base.length - 1) + (c - lo)); }
       else { const arr = [...p[4].matchAll(/<([0-9A-Fa-f]+)>/g)].map((q) => u16(q[1])); for (let c = lo; c <= hi && c - lo < arr.length; c++) map[c] = arr[c - lo]; }
     }
+    Object.defineProperty(map, "wide", { value: /begincodespacerange\s*<[0-9A-Fa-f]{4}>/.test(txt), enumerable: false });
     cmaps[fname] = map;
     return map;
   };
@@ -3120,6 +3121,15 @@ async function pdfTextRuns(bytes) {
           if (cm) { for (let k = 0; k + 3 < h.length; k += 4) o += cm[parseInt(h.slice(k, k + 4), 16)] || ""; }
           else for (let k = 0; k + 1 < h.length; k += 2) o += String.fromCharCode(parseInt(h.slice(k, k + 2), 16));
           str = o;
+        }
+        // Literal strings in a font with a ToUnicode map: two byte glyph codes (CID fonts) or one byte codes (simple fonts) translated through the map.
+        if (!hex && font && str) {
+          const cm1 = await cmapOf(font);
+          if (cm1) {
+            let o = "";
+            if (cm1.wide) { if (str.length % 2 === 0) { for (let k = 0; k + 1 < str.length; k += 2) { const c = (str.charCodeAt(k) << 8) | str.charCodeAt(k + 1); o += c in cm1 ? cm1[c] : ""; } str = o; } }
+            else { for (const ch of str) { const c = ch.charCodeAt(0); o += c in cm1 ? cm1[c] : ch; } str = o; }
+          }
         }
         // Two byte glyph codes (Reece): every other byte is zero and the glyph number is the character code less 29.
         if (str.length >= 2 && str.length % 2 === 0 && /^(?:\0[\s\S])+$/.test(str)) { let o = ""; for (let k = 1; k < str.length; k += 2) o += String.fromCharCode(str.charCodeAt(k) + 29); str = o; }
@@ -3378,6 +3388,31 @@ async function aroFloParse(bytes) {
   const iso = (m) => `${m[3]}-${String(m[2]).padStart(2, "0")}-${String(m[1]).padStart(2, "0")}`;
   return { number, date: iso(dm), due: dd ? iso(dd) : undefined, ex, gst, inc, order: "" };
 }
+async function adamsonsParse(bytes) {
+  const items = await pdfTextRuns(bytes);
+  if (!items.length) return null;
+  // This generator gives no usable line positions or spaces, so read the items in order: a label, then its value.
+  const t = items.map((i) => i.t.trim());
+  const idx = (pred) => { for (let k = 0; k < t.length; k++) if (pred(k)) return k; return -1; };
+  const isNeg = (x) => /^\(.*\)$|^-|-$|CR$/i.test(String(x).trim());
+  const money = (x) => { const n = Number(String(x).replace(/[^0-9.]/g, "")); return isNeg(x) ? -n : n; };
+  const mon = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+  const ex = money(t[idx((k) => t[k] === "Subtotal") + 1] || "");
+  const gst = money(t[idx((k) => t[k] === "Total" && /^GST/i.test(t[k + 1] || "")) + 2] || "");
+  const iT = idx((k) => /^Invoice\s*Total/i.test(t[k]) || (t[k] === "Invoice" && /^TotalAUD$/i.test(t[k + 1] || "")));
+  const incT = iT < 0 ? "" : t[iT + (/^TotalAUD$/i.test(t[iT + 1] || "") ? 2 : 1)] || "";
+  const inc = money(incT);
+  if (isNeg(incT) || inc < 0 || items.some((i) => /credit note/i.test(i.t))) return { credit: true };
+  const nk = idx((k) => t[k] === "Invoice" && t[k + 1] === "Number");
+  const number = nk < 0 ? "" : t[nk + 2] || "";
+  const dk = idx((k) => t[k] === "Invoice" && t[k + 1] === "Date");
+  const dm = dk < 0 ? null : [t[dk + 2], t[dk + 3], t[dk + 4]];
+  const mi = dm ? mon.indexOf(String(dm[1]).slice(0, 3).toLowerCase()) : -1;
+  const due = ((t.join(" ").match(/Due\s*Date:\s*(\d{1,2})\s*([A-Za-z]{3})\s*(\d{4})/i)) || null);
+  const dmi = due ? mon.indexOf(due[2].toLowerCase()) : -1;
+  if (!/^\d{5,}$/.test(number) || !dm || mi < 0 || !/^\d{1,2}$/.test(dm[0]) || !/^\d{4}$/.test(dm[2]) || !(ex > 0) || !(inc > 0) || Math.abs(ex + gst - inc) > 0.02) return null;
+  return { number, date: `${dm[2]}-${String(mi + 1).padStart(2, "0")}-${String(dm[0]).padStart(2, "0")}`, due: dmi >= 0 ? `${due[3]}-${String(dmi + 1).padStart(2, "0")}-${String(due[1]).padStart(2, "0")}` : undefined, ex, gst, inc, order: "" };
+}
 // Due on the last business day (Monday to Friday) of the month after the invoice month.
 function billDueDate(iso) {
   const [y, m] = iso.split("-").map(Number);
@@ -3444,7 +3479,8 @@ const INVOICE_MAIL_RULES = [
   { name: "Plumbhaus", from: "messaging-service@post.xero.com", subject: "from plumbhaus co pty ltd", contact: "plumbhaus", account: "", parse: (b) => plumbhausParse(b) },
   { name: "Bunnings", from: "creditedelivery@edelivery.bunnings.com.au", subject: "your bunnings statement", contact: "bunnings", account: "", xeroOnly: true, parse: (b) => bunningsParse(b) },
   { name: "JJ's Waste", from: "ar.melbourne@jjswaste.com.au", subject: "invoice for customer", contact: "jjs waste", account: "", xeroOnly: true, parse: (b) => jjsParse(b) },
-  { name: "AroFlo", from: "billing@aroflo.com", subject: "aroflo billing", contact: "aroflo", account: "", xeroOnly: true, parse: (b) => aroFloParse(b) }
+  { name: "AroFlo", from: "billing@aroflo.com", subject: "aroflo billing", contact: "aroflo", account: "", xeroOnly: true, parse: (b) => aroFloParse(b) },
+  { name: "Adamsons", from: "messaging-service@post.xero.com", subject: "from adamsons tax", contact: "adamsons", account: "", xeroOnly: true, parse: (b) => adamsonsParse(b) }
 ];
 const MAILBOXES = [
   { id: "tayler", label: "Tayler", address: "tayler@directflow.com.au", only: ["tayler@directflow.com.au"] },
