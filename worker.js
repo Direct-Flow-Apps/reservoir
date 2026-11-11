@@ -3920,7 +3920,7 @@ async function mailRoutes(request, env, user, url) {
         const r = await mailGraph(env, mailAddress(env, b), "/mailFolders/inbox?$select=unreadItemCount");
         return { id: b.id, label: b.label, personal: !!b.only, unread: r.ok && r.json ? Number(r.json.unreadItemCount || 0) : 0, error: r.ok ? "" : mailWhy(r) };
       }));
-      return reply(env, 200, { boxes: out, worker: WORKER_BUILD });
+      return reply(env, 200, { boxes: out, targets: MAILBOXES.filter((x) => !x.only || mailAllowed(x, user)).map((x) => ({ id: x.id, label: x.label })), worker: WORKER_BUILD });
     }
     const b = mine.find((x) => x.id === (url.searchParams.get("id") || ""));
     let body = null;
@@ -4038,6 +4038,21 @@ async function mailRoutes(request, env, user, url) {
       const done = (r) => r.ok ? reply(env, 200, { ok: true, worker: WORKER_BUILD }) : reply(env, 200, { ok: false, error: mailWhy(r, true), worker: WORKER_BUILD });
       if (act === "read" && msg) return done(await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}`, "PATCH", { isRead: !!body.read }));
       if (act === "archive" && msg) { const ar = await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}/move`, "POST", { destinationId: "archive" }); return ar.ok ? reply(env, 200, { ok: true, newId: String((ar.json && ar.json.id) || ""), worker: WORKER_BUILD }) : done(ar); }
+      if (act === "moveto" && msg) {
+        const tb = MAILBOXES.find((x) => x.id === String(body.target || "") && (!x.only || mailAllowed(x, user)));
+        if (!tb || tb.id === box.id) return reply(env, 200, { ok: false, error: "Choose another mailbox to move it to.", worker: WORKER_BUILD });
+        const src = await graphFetch(env, `/users/${encodeURIComponent(addr)}/messages/${encodeURIComponent(msg)}/$value`);
+        if (!src.ok) return reply(env, 200, { ok: false, error: "The email could not be read to move it. Microsoft answered " + src.status + ".", worker: WORKER_BUILD });
+        const bytes = new Uint8Array(await src.arrayBuffer());
+        let bin = "";
+        for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+        const put = await graphFetch(env, `/users/${encodeURIComponent(mailAddress(env, tb))}/mailFolders/inbox/messages`, { method: "POST", headers: { "Content-Type": "text/plain" }, body: btoa(bin) });
+        if (!put.ok) return reply(env, 200, { ok: false, error: "The copy into " + tb.label + " failed. Microsoft answered " + put.status + ". Nothing was changed.", worker: WORKER_BUILD });
+        let created = null; try { created = await put.json(); } catch (e) { created = null; }
+        if (created && created.id && created.isDraft) await mailDo(env, mailAddress(env, tb), `/messages/${encodeURIComponent(created.id)}`, "PATCH", { isRead: !!body.read });
+        const gone = await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}/move`, "POST", { destinationId: "archive" });
+        return reply(env, 200, { ok: true, label: tb.label, archived: gone.ok, worker: WORKER_BUILD });
+      }
       if (act === "restore" && msg) return done(await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}/move`, "POST", { destinationId: "inbox" }));
       if (act === "flag" && msg) return done(await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}`, "PATCH", { flag: body.status === "complete" ? { flagStatus: "complete", completedDateTime: { dateTime: new Date().toISOString().slice(0, 19), timeZone: "UTC" } } : { flagStatus: body.status === "flagged" ? "flagged" : "notFlagged" } }));
       if (act === "categories" && msg) return done(await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}`, "PATCH", { categories: (Array.isArray(body.categories) ? body.categories : []).map((c) => String(c).slice(0, 40)).slice(0, 12) }));
