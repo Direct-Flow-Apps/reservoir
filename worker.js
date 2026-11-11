@@ -3967,7 +3967,22 @@ async function mailRoutes(request, env, user, url) {
       if (!r.ok) return reply(env, 200, { ok: false, error: mailWhy(r), worker: WORKER_BUILD });
       const m = r.json || {};
       const html = !!(m.body && String(m.body.contentType || "").toLowerCase() === "html");
-      return reply(env, 200, { ok: true, id: m.id, subject: String(m.subject || "(no subject)"), from: mailPart(m.from), to: (m.toRecipients || []).map(mailPart), cc: (m.ccRecipients || []).map(mailPart), at: m.receivedDateTime || m.sentDateTime || "", read: !!m.isRead, html, body: String((m.body && m.body.content) || "").slice(0, 1500000), attachments: (m.attachments || []).filter((a) => !a.isInline).map((a) => ({ id: a.id, name: String(a.name || "attachment").slice(0, 160), size: Number(a.size || 0), type: String(a.contentType || "") })), worker: WORKER_BUILD });
+      let shown = String((m.body && m.body.content) || "").slice(0, 1500000);
+      if (html && /cid:/i.test(shown)) {
+        let room = 8000000;
+        for (const a of (m.attachments || []).filter((x) => /^image\//i.test(String(x.contentType || "")) && Number(x.size || 0) <= 2000000).slice(0, 20)) {
+          if (room <= 0) break;
+          try {
+            const f = await mailGraph(env, addr, `/messages/${encodeURIComponent(msg)}/attachments/${encodeURIComponent(a.id)}`);
+            const j = f.ok ? f.json : null;
+            const cid = j ? String(j.contentId || "").replace(/^<|>$/g, "") : "";
+            if (!j || !j.contentBytes || !cid) continue;
+            room -= j.contentBytes.length;
+            shown = shown.split("cid:" + cid).join(`data:${j.contentType || a.contentType};base64,${j.contentBytes}`);
+          } catch (e) {}
+        }
+      }
+      return reply(env, 200, { ok: true, id: m.id, subject: String(m.subject || "(no subject)"), from: mailPart(m.from), to: (m.toRecipients || []).map(mailPart), cc: (m.ccRecipients || []).map(mailPart), at: m.receivedDateTime || m.sentDateTime || "", read: !!m.isRead, html, body: shown, attachments: (m.attachments || []).filter((a) => !a.isInline).map((a) => ({ id: a.id, name: String(a.name || "attachment").slice(0, 160), size: Number(a.size || 0), type: String(a.contentType || "") })), worker: WORKER_BUILD });
     }
     if (url.pathname === "/api/mail/attachment" && !post) {
       const msg = mailId(url.searchParams.get("msg")), att = mailId(url.searchParams.get("att"));
