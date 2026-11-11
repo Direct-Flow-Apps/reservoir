@@ -3093,6 +3093,8 @@ async function pdfTextRuns(bytes) {
   for (const om of bin.matchAll(/(\d+)\s+0\s+obj([\s\S]*?)endobj/g)) objBody[om[1]] = { head: om[2], at: om.index + om[0].indexOf(om[2]) };
   const fontObj = {};
   for (const fm of bin.matchAll(/\/Font\s*<<([^>]*)>>/g)) for (const p of fm[1].matchAll(/\/([A-Za-z0-9_.+-]+)\s+(\d+)\s+0\s+R/g)) fontObj[p[1]] = p[2];
+  // Font dictionaries that sit in their own object (Qt): any name that points at a font object.
+  for (const fm of bin.matchAll(/\/([A-Za-z0-9_.+-]+)\s+(\d+)\s+0\s+R/g)) { const o = objBody[fm[2]]; if (o && /\/Type\s*\/Font\b/.test(o.head) && !(fm[1] in fontObj)) fontObj[fm[1]] = fm[2]; }
   const cmaps = {};
   const cmapOf = async (fname) => {
     if (fname in cmaps) return cmaps[fname];
@@ -3174,14 +3176,14 @@ async function pdfTextRuns(bytes) {
           let o = "";
           if (cm) { for (let k = 0; k + 3 < h.length; k += 4) o += cm[parseInt(h.slice(k, k + 4), 16)] || ""; }
           else for (let k = 0; k + 1 < h.length; k += 2) o += String.fromCharCode(parseInt(h.slice(k, k + 2), 16));
-          str = o;
+          str = o.replace(/\t/g, " ");
         }
         // Literal strings in a font with a ToUnicode map: two byte glyph codes (CID fonts) or one byte codes (simple fonts) translated through the map.
         if (!hex && font && str) {
           const cm1 = await cmapOf(font);
           if (cm1) {
             let o = "";
-            if (cm1.wide) { if (str.length % 2 === 0) { for (let k = 0; k + 1 < str.length; k += 2) { const c = (str.charCodeAt(k) << 8) | str.charCodeAt(k + 1); o += c in cm1 ? cm1[c] : ""; } str = o; } }
+            if (cm1.wide) { if (str.length % 2 === 0) { for (let k = 0; k + 1 < str.length; k += 2) { const c = (str.charCodeAt(k) << 8) | str.charCodeAt(k + 1); o += c in cm1 ? cm1[c] : ""; } str = o.replace(/\t/g, " "); } }
             else { for (const ch of str) { const c = ch.charCodeAt(0); o += c in cm1 ? cm1[c] : ch; } str = o; }
           }
         }
@@ -3518,6 +3520,28 @@ async function estimateOneParse(bytes) {
   if (!/^\d{4,}$/.test(number) || !date || !(ex > 0) || !(inc > 0) || Math.abs(ex + gst - inc) > 0.02) return null;
   return { number, date, due: dueRaw || date, ex, gst, inc, order: "" };
 }
+async function geelongCommercialParse(bytes) {
+  const items = await pdfTextRuns(bytes);
+  if (!items.length) return null;
+  const isNeg = (t) => /^\(.*\)$|^-|-$|CR$/i.test(String(t).trim());
+  const money = (t) => { const n = Number(String(t).replace(/[^0-9.]/g, "")); return isNeg(t) ? -n : n; };
+  const label = (name) => items.filter((i) => i.t.trim().toLowerCase() === name.toLowerCase()).sort((a, b) => a.y - b.y)[0];
+  const side = (name) => { const l = label(name); if (!l) return ""; const v = items.filter((i) => i.page === l.page && Math.abs(i.y - l.y) < 4 && i.x > l.x + 20 && i.t.trim()).sort((a, b) => a.x - b.x)[0]; return v ? v.t.trim() : ""; };
+  const mon = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+  const dateOf = (t) => { const m = String(t).trim().match(/^(\d{1,2})\s+([A-Za-z]{3})[a-z]*\s+(\d{4})$/); const mi = m ? mon.indexOf(m[2].toLowerCase()) : -1; return m && mi >= 0 ? `${m[3]}-${String(mi + 1).padStart(2, "0")}-${String(m[1]).padStart(2, "0")}` : ""; };
+  // The bottom Total Due row holds GST then balance; the heading Total Due has the amount above it.
+  let gst = 0, inc = 0, incT = "";
+  for (const l of items.filter((i) => i.t.trim().toLowerCase() === "total due").sort((a, b) => a.y - b.y)) {
+    const row = items.filter((i) => i.page === l.page && Math.abs(i.y - l.y) < 4 && i.x > l.x + 20 && /\$/.test(i.t)).sort((a, b) => a.x - b.x).map((i) => i.t.trim());
+    if (row.length >= 2) { gst = money(row[0]); incT = row[row.length - 1]; inc = money(incT); break; }
+  }
+  if (isNeg(incT) || inc < 0 || items.some((i) => /credit note/i.test(i.t))) return { credit: true };
+  const number = side("Invoice No.");
+  const date = dateOf(side("Issued:")), due = dateOf(side("Due Date:"));
+  const ex = Math.round((inc - gst) * 100) / 100;
+  if (!/^\d{4,}$/.test(number) || !date || !(inc > 0) || !(gst >= 0) || !(ex > 0)) return null;
+  return { number, date, due: due || undefined, ex, gst, inc, order: "" };
+}
 // Due on the last business day (Monday to Friday) of the month after the invoice month.
 function billDueDate(iso) {
   const [y, m] = iso.split("-").map(Number);
@@ -3537,7 +3561,7 @@ async function xeroBillFromPdf(env, rule, bytes, fileName, parsed) {
   if (cr.ok) { const cj = await cr.json(); const c = (cj.Contacts || [])[0] || {}; account = String(c.PurchasesDefaultAccountCode || (c.PurchasesDefaultAccount && c.PurchasesDefaultAccount.Code) || ""); }
   if (!account) account = String(rule.account || "");
   const make = async (status) => {
-    const line = { Description: `${rule.name} ${parsed.inclusive ? "statement" : "invoice"} ${parsed.number}${parsed.order ? ` (order ${parsed.order})` : ""}`, Quantity: 1, UnitAmount: parsed.inclusive ? parsed.inc : parsed.ex, TaxType: "INPUT" };
+    const line = { Description: `${rule.name} ${parsed.inclusive ? "statement" : "invoice"} ${parsed.number}${parsed.order ? ` (order ${parsed.order})` : ""}`, Quantity: 1, UnitAmount: parsed.inclusive ? parsed.inc : parsed.ex, TaxType: parsed.gst === 0 ? "EXEMPTEXPENSES" : "INPUT" };
     if (account) line.AccountCode = account;
     const body = { Invoices: [{ Type: "ACCPAY", Contact: { ContactID: contact.contact_id }, InvoiceNumber: parsed.number, Date: parsed.date, DueDate: parsed.due || billDueDate(parsed.date), LineAmountTypes: parsed.inclusive ? "Inclusive" : "Exclusive", Status: status, LineItems: [line] }] };
     return xeroFetch(env, "api.xro/2.0/Invoices?summarizeErrors=false", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
@@ -3588,7 +3612,8 @@ const INVOICE_MAIL_RULES = [
   { name: "Adamsons", from: "messaging-service@post.xero.com", subject: "from adamsons tax", contact: "adamsons", account: "", xeroOnly: true, parse: (b) => adamsonsParse(b) },
   { name: "Superloop", from: "noreply@superloop.com", subject: "your superloop bill", contact: "superloop", account: "", xeroOnly: true, parse: (b) => superloopParse(b) },
   { name: "Soilworx", from: "accounts@soilworx.com.au", subject: "inv", contact: "soilworx", account: "", parse: (b) => soilworxParse(b) },
-  { name: "Estimate One", from: "accounts@estimateone.com", subject: "your e1 invoice", contact: "estimate one", account: "", xeroOnly: true, parse: (b) => estimateOneParse(b) }
+  { name: "Estimate One", from: "accounts@estimateone.com", subject: "your e1 invoice", contact: "estimate one", account: "", xeroOnly: true, parse: (b) => estimateOneParse(b) },
+  { name: "Geelong Commercial", from: "emaildelivery@console.com.au", subject: "invoice for 41 seaside pde", contact: "geelong commercial", account: "", xeroOnly: true, parse: (b) => geelongCommercialParse(b) }
 ];
 const MAILBOXES = [
   { id: "tayler", label: "Tayler", address: "tayler@directflow.com.au", only: ["tayler@directflow.com.au"] },
