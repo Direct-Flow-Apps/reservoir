@@ -5943,6 +5943,213 @@ async function tsXeroPullSchedule(env) {
   if (now.date >= "2026-10-26") await xeroPullOnce(env, "oneoff.contacts_pull_20261026", "One off contacts pull", contactsPullFn);
   if (now.dow >= 1 && now.dow <= 5 && now.mins >= 18 * 60 && now.mins < 19 * 60) await xeroPullOnce(env, `sweep.contacts_pull.${now.date}`, "Weekday contacts pull", contactsPullFn);
 }
+// ---- Accounts mailbox invoice pickup. Supplier emails are moved into the Reservoir folder the moment they arrive (inbox rules this Worker creates), Microsoft pings the Worker for each one, and the Worker sends it to AroFlo and Xero, marks it read and archives it. A problem email, a credit or an email with no PDF goes back to the inbox. The half hourly cron is the backstop for a missed ping. ----
+const INV_FOLDER_NAME = "Reservoir";
+const invHash = (s) => { s = String(s); let h = 5381; for (let i = 0; i < s.length; i++) h = ((h * 33) ^ s.charCodeAt(i)) >>> 0; return h.toString(36); };
+const invRulesSorted = () => [...INVOICE_MAIL_RULES].sort((a, b) => a.name.localeCompare(b.name));
+let invFolderCache = "";
+async function invHistoryTable(env) {
+  await env.DB.prepare("CREATE TABLE IF NOT EXISTS invoice_history (id INTEGER PRIMARY KEY AUTOINCREMENT, msg TEXT, supplier TEXT, number TEXT, status TEXT, detail TEXT, at TEXT DEFAULT (datetime('now')), month TEXT)").run();
+}
+async function invHistoryAdd(env, msg, supplier, number, status, detail) {
+  try {
+    await invHistoryTable(env);
+    if (msg) await env.DB.prepare("DELETE FROM invoice_history WHERE msg = ? AND status = 'error'").bind(msg).run();
+    await env.DB.prepare("INSERT INTO invoice_history (msg, supplier, number, status, detail, month) VALUES (?, ?, ?, ?, ?, strftime('%Y-%m', 'now', '+11 hours'))").bind(msg || "", supplier || "", String(number || "").slice(0, 80), status, String(detail || "").slice(0, 300)).run();
+  } catch (e) { console.log("invoice history failed", String(e && e.message || e)); }
+}
+// Successful invoices are kept for the current month and the one before it, so November goes on 1 January. Errors stay until someone clears them.
+async function invHistoryTidy(env) {
+  await invHistoryTable(env);
+  await env.DB.prepare("DELETE FROM invoice_history WHERE status = 'done' AND month < strftime('%Y-%m', 'now', '+11 hours', 'start of month', '-1 month')").run();
+}
+async function invFolderId(env, addr) {
+  if (invFolderCache) return invFolderCache;
+  const q = `?$filter=${encodeURIComponent(`displayName eq '${INV_FOLDER_NAME}'`)}&$select=id,displayName`;
+  for (const path of ["/mailFolders", "/mailFolders/inbox/childFolders"]) {
+    const r = await mailGraph(env, addr, path + q);
+    const f = r.ok && r.json && r.json.value && r.json.value[0];
+    if (f && f.id) { invFolderCache = f.id; return f.id; }
+  }
+  return "";
+}
+async function invClaim(env, key) {
+  const r = await env.DB.prepare("INSERT INTO app_settings (key, value, detail, by_name, at) VALUES (?, 'claim', '', 'claim', datetime('now')) ON CONFLICT(key) DO UPDATE SET at = datetime('now') WHERE at < datetime('now', '-10 minutes')").bind(key).run();
+  return !!(r.meta && r.meta.changes > 0);
+}
+const invMatchRule = (m) => {
+  const from = String((m.from && m.from.emailAddress && m.from.emailAddress.address) || "").toLowerCase();
+  const subj = String(m.subject || "").toLowerCase();
+  return invRulesSorted().find((r) => (r.from ? from === r.from.toLowerCase() : from.endsWith("@" + String(r.fromDomain || "").toLowerCase())) && subj.includes(r.subject.toLowerCase())) || null;
+};
+// Work out one email. Returns null when there is nothing to do with it, { credit: true } for a credit, otherwise the result shown on the screen.
+async function invProcessHit(env, actor, addr, rule, hit, inFolder) {
+  const to = [env.AROFLO_BILLS_EMAIL, env.XERO_BILLS_EMAIL];
+  const msgUrl = `/users/${encodeURIComponent(addr)}/messages/${encodeURIComponent(hit.id)}`;
+  const patch = (body) => graphFetch(env, msgUrl, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }).catch(() => null);
+  const moveTo = (dest) => graphFetch(env, msgUrl + "/move", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ destinationId: dest }) }).catch(() => null);
+  const msgKey = invHash(hit.internetMessageId || hit.id);
+  const done = async (k) => !!(await env.DB.prepare("SELECT key FROM app_settings WHERE key = ?").bind(k).first());
+  const mark = (k, d) => env.DB.prepare("INSERT OR REPLACE INTO app_settings (key, value, detail, by_name, at) VALUES (?, '1', ?, ?, datetime('now'))").bind(k, String(d).slice(0, 200), actor.name).run();
+  const at = await mailGraph(env, addr, `/messages/${encodeURIComponent(hit.id)}/attachments?$select=id,name,contentType,size,isInline`);
+  if (!at.ok) return { lastErr: mailWhy(at) };
+  const pdfs = ((at.json && at.json.value) || []).filter((x) => !x.isInline && (/pdf/i.test(x.contentType || "") || /\.pdf$/i.test(x.name || "")));
+  if (!pdfs.length) { if (inFolder) await moveTo("inbox"); return null; }
+  const got = [];
+  for (const p of pdfs) {
+    if (Number(p.size || 0) > MAX_EMAIL) { got.push({ p, big: true }); continue; }
+    const res = await graphFetch(env, `/users/${encodeURIComponent(addr)}/messages/${encodeURIComponent(hit.id)}/attachments/${encodeURIComponent(p.id)}/$value`);
+    if (!res.ok) { got.push({ p, bad: true }); continue; }
+    const buf = await res.arrayBuffer();
+    let parsed = null;
+    try { parsed = await rule.parse(buf); } catch (e) { parsed = null; }
+    got.push({ p, buf, parsed });
+  }
+  // A credit goes back to the inbox with the Credit tag, for a person to deal with.
+  if (got.some((g) => g.parsed && g.parsed.credit)) {
+    await patch({ categories: [...new Set([...(hit.categories || []), "Credit"])] });
+    if (inFolder) await moveTo("inbox");
+    return { credit: true };
+  }
+  const failed = [];
+  const items = [];
+  let allOk = true;
+  for (const g of got) {
+    const p = g.p;
+    const fname = String(p.name || "invoice.pdf").slice(0, 150);
+    const it = { file: fname, supplier: rule.name, number: g.parsed ? g.parsed.number : "", aroflo: "", xero: "", xeroNote: "" };
+    items.push(it);
+    if (g.big) { failed.push(`${fname} is over 3.5 MB`); allOk = false; continue; }
+    if (g.bad) { failed.push(`${fname} could not be read`); allOk = false; continue; }
+    const b64 = toB64(g.buf);
+    const key = `invmail.${msgKey}.${invHash(fname + ":" + (p.size || ""))}`;
+    if (rule.xeroOnly) it.aroflo = "not needed";
+    else if (await done(key + ".aroflo")) it.aroflo = "already sent";
+    else { try { await mailAttachment(env, actor, to[0], fname, "application/pdf", b64); await mark(key + ".aroflo", "sent"); it.aroflo = "sent"; } catch (e) { allOk = false; it.aroflo = "failed"; failed.push(`AroFlo: ${String(e.message || "").slice(0, 80)}`); } }
+    if (await done(key + ".xero")) it.xero = "already done";
+    else {
+      let x = { ok: false, note: "the PDF could not be read" };
+      try { if (g.parsed) x = await xeroBillFromPdf(env, rule, g.buf, fname, g.parsed); } catch (e) { x = { ok: false, note: String(e && e.message || e).slice(0, 160) }; }
+      if (x.ok && x.status === "AUTHORISED") { await mark(key + ".xero", "approved"); it.xero = "approved"; it.xeroNote = x.note || ""; }
+      else if (x.ok && x.status === "EXISTS") { await mark(key + ".xero", "exists"); it.xero = "already in Xero"; }
+      else if (x.ok) { await mark(key + ".xero", "draft"); it.xero = "draft"; it.xeroNote = x.note || ""; }
+      else {
+        it.xero = "failed, emailed as a draft";
+        it.xeroNote = x.note || "";
+        try { await mailAttachment(env, actor, to[1], fname, "application/pdf", b64); } catch (e) { it.xero = "failed"; failed.push(`Xero: ${String(e.message || "").slice(0, 80)}`); }
+        allOk = false;
+      }
+    }
+  }
+  let archived = "";
+  if (!allOk) {
+    const tag = await patch({ categories: [...new Set([...(hit.categories || []), "ERROR!"])] });
+    if (inFolder) { const mv = await moveTo("inbox"); archived = mv && mv.ok ? "moved to the inbox and tagged ERROR!" : "left in the Reservoir folder (could not move it)"; }
+    else archived = tag && tag.ok ? "left in the mailbox and tagged ERROR!" : "left in the mailbox (could not tag it ERROR!)";
+    for (const it of items) await invHistoryAdd(env, msgKey + ":" + invHash(it.file), rule.name, it.number || it.file, "error", failed.join(". ") || it.xeroNote);
+    if (!items.length) await invHistoryAdd(env, msgKey, rule.name, "", "error", failed.join(". "));
+  } else {
+    await patch({ isRead: true });
+    const mv = await moveTo("archive");
+    archived = mv && mv.ok ? "archived" : `not archived (Microsoft ${mv ? mv.status : "no answer"})`;
+    for (const it of items) await invHistoryAdd(env, msgKey + ":" + invHash(it.file), rule.name, it.number || it.file, "done", "");
+  }
+  return { ok: true, found: true, subject: String(hit.subject || "").slice(0, 120), received: hit.receivedDateTime || "", items, archived, failed: failed.join(". ") };
+}
+// Emails waiting in the Reservoir folder, matched to a supplier rule, in supplier order (A to Z).
+async function invFolderHits(env, addr, folderId) {
+  const f = "receivedDateTime ge 1900-01-01T00:00:00Z and hasAttachments eq true";
+  const r = await mailGraph(env, addr, `/mailFolders/${folderId}/messages?$top=50&$select=subject,receivedDateTime,categories,from,internetMessageId&$filter=${encodeURIComponent(f)}&$orderby=receivedDateTime desc`);
+  if (!r.ok) return { err: mailWhy(r), hits: [] };
+  const hits = [];
+  for (const m of (r.json && r.json.value) || []) {
+    const rule = invMatchRule(m);
+    if (!rule) continue;
+    const cats = (m.categories || []).map((c) => String(c).toLowerCase());
+    if (cats.includes("error!") || cats.includes("credit")) continue;
+    hits.push({ m, rule });
+  }
+  hits.sort((a, b) => a.rule.name.localeCompare(b.rule.name) || String(a.m.receivedDateTime).localeCompare(String(b.m.receivedDateTime)));
+  return { err: "", hits };
+}
+// The Worker's own run (a Microsoft ping or the half hourly backstop). Does up to max emails from the Reservoir folder.
+async function invMailSweep(env, max) {
+  const to = [env.AROFLO_BILLS_EMAIL, env.XERO_BILLS_EMAIL];
+  if (!to[0] || !to[1]) return;
+  const addr = mailAddress(env, MAILBOXES.find((x) => x.id === "accounts"));
+  await settingsTable(env);
+  await invHistoryTable(env);
+  const folderId = await invFolderId(env, addr);
+  if (!folderId) return;
+  const { hits } = await invFolderHits(env, addr, folderId);
+  let n = 0;
+  for (const { m, rule } of hits) {
+    if (n >= max) break;
+    if (!(await invClaim(env, "invmail.claim." + invHash(m.internetMessageId || m.id)))) continue;
+    n++;
+    try { await invProcessHit(env, { name: "Reservoir" }, addr, rule, m, true); } catch (e) { console.log("invoice pickup failed", String(e && e.message || e)); }
+  }
+}
+async function invSha(s) {
+  const b = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s)));
+  return Array.from(b).map((x) => x.toString(16).padStart(2, "0")).join("");
+}
+const invClientState = async (env) => (await invSha("invnotify:" + String(env.GRAPH_CLIENT_SECRET || ""))).slice(0, 32);
+// The Worker makes and keeps alive its own Microsoft "ping me when mail arrives" registration. Microsoft keeps it for under three days, so it is renewed whenever less than a day is left.
+async function invSubscribe(env) {
+  if (!env.GRAPH_CLIENT_SECRET) return;
+  await settingsTable(env);
+  const addr = mailAddress(env, MAILBOXES.find((x) => x.id === "accounts"));
+  const row = await env.DB.prepare("SELECT value, detail FROM app_settings WHERE key = 'invmail.sub'").first();
+  const left = row && row.detail ? Date.parse(row.detail) - Date.now() : 0;
+  if (row && row.value && left > 24 * 3600 * 1000) return;
+  const folderId = await invFolderId(env, addr);
+  if (!folderId) return;
+  const expires = new Date(Date.now() + 4200 * 60000).toISOString();
+  const save = (id) => env.DB.prepare("INSERT OR REPLACE INTO app_settings (key, value, detail, by_name, at) VALUES ('invmail.sub', ?, ?, 'Reservoir', datetime('now'))").bind(id, expires).run();
+  if (row && row.value) {
+    const r = await graphFetch(env, `/subscriptions/${encodeURIComponent(row.value)}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ expirationDateTime: expires }) });
+    if (r.ok) { await save(row.value); return; }
+  }
+  const r = await graphFetch(env, "/subscriptions", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ changeType: "created", notificationUrl: `${env.API_ORIGIN || "https://reservoir-api.directflow.workers.dev"}/api/invoices/notify`, resource: `users/${addr}/mailFolders/${folderId}/messages`, expirationDateTime: expires, clientState: await invClientState(env) }) });
+  const j = await r.json().catch(() => ({}));
+  if (r.ok && j.id) await save(j.id);
+  else console.log("mail subscription failed", r.status, JSON.stringify(j).slice(0, 300));
+}
+// The server side rules that move supplier mail into the Reservoir folder as it arrives. Needs MailboxSettings.ReadWrite on the Reservoir Directories app. Done again only when the rules or folder change.
+async function invRulesSync(env) {
+  if (!env.GRAPH_CLIENT_SECRET) return;
+  await settingsTable(env);
+  const addr = mailAddress(env, MAILBOXES.find((x) => x.id === "accounts"));
+  const folderId = await invFolderId(env, addr);
+  if (!folderId) return;
+  const sig = invHash(JSON.stringify(INVOICE_MAIL_RULES.map((r) => [r.name, r.from || "", r.fromDomain || "", r.subject])) + folderId);
+  const row = await env.DB.prepare("SELECT detail FROM app_settings WHERE key = 'invmail.rules_sync'").first();
+  if (row && row.detail === sig) return;
+  const base = `/users/${encodeURIComponent(addr)}/mailFolders/inbox/messageRules`;
+  const list = await graphFetch(env, base);
+  if (!list.ok) { console.log("mail rules list failed", list.status); return; }
+  const have = {};
+  for (const x of ((await list.json()).value || [])) have[x.displayName] = x.id;
+  let ok = true;
+  const sorted = invRulesSorted();
+  for (let i = 0; i < sorted.length; i++) {
+    const r = sorted[i];
+    const name = `Reservoir invoices: ${r.name}`;
+    const body = JSON.stringify({ displayName: name, sequence: i + 1, isEnabled: true, conditions: { senderContains: [r.from ? r.from : "@" + r.fromDomain], subjectContains: [r.subject], hasAttachments: true }, actions: { moveToFolder: folderId, stopProcessingRules: true } });
+    const res = have[name]
+      ? await graphFetch(env, `${base}/${have[name]}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body })
+      : await graphFetch(env, base, { method: "POST", headers: { "Content-Type": "application/json" }, body });
+    if (!res.ok) { ok = false; console.log("mail rule failed", name, res.status, (await res.text()).slice(0, 200)); if (res.status === 403) break; }
+  }
+  if (ok) await env.DB.prepare("INSERT OR REPLACE INTO app_settings (key, value, detail, by_name, at) VALUES ('invmail.rules_sync', '1', ?, 'Reservoir', datetime('now'))").bind(sig).run();
+}
+async function invMailCron(env) {
+  await invRulesSync(env);
+  await invSubscribe(env);
+  await invMailSweep(env, 2);
+  await invHistoryTidy(env);
+}
 export default {
   // Runs on a Cloudflare cron trigger if one is added (for example Thursday early morning). It only refreshes leave balances and leave history from Xero into D1.
   async scheduled(event, env, ctx) {
@@ -5956,16 +6163,29 @@ export default {
     ctx.waitUntil(tsXeroPullSchedule(env).catch((e) => console.log("timesheet pull failed", String(e && e.message || e))));
     ctx.waitUntil(pushOneOffAndrey(env).catch((e) => console.log("one off failed", String(e && e.message || e))));
     ctx.waitUntil(mailWatch(env).catch((e) => console.log("mail watch failed", String(e && e.message || e))));
+    ctx.waitUntil(invMailCron(env).catch((e) => console.log("invoice mail cron failed", String(e && e.message || e))));
     ctx.waitUntil(payrollSweep(env).catch((e) => console.log("payroll sweep failed", String(e && e.message || e))));
     ctx.waitUntil(incidentReminders(env).catch((e) => console.log("incident reminders failed", String(e && e.message || e))));
     if (event && (event.cron === "*/30 * * * *" || event.cron === "*/15 * * * *")) return;
     ctx.waitUntil(leaveSync(env).catch((e) => console.log("leave sync failed", String(e && e.message || e))));
   },
-  async fetch(request, rawEnv) {
+  async fetch(request, rawEnv, ctx) {
     let env = rawEnv;
     if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: cors(env) });
     const earlyUrl = new URL(request.url);
     if (earlyUrl.pathname === "/api/ping" && request.method === "GET") return reply(env, 200, { worker: WORKER_BUILD, xeroMe: true, xeroStaff: true });
+    if (earlyUrl.pathname === "/api/invoices/notify" && request.method === "POST") {
+      // Microsoft pings here when mail lands in the Reservoir folder. The first call after the registration is made carries a validation token that must be echoed back.
+      const vt = earlyUrl.searchParams.get("validationToken");
+      if (vt) return new Response(vt, { status: 200, headers: { "Content-Type": "text/plain" } });
+      try {
+        const body = await request.json();
+        const want = await invClientState(env);
+        const real = ((body && body.value) || []).filter((n) => n && n.clientState === want);
+        if (real.length && ctx) ctx.waitUntil(invMailSweep(env, 1).catch((e) => console.log("invoice ping failed", String(e && e.message || e))));
+      } catch (e) { /* a bad ping is ignored */ }
+      return new Response(null, { status: 202 });
+    }
     if (earlyUrl.pathname === "/api/xero/callback" && request.method === "GET") {
       // Xero sends the browser back here after consent. No Microsoft token on a redirect, so the signed state proves who started it.
       const back = (flag) => Response.redirect(`${env.ALLOWED_ORIGIN}/?xero=${flag}`, 302);
@@ -7677,7 +7897,7 @@ export default {
     }
 
     if (url.pathname === "/api/invoices/mailbox" && request.method === "POST") {
-      // Pick the latest matching supplier email in the Accounts mailbox and send its PDF to AroFlo and Xero.
+      // Do the next waiting supplier email in the Accounts mailbox: first the Reservoir folder, then the inbox (A to Z by supplier). One email per press.
       if (user.tier !== "T1") return reply(env, 403, { error: "forbidden" });
       if (user.viewAs) return reply(env, 403, { error: "Viewing as someone else is read only." });
       const to = [env.AROFLO_BILLS_EMAIL, env.XERO_BILLS_EMAIL];
@@ -7686,19 +7906,26 @@ export default {
         const box = MAILBOXES.find((x) => x.id === "accounts");
         const addr = mailAddress(env, box);
         await settingsTable(env);
-        // One time reset of the markers from the first tests, so that invoice goes to AroFlo and Xero again.
-        if (!(await env.DB.prepare("SELECT key FROM app_settings WHERE key = 'oneoff.invmail_reset_20261111c'").first())) {
-          await env.DB.prepare("DELETE FROM app_settings WHERE key LIKE 'invmail.%'").run();
-          await env.DB.prepare("INSERT OR REPLACE INTO app_settings (key, value, detail, by_name, at) VALUES ('oneoff.invmail_reset_20261111c', '1', 'reset', 'One off', datetime('now'))").run();
-        }
-        const done = async (k) => !!(await env.DB.prepare("SELECT key FROM app_settings WHERE key = ?").bind(k).first());
-        const mark = (k, d) => env.DB.prepare("INSERT OR REPLACE INTO app_settings (key, value, detail, by_name, at) VALUES (?, '1', ?, ?, datetime('now'))").bind(k, String(d).slice(0, 200), user.name).run();
+        await invHistoryTable(env);
         let credits = 0;
         let lastErr = "";
-        for (const rule of INVOICE_MAIL_RULES) {
+        const folderId = await invFolderId(env, addr);
+        if (folderId) {
+          const fh = await invFolderHits(env, addr, folderId);
+          if (fh.err) lastErr = fh.err;
+          for (const { m, rule } of fh.hits) {
+            if (!(await invClaim(env, "invmail.claim." + invHash(m.internetMessageId || m.id)))) continue;
+            const r = await invProcessHit(env, user, addr, rule, m, true);
+            if (!r) continue;
+            if (r.lastErr) { lastErr = r.lastErr; continue; }
+            if (r.credit) { credits++; continue; }
+            return reply(env, 200, { ...r, credits });
+          }
+        }
+        for (const rule of invRulesSorted()) {
           // A rule matches one exact sender address, or any address on a sender domain (Samios branches each have their own).
           const f = `receivedDateTime ge 1900-01-01T00:00:00Z and hasAttachments eq true${rule.from ? ` and from/emailAddress/address eq '${rule.from}'` : ""}`;
-          const r = await mailGraph(env, addr, `/mailFolders/inbox/messages?$top=${rule.fromDomain ? 50 : 25}&$select=subject,receivedDateTime,categories,from&$filter=${encodeURIComponent(f)}&$orderby=receivedDateTime desc`);
+          const r = await mailGraph(env, addr, `/mailFolders/inbox/messages?$top=${rule.fromDomain ? 50 : 25}&$select=subject,receivedDateTime,categories,from,internetMessageId&$filter=${encodeURIComponent(f)}&$orderby=receivedDateTime desc`);
           if (!r.ok) { lastErr = mailWhy(r); continue; }
           const dom = rule.fromDomain ? "@" + rule.fromDomain.toLowerCase() : "";
           const hits = ((r.json && r.json.value) || []).filter((m) => (!dom || String((m.from && m.from.emailAddress && m.from.emailAddress.address) || "").toLowerCase().endsWith(dom)) && String(m.subject || "").toLowerCase().includes(rule.subject.toLowerCase())).slice(0, 10);
@@ -7706,66 +7933,11 @@ export default {
             if ((hit.categories || []).some((c) => String(c).toLowerCase() === "credit")) { credits++; continue; }
             // An email Reservoir tagged ERROR! waits until the tag is removed in Outlook.
             if ((hit.categories || []).some((c) => String(c).toLowerCase() === "error!")) continue;
-            const at = await mailGraph(env, addr, `/messages/${encodeURIComponent(hit.id)}/attachments?$select=id,name,contentType,size,isInline`);
-            if (!at.ok) { lastErr = mailWhy(at); continue; }
-            const pdfs = ((at.json && at.json.value) || []).filter((x) => !x.isInline && (/pdf/i.test(x.contentType || "") || /\.pdf$/i.test(x.name || "")));
-            if (!pdfs.length) continue;
-            const got = [];
-            for (const p of pdfs) {
-              if (Number(p.size || 0) > MAX_EMAIL) { got.push({ p, big: true }); continue; }
-              const res = await graphFetch(env, `/users/${encodeURIComponent(addr)}/messages/${encodeURIComponent(hit.id)}/attachments/${encodeURIComponent(p.id)}/$value`);
-              if (!res.ok) { got.push({ p, bad: true }); continue; }
-              const buf = await res.arrayBuffer();
-              let parsed = null;
-              try { parsed = await rule.parse(buf); } catch (e) { parsed = null; }
-              got.push({ p, buf, parsed });
-            }
-            // A credit stays in the mailbox untouched.
-            if (got.some((g) => g.parsed && g.parsed.credit)) {
-              credits++;
-              await graphFetch(env, `/users/${encodeURIComponent(addr)}/messages/${encodeURIComponent(hit.id)}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ categories: [...new Set([...(hit.categories || []), "Credit"])] }) }).catch(() => null);
-              continue;
-            }
-            const failed = [];
-            const items = [];
-            let allOk = true;
-            for (const g of got) {
-              const p = g.p;
-              const fname = String(p.name || "invoice.pdf").slice(0, 150);
-              const it = { file: fname, supplier: rule.name, number: g.parsed ? g.parsed.number : "", aroflo: "", xero: "", xeroNote: "" };
-              items.push(it);
-              if (g.big) { failed.push(`${fname} is over 3.5 MB`); allOk = false; continue; }
-              if (g.bad) { failed.push(`${fname} could not be read`); allOk = false; continue; }
-              const b64 = toB64(g.buf);
-              const key = `invmail.${hit.id.slice(-40)}.${p.id.slice(-20)}`;
-              if (rule.xeroOnly) it.aroflo = "not needed";
-              else if (await done(key + ".aroflo")) it.aroflo = "already sent";
-              else { try { await mailAttachment(env, user, to[0], fname, "application/pdf", b64); await mark(key + ".aroflo", "sent"); it.aroflo = "sent"; } catch (e) { allOk = false; it.aroflo = "failed"; failed.push(`AroFlo: ${String(e.message || "").slice(0, 80)}`); } }
-              if (await done(key + ".xero")) it.xero = "already done";
-              else {
-                let x = { ok: false, note: "the PDF could not be read" };
-                try { if (g.parsed) x = await xeroBillFromPdf(env, rule, g.buf, fname, g.parsed); } catch (e) { x = { ok: false, note: String(e && e.message || e).slice(0, 160) }; }
-                if (x.ok && x.status === "AUTHORISED") { await mark(key + ".xero", "approved"); it.xero = "approved"; it.xeroNote = x.note || ""; }
-                else if (x.ok && x.status === "EXISTS") { await mark(key + ".xero", "exists"); it.xero = "already in Xero"; }
-                else if (x.ok) { await mark(key + ".xero", "draft"); it.xero = "draft"; it.xeroNote = x.note || ""; }
-                else {
-                  it.xero = "failed, emailed as a draft";
-                  it.xeroNote = x.note || "";
-                  try { await mailAttachment(env, user, to[1], fname, "application/pdf", b64); } catch (e) { it.xero = "failed"; failed.push(`Xero: ${String(e.message || "").slice(0, 80)}`); }
-                  allOk = false;
-                }
-              }
-            }
-            let archived = "";
-            if (!allOk) {
-              const tag = await graphFetch(env, `/users/${encodeURIComponent(addr)}/messages/${encodeURIComponent(hit.id)}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ categories: [...new Set([...(hit.categories || []), "ERROR!"])] }) }).catch(() => null);
-              archived = tag && tag.ok ? "left in the mailbox and tagged ERROR!" : "left in the mailbox (could not tag it ERROR!)";
-            }
-            if (allOk) {
-              const mv = await graphFetch(env, `/users/${encodeURIComponent(addr)}/messages/${encodeURIComponent(hit.id)}/move`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ destinationId: "archive" }) });
-              archived = mv.ok ? "archived" : `not archived (Microsoft ${mv.status})`;
-            }
-            return reply(env, 200, { ok: true, found: true, subject: String(hit.subject || "").slice(0, 120), received: hit.receivedDateTime || "", items, archived, credits, failed: failed.join(". ") });
+            const res = await invProcessHit(env, user, addr, rule, hit, false);
+            if (!res) continue;
+            if (res.lastErr) { lastErr = res.lastErr; continue; }
+            if (res.credit) { credits++; continue; }
+            return reply(env, 200, { ...res, credits });
           }
         }
         if (lastErr) return reply(env, 200, { ok: false, error: lastErr });
@@ -7773,6 +7945,23 @@ export default {
       } catch (e) {
         return reply(env, 502, { error: "mailbox failed", detail: String(e.message || "").slice(0, 200) });
       }
+    }
+
+    if (url.pathname === "/api/invoices/history" && request.method === "GET") {
+      // What the mailbox pickup has done. Successes for this month and last, errors until they are cleared.
+      if (user.tier !== "T1") return reply(env, 403, { error: "forbidden" });
+      await invHistoryTidy(env);
+      const rows = ((await env.DB.prepare("SELECT id, supplier, number, status, detail, at FROM invoice_history ORDER BY id DESC LIMIT 300").all()).results) || [];
+      const out = (r) => ({ id: r.id, supplier: r.supplier, number: r.number, detail: r.detail || "", at: r.at });
+      return reply(env, 200, { done: rows.filter((r) => r.status === "done").map(out), errors: rows.filter((r) => r.status === "error").map(out) });
+    }
+    const ih = url.pathname.match(/^\/api\/invoices\/history\/(\d{1,12})$/);
+    if (ih && request.method === "DELETE") {
+      if (user.tier !== "T1") return reply(env, 403, { error: "forbidden" });
+      if (user.viewAs) return reply(env, 403, { error: "Viewing as someone else is read only." });
+      await invHistoryTable(env);
+      await env.DB.prepare("DELETE FROM invoice_history WHERE id = ?").bind(Number(ih[1])).run();
+      return reply(env, 200, { ok: true });
     }
 
     const inv = url.pathname.match(/^\/api\/invoices\/(xero|aroflo)$/);
