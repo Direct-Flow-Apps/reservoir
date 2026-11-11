@@ -3323,7 +3323,10 @@ async function momentumParse(bytes) {
   const mi = dm ? ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"].indexOf(dm[2].toLowerCase()) : -1;
   const ex = Math.round((inc - gst) * 100) / 100;
   if (!/^\d{5,}$/.test(number) || !dm || mi < 0 || !(inc > 0) || !(gst >= 0) || !(ex > 0)) return null;
-  return { number, date: `${dm[3]}-${String(mi + 1).padStart(2, "0")}-${String(dm[1]).padStart(2, "0")}`, ex, gst, inc, order: "" };
+  // The bill states its own due date ("due on 2 December 2026").
+  let due;
+  for (const it of items) { const m = it.t.match(/due on\s+(\d{1,2})\s+([A-Za-z]{3})[a-z]*\s+(\d{4})/i); const k = m ? ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"].indexOf(m[2].toLowerCase()) : -1; if (m && k >= 0) { due = `${m[3]}-${String(k + 1).padStart(2, "0")}-${String(m[1]).padStart(2, "0")}`; break; } }
+  return { number, date: `${dm[3]}-${String(mi + 1).padStart(2, "0")}-${String(dm[1]).padStart(2, "0")}`, due, ex, gst, inc, order: "" };
 }
 async function wexParse(bytes) {
   const items = await pdfTextRuns(bytes);
