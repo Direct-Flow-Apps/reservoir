@@ -3073,18 +3073,34 @@ async function pdfTextRuns(bytes) {
     if (end < 0) break;
     re.lastIndex = end + 9;
     let text = "";
-    let cut = end;
-    while (cut > start && (raw[cut - 1] === 10 || raw[cut - 1] === 13)) cut--;
-    for (const stop of [cut, end]) {
-      try {
-        const ds = new DecompressionStream("deflate");
-        const out = new Response(new Blob([raw.slice(start, stop)]).stream().pipeThrough(ds));
-        text = new TextDecoder("latin1").decode(await out.arrayBuffer());
-        break;
-      } catch (e) { text = ""; }
+    const dict = bin.slice(Math.max(0, m.index - 400), m.index);
+    const dd = dict.slice(Math.max(dict.lastIndexOf("obj"), 0));
+    const filtered = /\/Filter/.test(dd);
+    let data = raw.slice(start, end);
+    if (/ASCII85Decode/.test(dd)) {
+      // ASCII85 wrapped streams (EngageOne, Bunnings): decode to bytes first, then inflate.
+      const body = new TextDecoder("latin1").decode(data).replace(/\s+/g, "").replace(/~>[\s\S]*$/, "").replace(/^<~/, "");
+      const bytesOut = [];
+      let grp = [];
+      for (const ch of body) {
+        if (ch === "z" && !grp.length) { bytesOut.push(0, 0, 0, 0); continue; }
+        grp.push(ch.charCodeAt(0) - 33);
+        if (grp.length === 5) { let v = 0; for (const g of grp) v = v * 85 + g; bytesOut.push((v >>> 24) & 255, (v >>> 16) & 255, (v >>> 8) & 255, v & 255); grp = []; }
+      }
+      if (grp.length > 1) { const n = grp.length; while (grp.length < 5) grp.push(84); let v = 0; for (const g of grp) v = v * 85 + g; const four = [(v >>> 24) & 255, (v >>> 16) & 255, (v >>> 8) & 255, v & 255]; bytesOut.push(...four.slice(0, n - 1)); }
+      data = new Uint8Array(bytesOut);
     }
-    // Older PDFs (WEX) keep the page content uncompressed.
-    if (!text) { const plain = bin.slice(start, end); if (/\bBT\b/.test(plain) && /\bTj\b|\bTJ\b/.test(plain)) text = plain; }
+    if (filtered) {
+      for (const trim of [true, false]) {
+        let stop = data.length;
+        if (trim) while (stop > 0 && (data[stop - 1] === 10 || data[stop - 1] === 13)) stop--;
+        try { text = new TextDecoder("latin1").decode(await new Response(new Blob([data.slice(0, stop)]).stream().pipeThrough(new DecompressionStream("deflate"))).arrayBuffer()); break; } catch (e) { text = ""; }
+      }
+    } else {
+      // Older PDFs (WEX) keep the page content uncompressed.
+      const plain = bin.slice(start, end);
+      if (/\bBT\b/.test(plain) && /\bTj\b|\bTJ\b/.test(plain)) text = plain;
+    }
     if (!text || !/\bTj\b|\bTJ\b/.test(text)) continue;
     page++;
     const unesc = (s) => s.replace(/\\([0-7]{1,3}|.)/g, (_, c) => (/^[0-7]+$/.test(c) ? String.fromCharCode(parseInt(c, 8)) : c === "n" ? "\n" : c === "r" ? "\r" : c === "t" ? "\t" : c));
@@ -3311,6 +3327,26 @@ async function plumbhausParse(bytes) {
   if (!/^INV-\d+$/i.test(number) || !date || !due || !(ex > 0) || !(inc > 0) || Math.abs(ex + gst - inc) > 0.02) return null;
   return { number, date, due, ex, gst, inc, order: "" };
 }
+async function bunningsParse(bytes) {
+  const items = await pdfTextRuns(bytes);
+  if (!items.length) return null;
+  const isNeg = (t) => /^\(.*\)$|^-|-$|CR$/i.test(String(t).trim());
+  const money = (t) => { const n = Number(String(t).replace(/[^0-9.]/g, "")); return isNeg(t) ? -n : n; };
+  const label = (name) => { const ls = items.filter((i) => i.t.trim().toLowerCase() === name.toLowerCase()); return ls[0]; };
+  const side = (name) => { const l = label(name); if (!l) return ""; const v = items.filter((i) => i.page === l.page && Math.abs(i.y - l.y) < 4 && i.x > l.x + 20 && /\d/.test(i.t)).sort((a, b) => a.x - b.x)[0]; return v ? v.t.trim() : ""; };
+  const accT = side("ACCOUNT TOTAL");
+  const inc = money(accT);
+  if (isNeg(accT) || inc < 0) return { credit: true };
+  const dm = side("DATE OF ISSUE:").match(/^(\d{1,2})\s+([A-Za-z]{3})[a-z]*\s+(\d{4})$/);
+  const mi = dm ? ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"].indexOf(dm[2].toLowerCase()) : -1;
+  const acct = side("ACCOUNT NUMBER:");
+  if (!dm || mi < 0 || !/^\d{6,}$/.test(acct) || !(inc > 0)) return null;
+  const date = `${dm[3]}-${String(mi + 1).padStart(2, "0")}-${String(dm[1]).padStart(2, "0")}`;
+  // The statement shows no GST split, so the account total is booked GST inclusive. Due 14 days after issue.
+  const d = new Date(`${date}T00:00:00Z`); d.setUTCDate(d.getUTCDate() + 14);
+  const gst = Math.round((inc / 11) * 100) / 100;
+  return { number: `${acct}-${String(dm[1]).padStart(2, "0")}${String(mi + 1).padStart(2, "0")}${dm[3].slice(2)}`, date, due: d.toISOString().slice(0, 10), ex: Math.round((inc - gst) * 100) / 100, gst, inc, inclusive: true, order: "" };
+}
 // Due on the last business day (Monday to Friday) of the month after the invoice month.
 function billDueDate(iso) {
   const [y, m] = iso.split("-").map(Number);
@@ -3330,9 +3366,9 @@ async function xeroBillFromPdf(env, rule, bytes, fileName, parsed) {
   if (cr.ok) { const cj = await cr.json(); const c = (cj.Contacts || [])[0] || {}; account = String(c.PurchasesDefaultAccountCode || (c.PurchasesDefaultAccount && c.PurchasesDefaultAccount.Code) || ""); }
   if (!account) account = String(rule.account || "");
   const make = async (status) => {
-    const line = { Description: `${rule.name} invoice ${parsed.number}${parsed.order ? ` (order ${parsed.order})` : ""}`, Quantity: 1, UnitAmount: parsed.ex, TaxType: "INPUT" };
+    const line = { Description: `${rule.name} ${parsed.inclusive ? "statement" : "invoice"} ${parsed.number}${parsed.order ? ` (order ${parsed.order})` : ""}`, Quantity: 1, UnitAmount: parsed.inclusive ? parsed.inc : parsed.ex, TaxType: "INPUT" };
     if (account) line.AccountCode = account;
-    const body = { Invoices: [{ Type: "ACCPAY", Contact: { ContactID: contact.contact_id }, InvoiceNumber: parsed.number, Date: parsed.date, DueDate: parsed.due || billDueDate(parsed.date), LineAmountTypes: "Exclusive", Status: status, LineItems: [line] }] };
+    const body = { Invoices: [{ Type: "ACCPAY", Contact: { ContactID: contact.contact_id }, InvoiceNumber: parsed.number, Date: parsed.date, DueDate: parsed.due || billDueDate(parsed.date), LineAmountTypes: parsed.inclusive ? "Inclusive" : "Exclusive", Status: status, LineItems: [line] }] };
     return xeroFetch(env, "api.xro/2.0/Invoices?summarizeErrors=false", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
   };
   const created = async (status) => {
@@ -3374,7 +3410,8 @@ const INVOICE_MAIL_RULES = [
   { name: "Momentum", from: "hello@mail.momentum.com.au", subject: "your electricity bill", contact: "momentum", account: "", xeroOnly: true, parse: (b) => momentumParse(b) },
   { name: "WEX Motorpass", from: "enquiries@motorpass.com.au", subject: "wex motorpass statement", contact: "wex", account: "", xeroOnly: true, parse: (b) => wexParse(b) },
   { name: "Daisys", from: "notifications@daisysgarden.com.au", subject: "daisys garden supplies pty ltd invoice", contact: "daisy", account: "", parse: (b) => daisysParse(b) },
-  { name: "Plumbhaus", from: "messaging-service@post.xero.com", subject: "from plumbhaus co pty ltd", contact: "plumbhaus", account: "", parse: (b) => plumbhausParse(b) }
+  { name: "Plumbhaus", from: "messaging-service@post.xero.com", subject: "from plumbhaus co pty ltd", contact: "plumbhaus", account: "", parse: (b) => plumbhausParse(b) },
+  { name: "Bunnings", from: "creditedelivery@edelivery.bunnings.com.au", subject: "your bunnings statement", contact: "bunnings", account: "", xeroOnly: true, parse: (b) => bunningsParse(b) }
 ];
 const MAILBOXES = [
   { id: "tayler", label: "Tayler", address: "tayler@directflow.com.au", only: ["tayler@directflow.com.au"] },
