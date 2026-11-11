@@ -3094,7 +3094,7 @@ async function pdfTextRuns(bytes) {
       let x = 0, y = 0, lead = 0;
       const nums = [];
       const tok = /\[((?:\((?:\\.|[^\\)])*\)|[^\]])*)\]|\(((?:\\.|[^\\)])*)\)|<([0-9A-Fa-f\s]+)>|\/([A-Za-z0-9_.+-]+)|(-?[\d.]+)|([A-Za-z*'"]+)/g;
-      let t, last = null, font = "";
+      let t, last = null, font = "", fsize = 0;
       const emit = async (str, hex) => {
         if (hex) {
           // Hex strings are glyph numbers, two bytes each, turned into text by the font's ToUnicode map.
@@ -3112,7 +3112,7 @@ async function pdfTextRuns(bytes) {
         if (hex && last && last.page === page && Math.abs(last.y - y) < 0.5 && x >= last.lastX && x - last.lastX < 25) { last.t += str; last.lastX = x; return; }
         if (!str.trim()) return;
         if (last && last.x === x && last.y === y && last.page === page) last.t += str;
-        else { last = { x, y, t: str, page, lastX: x }; items.push(last); }
+        else { last = { x, y, t: str, page, lastX: x, size: fsize }; items.push(last); }
       };
       while ((t = tok.exec(b[1]))) {
         if (t[5] !== undefined) { nums.push(Number(t[5])); continue; }
@@ -3123,7 +3123,7 @@ async function pdfTextRuns(bytes) {
           continue;
         }
         const op = t[6];
-        if (op === "Tf") { const n = nums.find((q) => q && q.name !== undefined); if (n) font = n.name; }
+        if (op === "Tf") { const n = nums.find((q) => q && q.name !== undefined); if (n) font = n.name; const sz = nums.find((q) => typeof q === "number"); if (sz) fsize = sz; }
         else if (op === "Tm" && nums.length >= 6) { x = nums[nums.length - 2]; y = nums[nums.length - 1]; }
         else if ((op === "Td" || op === "TD") && nums.length >= 2) { x += nums[nums.length - 2]; y += nums[nums.length - 1]; if (op === "TD") lead = -nums[nums.length - 1]; }
         else if (op === "TL" && nums.length) lead = nums[nums.length - 1];
@@ -3281,6 +3281,36 @@ async function daisysParse(bytes) {
   const yr = dt[3].length === 2 ? 2000 + Number(dt[3]) : Number(dt[3]);
   return { number, date: `${yr}-${String(dt[2]).padStart(2, "0")}-${String(dt[1]).padStart(2, "0")}`, ex, gst, inc, order: belowText("PO#:") };
 }
+// Some generators (pdf-lib) split one line of text into several runs. Joins runs on the same line that sit right next to each other.
+function joinRuns(items) {
+  const out = [];
+  const sorted = [...items].sort((a, b) => a.page - b.page || a.y - b.y || a.x - b.x);
+  for (const it of sorted) {
+    const p = out[out.length - 1];
+    const sz = (p && p.size) || it.size || 12;
+    if (p && p.page === it.page && Math.abs(p.y - it.y) < 1.5 && it.x - (p.x + p.t.length * sz * 0.6) < sz * 1.2 && it.x >= p.x) out[out.length - 1] = { ...p, t: p.t + it.t, size: p.size };
+    else out.push({ ...it });
+  }
+  return out;
+}
+async function plumbhausParse(bytes) {
+  const items = joinRuns(await pdfTextRuns(bytes));
+  if (!items.length) return null;
+  const isNeg = (t) => /^\(.*\)$|^-|-$|CR$/i.test(String(t).trim());
+  const money = (t) => { const n = Number(String(t).replace(/[^0-9.]/g, "")); return isNeg(t) ? -n : n; };
+  const label = (name) => { const ls = items.filter((i) => i.t.trim().toLowerCase() === name.toLowerCase()); return ls[ls.length - 1]; };
+  const side = (name) => { const l = label(name); if (!l) return ""; const v = items.filter((i) => i.page === l.page && Math.abs(i.y - l.y) < 4 && i.x > l.x + 20 && /\d/.test(i.t)).sort((a, b) => b.x - a.x)[0]; return v ? v.t.trim() : ""; };
+  const belowText = (name) => { const l = label(name); if (!l) return ""; const v = items.filter((i) => i.page === l.page && Math.abs(i.x - l.x) < 3 && Math.abs(i.y - l.y) > 5 && Math.abs(i.y - l.y) < 40).sort((a, b) => Math.abs(a.y - l.y) - Math.abs(b.y - l.y))[0]; return v ? v.t.trim() : ""; };
+  const mon = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+  const dateOf = (t) => { const m = String(t).trim().match(/^(\d{1,2})\s+([A-Za-z]{3})[A-Za-z]*\s+(\d{4})$/); const mi = m ? mon.indexOf(m[2].toLowerCase()) : -1; return m && mi >= 0 ? `${m[3]}-${String(mi + 1).padStart(2, "0")}-${String(m[1]).padStart(2, "0")}` : ""; };
+  const exT = side("Subtotal"), gstT = side("Total GST 10%"), incT = side("Total");
+  const ex = money(exT), gst = money(gstT), inc = money(incT);
+  if (isNeg(incT) || inc < 0 || items.some((i) => /credit note/i.test(i.t))) return { credit: true };
+  const number = belowText("Invoice number");
+  const date = dateOf(belowText("Issue date")), due = dateOf(belowText("Due date"));
+  if (!/^INV-\d+$/i.test(number) || !date || !due || !(ex > 0) || !(inc > 0) || Math.abs(ex + gst - inc) > 0.02) return null;
+  return { number, date, due, ex, gst, inc, order: "" };
+}
 // Due on the last business day (Monday to Friday) of the month after the invoice month.
 function billDueDate(iso) {
   const [y, m] = iso.split("-").map(Number);
@@ -3343,7 +3373,8 @@ const INVOICE_MAIL_RULES = [
   { name: "Tradelink", from: "donotreply@tradelink.com.au", subject: "tax invoice", contact: "tradelink", account: "", parse: (b) => tradelinkParse(b) },
   { name: "Momentum", from: "hello@mail.momentum.com.au", subject: "your electricity bill", contact: "momentum", account: "", xeroOnly: true, parse: (b) => momentumParse(b) },
   { name: "WEX Motorpass", from: "enquiries@motorpass.com.au", subject: "wex motorpass statement", contact: "wex", account: "", xeroOnly: true, parse: (b) => wexParse(b) },
-  { name: "Daisys", from: "notifications@daisysgarden.com.au", subject: "daisys garden supplies pty ltd invoice", contact: "daisy", account: "", parse: (b) => daisysParse(b) }
+  { name: "Daisys", from: "notifications@daisysgarden.com.au", subject: "daisys garden supplies pty ltd invoice", contact: "daisy", account: "", parse: (b) => daisysParse(b) },
+  { name: "Plumbhaus", from: "messaging-service@post.xero.com", subject: "from plumbhaus co pty ltd", contact: "plumbhaus", account: "", parse: (b) => plumbhausParse(b) }
 ];
 const MAILBOXES = [
   { id: "tayler", label: "Tayler", address: "tayler@directflow.com.au", only: ["tayler@directflow.com.au"] },
