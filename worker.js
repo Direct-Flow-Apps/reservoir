@@ -4243,7 +4243,7 @@ async function mailDraftsSweep(env) {
       const who = author ? [author] : Object.keys(tiers).filter((e) => mailAllowed(b, { email: e, tier: tiers[e] }));
       for (const e of who) warn.set(e, (warn.get(e) || 0) + 1);
     }
-    for (const [e, n] of warn) await notify(env, { to: e, kind: "mail", title: `Old drafts, ${b.label}`, body: `There ${n === 1 ? "is a draft" : "are drafts"} in the ${b.label} mailbox you started that ${n === 1 ? "is" : "are"} more than 14 days old. ${n === 1 ? "It is" : "They are"} about to be deleted. Please go in and clear ${n === 1 ? "it" : "them"}.`, link: "emailbox", by: "Reservoir" });
+    for (const [e, n] of warn) await notify(env, { to: e, kind: "mail", title: `Old drafts, ${b.label}`, body: `There ${n === 1 ? "is a draft" : "are drafts"} in the ${b.label} mailbox you started that ${n === 1 ? "is" : "are"} more than 14 days old. ${n === 1 ? "It is" : "They are"} about to be deleted. Please go in and clear ${n === 1 ? "it" : "them"}.`, link: `emailbox:${b.id}:drafts`, by: "Reservoir" });
   }
 }
 async function arofloRoutes(request, env, user, url) {
