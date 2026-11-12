@@ -4069,6 +4069,34 @@ async function mailRoutes(request, env, user, url) {
         const gone = await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}/move`, "POST", { destinationId: "archive" });
         return reply(env, 200, { ok: true, label: tb.label, archived: gone.ok, worker: WORKER_BUILD });
       }
+      if (act === "newfolder") {
+        const name = String(body.name || "").replace(/\s+/g, " ").trim().slice(0, 100);
+        if (!name) return reply(env, 200, { ok: false, error: "Give the folder a name.", worker: WORKER_BUILD });
+        const parent = body.parent ? mailFolderId(body.parent) : "";
+        const nf = await mailDo(env, addr, parent ? `/mailFolders/${encodeURIComponent(parent)}/childFolders` : "/mailFolders", "POST", { displayName: name });
+        if (!nf.ok) return reply(env, 200, { ok: false, error: nf.status === 409 ? "A folder with that name is already there." : mailWhy(nf, true), worker: WORKER_BUILD });
+        return reply(env, 200, { ok: true, folder: { id: String((nf.json && nf.json.id) || ""), name: String((nf.json && nf.json.displayName) || name) }, worker: WORKER_BUILD });
+      }
+      if (act === "markall") {
+        const fid = mailFolderId(body.folder), want = !!body.read;
+        let next = `/mailFolders/${encodeURIComponent(fid)}/messages?$top=100&$select=id&$filter=${encodeURIComponent("isRead eq " + (want ? "false" : "true"))}`;
+        const ids = [];
+        for (let pg = 0; pg < 5 && next; pg++) {
+          const lr = await mailGraph(env, addr, next);
+          if (!lr.ok) return reply(env, 200, { ok: false, error: mailWhy(lr), worker: WORKER_BUILD });
+          ((lr.json && lr.json.value) || []).forEach((m) => { if (m.id) ids.push(m.id); });
+          next = lr.json && lr.json["@odata.nextLink"] ? lr.json["@odata.nextLink"] : "";
+        }
+        let changed = 0, failed = 0;
+        for (let i = 0; i < ids.length; i += 20) {
+          const chunk = ids.slice(i, i + 20);
+          const br = await graphFetch(env, "/$batch", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ requests: chunk.map((id, k) => ({ id: String(k), method: "PATCH", url: `/users/${encodeURIComponent(addr)}/messages/${encodeURIComponent(id)}`, headers: { "Content-Type": "application/json" }, body: { isRead: want } })) }) });
+          if (!br.ok) { failed += chunk.length; continue; }
+          let bj = null; try { bj = await br.json(); } catch (e) { bj = null; }
+          ((bj && bj.responses) || []).forEach((r) => { if (r.status >= 200 && r.status < 300) changed++; else failed++; });
+        }
+        return reply(env, 200, { ok: failed === 0, changed, failed, error: failed ? `${failed} of ${ids.length} emails could not be changed.` : "", worker: WORKER_BUILD });
+      }
       if (act === "restore" && msg) return done(await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}/move`, "POST", { destinationId: "inbox" }));
       if (act === "flag" && msg) return done(await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}`, "PATCH", { flag: body.status === "complete" ? { flagStatus: "complete", completedDateTime: { dateTime: new Date().toISOString().slice(0, 19), timeZone: "UTC" } } : { flagStatus: body.status === "flagged" ? "flagged" : "notFlagged" } }));
       if (act === "categories" && msg) return done(await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}`, "PATCH", { categories: (Array.isArray(body.categories) ? body.categories : []).map((c) => String(c).slice(0, 40)).slice(0, 12) }));
