@@ -3935,6 +3935,8 @@ function mailRecipients(v) {
 async function mailRoutes(request, env, user, url) {
   if (!url.pathname.startsWith("/api/mail")) return null;
   const mine = MAILBOXES.filter((b) => mailAllowed(b, user));
+  const ownEmail = String(user.email || "").toLowerCase();
+  if (/@directflow\.com\.au$/.test(ownEmail) && !mine.some((b) => b.only)) mine.push({ id: "me", label: "My Email", address: ownEmail, only: [ownEmail] });
   const post = request.method === "POST";
   if (request.method !== "GET" && !post) return reply(env, 404, { error: "not found" });
   if (post && user.viewAs) return reply(env, 403, { error: "Viewing as someone else is read only." });
