@@ -4053,6 +4053,20 @@ async function mailRoutes(request, env, user, url) {
       }));
       const seen = new Set(), out = [];
       for (const c of found.flat()) { const k = (c.emails[0] || c.name).toLowerCase(); if (seen.has(k) || !c.emails.length) continue; seen.add(k); out.push(c); }
+      // Addresses already used in sent mail are remembered too, even when nobody saved them as a contact.
+      if (out.length < 8) {
+        const ql = q.toLowerCase();
+        const sent = await Promise.all(mine.map(async (bx) => {
+          const r = await mailGraph(env, mailAddress(env, bx), "/mailFolders/sentitems/messages?$top=100&$select=toRecipients,ccRecipients");
+          return (r.ok && r.json && r.json.value) || [];
+        }));
+        for (const m of sent.flat()) for (const x of [...(m.toRecipients || []), ...(m.ccRecipients || [])]) {
+          const ea = x && x.emailAddress; const addr = String((ea && ea.address) || "").trim(); const nm = String((ea && ea.name) || "").trim();
+          if (!addr || seen.has(addr.toLowerCase())) continue;
+          if (!(addr.toLowerCase().includes(ql) || nm.toLowerCase().startsWith(ql))) continue;
+          seen.add(addr.toLowerCase()); out.push({ id: "sent:" + addr.toLowerCase(), box: mine[0] ? mine[0].id : "", name: (nm && nm.toLowerCase() !== addr.toLowerCase() ? nm : "").slice(0, 80), company: "", emails: [addr.slice(0, 120)] });
+        }
+      }
       return reply(env, 200, { ok: true, contacts: out.slice(0, 8), worker: WORKER_BUILD });
     }
     if (url.pathname === "/api/mail/senderphoto" && !post) {
