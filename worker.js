@@ -3894,6 +3894,25 @@ async function mailDo(env, address, path, method, bodyObj) {
   try { json = JSON.parse(text); } catch (e) { json = null; }
   return { ok: res.ok, status: res.status, json, text };
 }
+// Business font for everything sent from the mail client: Calibri 11.
+function mailHtml(text) {
+  const esc = String(text || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/\r?\n/g, "<br>");
+  return `<div style="font-family:Calibri,sans-serif;font-size:11pt">${esc}</div>`;
+}
+// Reply and forward: make the draft, put the typed words (in Calibri 11) above the quoted mail, then send it.
+async function mailDraftSend(env, addr, msg, op, text, to) {
+  const made = await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}/${op}`, "POST", {});
+  if (!made.ok || !made.json || !made.json.id) return made;
+  const id = made.json.id;
+  const old = String((made.json.body && made.json.body.content) || "");
+  const mine = mailHtml(String(text || "").slice(0, 200000)) + "<br>";
+  const html = /<body[^>]*>/i.test(old) ? old.replace(/<body[^>]*>/i, (m) => m + mine) : mine + old;
+  const patch = { body: { contentType: "HTML", content: html } };
+  if (to && to.length) patch.toRecipients = to;
+  const upd = await mailDo(env, addr, `/messages/${encodeURIComponent(id)}`, "PATCH", patch);
+  if (!upd.ok) return upd;
+  return mailDo(env, addr, `/messages/${encodeURIComponent(id)}/send`, "POST");
+}
 const MAIL_ALIAS = { "inbox": "inbox", "sent items": "sentitems", "drafts": "drafts", "deleted items": "deleteditems", "junk email": "junkemail", "archive": "archive" };
 // A mail search asks Graph for 250 results a page and keeps following its next page link, up to this many pages.
 const MAIL_SEARCH_PAGE = 250;
@@ -4101,17 +4120,17 @@ async function mailRoutes(request, env, user, url) {
       if (act === "flag" && msg) return done(await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}`, "PATCH", { flag: body.status === "complete" ? { flagStatus: "complete", completedDateTime: { dateTime: new Date().toISOString().slice(0, 19), timeZone: "UTC" } } : { flagStatus: body.status === "flagged" ? "flagged" : "notFlagged" } }));
       if (act === "categories" && msg) return done(await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}`, "PATCH", { categories: (Array.isArray(body.categories) ? body.categories : []).map((c) => String(c).slice(0, 40)).slice(0, 12) }));
       if (act === "delete" && msg) return done(await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}/move`, "POST", { destinationId: "deleteditems" }));
-      if (act === "reply" && msg) return done(await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}/reply`, "POST", { comment: String(body.comment || "").slice(0, 200000) }));
-      if (act === "replyall" && msg) return done(await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}/replyAll`, "POST", { comment: String(body.comment || "").slice(0, 200000) }));
+      if (act === "reply" && msg) return done(await mailDraftSend(env, addr, msg, "createReply", body.comment));
+      if (act === "replyall" && msg) return done(await mailDraftSend(env, addr, msg, "createReplyAll", body.comment));
       if (act === "forward" && msg) {
         const to = mailRecipients(body.to);
         if (!to.length) return reply(env, 200, { ok: false, error: "Add at least one valid email address to forward to.", worker: WORKER_BUILD });
-        return done(await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}/forward`, "POST", { comment: String(body.comment || "").slice(0, 200000), toRecipients: to }));
+        return done(await mailDraftSend(env, addr, msg, "createForward", body.comment, to));
       }
       if (act === "send") {
         const to = mailRecipients(body && body.to), cc = mailRecipients(body && body.cc);
         if (!to.length) return reply(env, 200, { ok: false, error: "Add at least one valid email address to send to.", worker: WORKER_BUILD });
-        return done(await mailDo(env, addr, "/sendMail", "POST", { message: { subject: String(body.subject || "").slice(0, 250), body: { contentType: "Text", content: String(body.text || "").slice(0, 200000) }, toRecipients: to, ccRecipients: cc }, saveToSentItems: true }));
+        return done(await mailDo(env, addr, "/sendMail", "POST", { message: { subject: String(body.subject || "").slice(0, 250), body: { contentType: "HTML", content: mailHtml(String(body.text || "").slice(0, 200000)) }, toRecipients: to, ccRecipients: cc }, saveToSentItems: true }));
       }
     }
   } catch (e) { return reply(env, 200, { ok: false, error: String(e && e.message || e).slice(0, 160), worker: WORKER_BUILD }); }
