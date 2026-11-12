@@ -3899,18 +3899,32 @@ function mailHtml(text) {
   const esc = String(text || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/\r?\n/g, "<br>");
   return `<div style="font-family:Calibri,sans-serif;font-size:11pt">${esc}</div>`;
 }
-// Reply and forward: make the draft, put the typed words (in Calibri 11) above the quoted mail, then send it.
-async function mailDraftSend(env, addr, msg, op, text, to) {
+function mailSafeHtml(h) {
+  return String(h || "").slice(0, 400000).replace(/<script[\s\S]*?<\/script>/gi, "").replace(/\son[a-z]+\s*=\s*("[^"]*"|'[^']*')/gi, "").replace(/\scontenteditable="[^"]*"/gi, "");
+}
+const mailBodyHtml = (b, text) => b && typeof b.html === "string" && b.html.trim() ? `<div style="font-family:Calibri,sans-serif;font-size:11pt">${mailSafeHtml(b.html)}</div>` : mailHtml(String(text || "").slice(0, 200000));
+function mailAtts(list) {
+  return (Array.isArray(list) ? list : []).slice(0, 8).filter((a) => a && a.name && typeof a.data === "string" && a.data.length < 4500000).map((a) => ({ "@odata.type": "#microsoft.graph.fileAttachment", name: String(a.name).slice(0, 150), contentType: String(a.type || "application/octet-stream").slice(0, 100), contentBytes: a.data }));
+}
+const mailWhenOk = (v) => { const t = Date.parse(String(v || "")); return t && t > Date.now() + 30000 ? new Date(t).toISOString() : ""; };
+// Reply and forward: make the draft, put the typed words (in Calibri 11) above the quoted mail, then send it. extra can carry the formatted body, attachments, importance, a send time, or noSend to keep it as a draft.
+async function mailDraftSend(env, addr, msg, op, text, to, extra) {
+  const x = extra || {};
   const made = await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}/${op}`, "POST", {});
   if (!made.ok || !made.json || !made.json.id) return made;
   const id = made.json.id;
   const old = String((made.json.body && made.json.body.content) || "");
-  const mine = mailHtml(String(text || "").slice(0, 200000)) + "<br>";
+  const mine = mailBodyHtml(x, text) + "<br>";
   const html = /<body[^>]*>/i.test(old) ? old.replace(/<body[^>]*>/i, (m) => m + mine) : mine + old;
   const patch = { body: { contentType: "HTML", content: html } };
   if (to && to.length) patch.toRecipients = to;
+  if (x.importance === "high") patch.importance = "high";
+  const at = mailWhenOk(x.sendAt);
+  if (at) patch.singleValueExtendedProperties = [{ id: "SystemTime 0x3FEF", value: at }];
   const upd = await mailDo(env, addr, `/messages/${encodeURIComponent(id)}`, "PATCH", patch);
   if (!upd.ok) return upd;
+  for (const a of mailAtts(x.attachments)) { const ar = await mailDo(env, addr, `/messages/${encodeURIComponent(id)}/attachments`, "POST", a); if (!ar.ok) return ar; }
+  if (x.noSend) return { ok: true, status: 200, json: { id } };
   return mailDo(env, addr, `/messages/${encodeURIComponent(id)}/send`, "POST");
 }
 const MAIL_ALIAS = { "inbox": "inbox", "sent items": "sentitems", "drafts": "drafts", "deleted items": "deleteditems", "junk email": "junkemail", "archive": "archive" };
@@ -3944,7 +3958,7 @@ async function mailRoutes(request, env, user, url) {
     if (url.pathname === "/api/mail/boxes" && !post) {
       const out = await Promise.all(mine.map(async (b) => {
         const r = await mailGraph(env, mailAddress(env, b), "/mailFolders/inbox?$select=unreadItemCount,totalItemCount");
-        return { id: b.id, label: b.label, personal: !!b.only, unread: r.ok && r.json ? Number(r.json.unreadItemCount || 0) : 0, total: r.ok && r.json ? Number(r.json.totalItemCount || 0) : 0, error: r.ok ? "" : mailWhy(r) };
+        return { id: b.id, label: b.label, address: mailAddress(env, b), personal: !!b.only, unread: r.ok && r.json ? Number(r.json.unreadItemCount || 0) : 0, total: r.ok && r.json ? Number(r.json.totalItemCount || 0) : 0, error: r.ok ? "" : mailWhy(r) };
       }));
       return reply(env, 200, { boxes: out, targets: MAILBOXES.filter((x) => !x.only || mailAllowed(x, user)).map((x) => ({ id: x.id, label: x.label })), worker: WORKER_BUILD });
     }
@@ -4122,18 +4136,37 @@ async function mailRoutes(request, env, user, url) {
       if (act === "flag" && msg) return done(await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}`, "PATCH", { flag: body.status === "complete" ? { flagStatus: "complete", completedDateTime: { dateTime: new Date().toISOString().slice(0, 19), timeZone: "UTC" } } : { flagStatus: body.status === "flagged" ? "flagged" : "notFlagged" } }));
       if (act === "categories" && msg) return done(await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}`, "PATCH", { categories: (Array.isArray(body.categories) ? body.categories : []).map((c) => String(c).slice(0, 40)).slice(0, 12) }));
       if (act === "delete" && msg) return done(await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}/move`, "POST", { destinationId: "deleteditems" }));
-      if (act === "reply" && msg) return done(await mailDraftSend(env, addr, msg, "createReply", body.comment));
-      if (act === "replyall" && msg) return done(await mailDraftSend(env, addr, msg, "createReplyAll", body.comment));
+      if (act === "reply" && msg) return done(await mailDraftSend(env, addr, msg, "createReply", body.comment, null, body));
+      if (act === "replyall" && msg) return done(await mailDraftSend(env, addr, msg, "createReplyAll", body.comment, null, body));
       if (act === "forward" && msg) {
         const to = mailRecipients(body.to);
         if (!to.length) return reply(env, 200, { ok: false, error: "Add at least one valid email address to forward to.", worker: WORKER_BUILD });
-        return done(await mailDraftSend(env, addr, msg, "createForward", body.comment, to));
+        return done(await mailDraftSend(env, addr, msg, "createForward", body.comment, to, body));
       }
+      const draftBody = () => ({ subject: String(body.subject || "").slice(0, 250), body: { contentType: "HTML", content: mailBodyHtml(body, body.text) }, toRecipients: mailRecipients(body.to), ccRecipients: mailRecipients(body.cc), bccRecipients: mailRecipients(body.bcc), importance: body.importance === "high" ? "high" : "normal" });
       if (act === "send") {
-        const to = mailRecipients(body && body.to), cc = mailRecipients(body && body.cc);
+        const to = mailRecipients(body && body.to);
         if (!to.length) return reply(env, 200, { ok: false, error: "Add at least one valid email address to send to.", worker: WORKER_BUILD });
-        return done(await mailDo(env, addr, "/sendMail", "POST", { message: { subject: String(body.subject || "").slice(0, 250), body: { contentType: "HTML", content: mailHtml(String(body.text || "").slice(0, 200000)) }, toRecipients: to, ccRecipients: cc }, saveToSentItems: true }));
+        const msgObj = draftBody();
+        const atts = mailAtts(body.attachments), at = mailWhenOk(body.sendAt);
+        if (!atts.length && !at) return done(await mailDo(env, addr, "/sendMail", "POST", { message: msgObj, saveToSentItems: true }));
+        const made = await mailDo(env, addr, "/messages", "POST", at ? { ...msgObj, singleValueExtendedProperties: [{ id: "SystemTime 0x3FEF", value: at }] } : msgObj);
+        if (!made.ok || !made.json || !made.json.id) return done(made);
+        for (const a of atts) { const ar = await mailDo(env, addr, `/messages/${encodeURIComponent(made.json.id)}/attachments`, "POST", a); if (!ar.ok) return done(ar); }
+        return done(await mailDo(env, addr, `/messages/${encodeURIComponent(made.json.id)}/send`, "POST"));
       }
+      if (act === "savedraft") {
+        let id = mailId(body.draftId);
+        if (id) { const u = await mailDo(env, addr, `/messages/${encodeURIComponent(id)}`, "PATCH", draftBody()); return u.ok ? reply(env, 200, { ok: true, draftId: id, worker: WORKER_BUILD }) : done(u); }
+        let made;
+        if (String(body.kind) === "forward" && msg) made = await mailDraftSend(env, addr, msg, "createForward", body.comment, mailRecipients(body.to), { ...body, noSend: true });
+        else {
+          made = await mailDo(env, addr, "/messages", "POST", draftBody());
+          if (made.ok && made.json && made.json.id) for (const a of mailAtts(body.attachments)) await mailDo(env, addr, `/messages/${encodeURIComponent(made.json.id)}/attachments`, "POST", a);
+        }
+        return made.ok && made.json && made.json.id ? reply(env, 200, { ok: true, draftId: made.json.id, worker: WORKER_BUILD }) : done(made);
+      }
+      if (act === "discarddraft" && msg) return done(await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}/permanentDelete`, "POST"));
     }
   } catch (e) { return reply(env, 200, { ok: false, error: String(e && e.message || e).slice(0, 160), worker: WORKER_BUILD }); }
   return reply(env, 404, { error: "not found" });
@@ -4160,6 +4193,43 @@ async function mailWatch(env) {
     const to = Object.keys(tiers).filter((e) => mailAllowed(b, { email: e, tier: tiers[e] }));
     for (const e of to) await notify(env, { to: e, kind: "mail", title: `New email, ${b.label}`, body, link: "emailbox", by: "Reservoir" });
     await save(newest);
+  }
+}
+// Once a day: drafts with no subject, recipients or words are deleted after 7 days, and any draft older than 14 days is deleted after a day's warning to whoever started it (matched from the name in its signature, or everyone with that mailbox if there is no match).
+async function mailDraftsSweep(env) {
+  if (!env.GRAPH_CLIENT_SECRET) return;
+  await settingsTable(env);
+  const key = "mail.drafts.sweep";
+  const row = await env.DB.prepare("SELECT value FROM app_settings WHERE key = ?").bind(key).first();
+  const nowMs = Date.now();
+  if (row && nowMs - Date.parse(row.value) < 20 * 3600 * 1000) return;
+  await env.DB.prepare("INSERT INTO app_settings (key, value, detail, by_name, at) VALUES (?, ?, 'drafts sweep', 'Reservoir', datetime('now')) ON CONFLICT(key) DO UPDATE SET value = excluded.value, at = datetime('now')").bind(key, new Date(nowMs).toISOString()).run();
+  const tiers = await accessTiers(env);
+  for (const b of MAILBOXES) {
+    const addr = mailAddress(env, b);
+    const r = await mailGraph(env, addr, "/mailFolders/drafts/messages?$top=100&$select=id,subject,createdDateTime,body,toRecipients");
+    if (!r.ok) { console.log("drafts sweep", b.id, r.status); continue; }
+    const warn = new Map();
+    for (const m of (r.json && r.json.value) || []) {
+      const days = (nowMs - Date.parse(m.createdDateTime)) / 86400000;
+      const html = String((m.body && m.body.content) || "");
+      const cut = html.search(/<div id="dfp-sig"/i);
+      const words = (cut >= 0 ? html.slice(0, cut) : html).replace(/<head[\s\S]*?<\/head>|<style[\s\S]*?<\/style>/gi, "").replace(/<[^>]+>/g, " ").replace(/&nbsp;/g, " ").trim();
+      const empty = !String(m.subject || "").trim() && !words && !(m.toRecipients || []).length;
+      if (empty && days >= 7) { await mailDo(env, addr, `/messages/${encodeURIComponent(m.id)}/permanentDelete`, "POST"); continue; }
+      if (days < 13) continue;
+      const wk = "mail.draftwarn." + m.id.slice(-60);
+      const warned = await env.DB.prepare("SELECT value FROM app_settings WHERE key = ?").bind(wk).first();
+      if (warned && days >= 14) { await mailDo(env, addr, `/messages/${encodeURIComponent(m.id)}/permanentDelete`, "POST"); continue; }
+      if (warned) continue;
+      await env.DB.prepare("INSERT INTO app_settings (key, value, detail, by_name, at) VALUES (?, '1', 'draft warned', 'Reservoir', datetime('now')) ON CONFLICT(key) DO NOTHING").bind(wk).run();
+      const sigAt = cut >= 0 ? html.slice(cut) : "";
+      const first = ((sigAt.match(/<b>([^<]+)<\/b>/i) || [])[1] || "").trim().toLowerCase();
+      const author = first ? Object.keys(tiers).find((e) => e.split("@")[0] === first && mailAllowed(b, { email: e, tier: tiers[e] })) : "";
+      const who = author ? [author] : Object.keys(tiers).filter((e) => mailAllowed(b, { email: e, tier: tiers[e] }));
+      for (const e of who) warn.set(e, (warn.get(e) || 0) + 1);
+    }
+    for (const [e, n] of warn) await notify(env, { to: e, kind: "mail", title: `Old drafts, ${b.label}`, body: `There ${n === 1 ? "is a draft" : "are drafts"} in the ${b.label} mailbox you started that ${n === 1 ? "is" : "are"} more than 14 days old. ${n === 1 ? "It is" : "They are"} about to be deleted. Please go in and clear ${n === 1 ? "it" : "them"}.`, link: "emailbox", by: "Reservoir" });
   }
 }
 async function arofloRoutes(request, env, user, url) {
@@ -6413,6 +6483,7 @@ export default {
     ctx.waitUntil(tsXeroPullSchedule(env).catch((e) => console.log("timesheet pull failed", String(e && e.message || e))));
     ctx.waitUntil(pushOneOffAndrey(env).catch((e) => console.log("one off failed", String(e && e.message || e))));
     ctx.waitUntil(mailWatch(env).catch((e) => console.log("mail watch failed", String(e && e.message || e))));
+    ctx.waitUntil(mailDraftsSweep(env).catch((e) => console.log("drafts sweep failed", String(e && e.message || e))));
     ctx.waitUntil(invMailCron(env).catch((e) => console.log("invoice mail cron failed", String(e && e.message || e))));
     ctx.waitUntil(payrollSweep(env).catch((e) => console.log("payroll sweep failed", String(e && e.message || e))));
     ctx.waitUntil(incidentReminders(env).catch((e) => console.log("incident reminders failed", String(e && e.message || e))));
