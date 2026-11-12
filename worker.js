@@ -3941,8 +3941,8 @@ async function mailRoutes(request, env, user, url) {
   try {
     if (url.pathname === "/api/mail/boxes" && !post) {
       const out = await Promise.all(mine.map(async (b) => {
-        const r = await mailGraph(env, mailAddress(env, b), "/mailFolders/inbox?$select=unreadItemCount");
-        return { id: b.id, label: b.label, personal: !!b.only, unread: r.ok && r.json ? Number(r.json.unreadItemCount || 0) : 0, error: r.ok ? "" : mailWhy(r) };
+        const r = await mailGraph(env, mailAddress(env, b), "/mailFolders/inbox?$select=unreadItemCount,totalItemCount");
+        return { id: b.id, label: b.label, personal: !!b.only, unread: r.ok && r.json ? Number(r.json.unreadItemCount || 0) : 0, total: r.ok && r.json ? Number(r.json.totalItemCount || 0) : 0, error: r.ok ? "" : mailWhy(r) };
       }));
       return reply(env, 200, { boxes: out, targets: MAILBOXES.filter((x) => !x.only || mailAllowed(x, user)).map((x) => ({ id: x.id, label: x.label })), worker: WORKER_BUILD });
     }
