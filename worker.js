@@ -3969,18 +3969,22 @@ async function mailRoutes(request, env, user, url) {
     if (!box) return reply(env, 403, { error: "forbidden" });
     const addr = mailAddress(env, box);
     if (url.pathname === "/api/mail/folders" && !post) {
-      const top = await mailGraph(env, addr, "/mailFolders?$top=100&$select=displayName,unreadItemCount");
+      const top = await mailGraph(env, addr, "/mailFolders?$top=100&$select=displayName,unreadItemCount,childFolderCount");
       if (!top.ok) return reply(env, 200, { ok: false, error: mailWhy(top), worker: WORKER_BUILD });
-      const inboxRes = await mailGraph(env, addr, "/mailFolders/inbox?$select=id");
-      const inboxId = inboxRes.ok && inboxRes.json ? inboxRes.json.id : "";
-      const kids = inboxId ? await mailGraph(env, addr, "/mailFolders/inbox/childFolders?$top=100&$select=displayName,unreadItemCount") : null;
       const folders = [];
+      const parents = [];
       ((top.json && top.json.value) || []).forEach((f) => {
         const name = String(f.displayName || "");
         if (MAIL_HIDE.test(name)) return;
-        folders.push({ id: MAIL_ALIAS[name.toLowerCase()] || f.id, name, unread: Number(f.unreadItemCount || 0) });
+        const fid = MAIL_ALIAS[name.toLowerCase()] || f.id;
+        folders.push({ id: fid, name, unread: Number(f.unreadItemCount || 0) });
+        if (Number(f.childFolderCount || 0) > 0) parents.push({ fid, name, gid: f.id });
       });
-      ((kids && kids.ok && kids.json && kids.json.value) || []).forEach((f) => folders.push({ id: f.id, name: "Inbox: " + String(f.displayName || ""), unread: Number(f.unreadItemCount || 0) }));
+      const kidRes = await Promise.all(parents.map((p) => mailGraph(env, addr, `/mailFolders/${encodeURIComponent(p.gid)}/childFolders?$top=100&$select=displayName,unreadItemCount`)));
+      parents.forEach((p, i) => {
+        const kids = kidRes[i];
+        ((kids && kids.ok && kids.json && kids.json.value) || []).forEach((f) => folders.push({ id: f.id, name: p.name + ": " + String(f.displayName || ""), unread: Number(f.unreadItemCount || 0), parent: p.fid }));
+      });
       return reply(env, 200, { ok: true, folders, worker: WORKER_BUILD });
     }
     if (url.pathname === "/api/mail/box" && !post) {
