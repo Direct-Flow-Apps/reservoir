@@ -6342,6 +6342,13 @@ async function invOneTimeClear(env) {
     await env.DB.prepare("DELETE FROM invoice_history WHERE number LIKE 'Credit %'").run();
     await env.DB.prepare("INSERT OR REPLACE INTO app_settings (key, value, detail, by_name, at) VALUES (?, '1', 'credit history cleared', 'Reservoir', datetime('now'))").bind(key2).run();
   } catch (e) { console.log("history clear failed", String(e && e.message || e)); }
+  // Third one time clear, 16 Nov 2026: credit note lines again.
+  try {
+    const key3 = "invhist.wipe.2026-11-16c";
+    if (await env.DB.prepare("SELECT 1 AS x FROM app_settings WHERE key = ?").bind(key3).first()) return;
+    await env.DB.prepare("DELETE FROM invoice_history WHERE number LIKE 'Credit %'").run();
+    await env.DB.prepare("INSERT OR REPLACE INTO app_settings (key, value, detail, by_name, at) VALUES (?, '1', 'credit history cleared', 'Reservoir', datetime('now'))").bind(key3).run();
+  } catch (e) { console.log("history clear failed", String(e && e.message || e)); }
 }
 // What the Uploaded Invoices screen shows: the successes (manual marks one that was entered by hand and ticked off) and the errors (retried marks one whose retry has failed, which gets the tick in place of the retry).
 async function invHistoryList(env) {
@@ -6528,9 +6535,9 @@ async function invRetry(env, actor, id) {
     await env.DB.prepare("DELETE FROM app_settings WHERE key = ?").bind(lock).run().catch(() => null);
   }
 }
-// A Samios credit note email. These are only ever done by hand from the Credits test button, never by the automatic runs or the normal invoice press.
+// A Samios credit note email. The Credits button does only these; the automatic runs and the normal invoice press do them along with the invoices.
 const invIsCreditMail = (m, rule) => !!(rule && rule.creditNotes && /credit note/i.test(String(m.subject || "")));
-// Emails waiting in the Reservoir folder, matched to a supplier rule, in supplier order (A to Z). creditsOnly gives just the credit notes, otherwise credit notes are left out.
+// Emails waiting in the Reservoir folder, matched to a supplier rule, in supplier order (A to Z). creditsOnly gives just the credit notes.
 async function invFolderHits(env, addr, folderId, creditsOnly) {
   const f = "receivedDateTime ge 1900-01-01T00:00:00Z and hasAttachments eq true";
   const r = await mailGraph(env, addr, `/mailFolders/${folderId}/messages?$top=50&$select=subject,receivedDateTime,categories,from,internetMessageId&$filter=${encodeURIComponent(f)}&$orderby=receivedDateTime desc`);
@@ -6541,7 +6548,7 @@ async function invFolderHits(env, addr, folderId, creditsOnly) {
     if (!rule) continue;
     const cats = (m.categories || []).map((c) => String(c).toLowerCase());
     if (cats.includes("error!") || (cats.includes("credit") && !rule.creditNotes)) continue;
-    if (invIsCreditMail(m, rule) !== !!creditsOnly) continue;
+    if (creditsOnly && !invIsCreditMail(m, rule)) continue;
     hits.push({ m, rule });
   }
   hits.sort((a, b) => a.rule.name.localeCompare(b.rule.name) || String(a.m.receivedDateTime).localeCompare(String(b.m.receivedDateTime)));
@@ -8407,7 +8414,7 @@ export default {
           const dom = rule.fromDomain ? "@" + rule.fromDomain.toLowerCase() : "";
           const hits = ((r.json && r.json.value) || []).filter((m) => (!dom || String((m.from && m.from.emailAddress && m.from.emailAddress.address) || "").toLowerCase().endsWith(dom)) && [rule.subject, ...(rule.alsoSubject || [])].some((t) => String(m.subject || "").toLowerCase().includes(t.toLowerCase()))).slice(0, 10);
           for (const hit of hits) {
-            if (invIsCreditMail(hit, rule) !== creditsOnly) continue;
+            if (creditsOnly && !invIsCreditMail(hit, rule)) continue;
             if (!rule.creditNotes && (hit.categories || []).some((c) => String(c).toLowerCase() === "credit")) { credits++; continue; }
             // An email Reservoir tagged ERROR! waits until the tag is removed in Outlook.
             if ((hit.categories || []).some((c) => String(c).toLowerCase() === "error!")) continue;
