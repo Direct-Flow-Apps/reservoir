@@ -3636,6 +3636,16 @@ async function xeroBillFromPdf(env, rule, bytes, fileName, parsed) {
 }
 // Raises a supplier credit note in Xero (ACCPAYCREDIT) from a parsed credit PDF, approved if Xero allows it and a draft if not, and attaches the PDF. Returns { ok, status, id, note }.
 async function xeroCreditFromPdf(env, rule, bytes, fileName, parsed) {
+  // Xero now and then answers 502, 503 or 504 for a call that is fine a moment later, so every call here is tried up to four times.
+  const xf = async (e, url, init) => {
+    let res;
+    for (let i = 0; i < 4; i++) {
+      try { res = await xeroFetch(e, url, init); } catch (err) { if (i === 3) throw err; await xeroSleep(2000); continue; }
+      if (res.status < 500 || i === 3) return res;
+      await xeroSleep(2000);
+    }
+    return res;
+  };
   if (!parsed || !parsed.number || !parsed.date || !(parsed.inc > 0) || Math.abs(parsed.ex + parsed.gst - parsed.inc) > 0.02) {
     const r = parsed && parsed.read ? ` (read: number ${parsed.number || "none"}, date ${parsed.date || "none"}, ex ${parsed.read.exT || "none"}, gst ${parsed.read.gstT || "none"}, inc ${parsed.read.incT || "none"})` : "";
     return { ok: false, note: `The credit note could not be read from the PDF${r}`.slice(0, 220) };
@@ -3647,7 +3657,7 @@ async function xeroCreditFromPdf(env, rule, bytes, fileName, parsed) {
   // Xero will not reuse the number of a deleted or voided credit note (it tries to edit the dead one), so a number that was deleted is saved with -2, -3 and so on, and the Reference keeps the real number.
   let xNumber = parsed.number, reused = "";
   for (let n = 1; n <= 6; n++) {
-    const dup = await xeroFetch(env, `api.xro/2.0/CreditNotes?where=${encodeURIComponent(`Type=="ACCPAYCREDIT" AND CreditNoteNumber=="${xNumber}" AND Contact.ContactID==Guid("${contact.contact_id}")`)}`);
+    const dup = await xf(env, `api.xro/2.0/CreditNotes?where=${encodeURIComponent(`Type=="ACCPAYCREDIT" AND CreditNoteNumber=="${xNumber}" AND Contact.ContactID==Guid("${contact.contact_id}")`)}`);
     const list = dup.ok ? (((await dup.json()).CreditNotes) || []) : [];
     if (list.some((c) => c.Status !== "DELETED" && c.Status !== "VOIDED")) return { ok: true, status: "EXISTS", note: "already in Xero" };
     if (!list.length) break;
@@ -3655,14 +3665,16 @@ async function xeroCreditFromPdf(env, rule, bytes, fileName, parsed) {
     xNumber = `${parsed.number}-${n + 1}`;
   }
   let account = "";
-  const cr = await xeroFetch(env, `api.xro/2.0/Contacts/${contact.contact_id}`);
+  const cr = await xf(env, `api.xro/2.0/Contacts/${contact.contact_id}`);
+  let crWhy = "";
+  if (!cr.ok) crWhy = `Xero contact lookup failed (${cr.status})`;
   if (cr.ok) { const cj = await cr.json(); const c = (cj.Contacts || [])[0] || {}; account = String(c.PurchasesDefaultAccountCode || (c.PurchasesDefaultAccount && c.PurchasesDefaultAccount.Code) || ""); }
   if (!account) account = String(rule.account || "");
   const make = async (status) => {
     const line = { Description: parsed.refInv ? `Credit: Original invoice ${parsed.refInv}` : `${rule.name} Credit`, Quantity: 1, UnitAmount: parsed.inc, TaxType: parsed.gst === 0 ? "EXEMPTEXPENSES" : "INPUT" };
     if (account) line.AccountCode = account;
     const body = { CreditNotes: [{ Type: "ACCPAYCREDIT", Contact: { ContactID: contact.contact_id }, CreditNoteNumber: xNumber, Reference: parsed.number, Date: parsed.date, LineAmountTypes: "Inclusive", Status: status, LineItems: [line] }] };
-    return xeroFetch(env, "api.xro/2.0/CreditNotes?summarizeErrors=false", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    return xf(env, "api.xro/2.0/CreditNotes?summarizeErrors=false", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
   };
   const created = async (status) => {
     const res = await make(status);
@@ -3673,7 +3685,7 @@ async function xeroCreditFromPdf(env, rule, bytes, fileName, parsed) {
     return { cn };
   };
   let status = "AUTHORISED";
-  let why = account ? "" : "no purchases account set for the contact";
+  let why = account ? "" : (crWhy || "no purchases account set for the contact");
   let r = account ? await created("AUTHORISED") : { err: why };
   if (r.err && /valid status/i.test(r.err)) { xNumber = `${parsed.number}-2`; reused = parsed.number; why = ""; r = await created("AUTHORISED"); }
   if (r.err) { why = r.err; status = "DRAFT"; r = await created("DRAFT"); }
@@ -3681,18 +3693,18 @@ async function xeroCreditFromPdf(env, rule, bytes, fileName, parsed) {
   if (r.err) return { ok: false, note: `${why ? why + ". " : ""}${r.err}`.slice(0, 220) };
   const cn = r.cn;
   let attached = "";
-  const at = await xeroFetch(env, `api.xro/2.0/CreditNotes/${cn.CreditNoteID}/Attachments/${encodeURIComponent(fileName)}`, { method: "PUT", headers: { "Content-Type": "application/pdf" }, body: bytes });
+  const at = await xf(env, `api.xro/2.0/CreditNotes/${cn.CreditNoteID}/Attachments/${encodeURIComponent(fileName)}`, { method: "PUT", headers: { "Content-Type": "application/pdf" }, body: bytes });
   if (!at.ok) attached = `PDF not attached (Xero ${at.status}: ${String(await at.text()).replace(/\s+/g, " ").slice(0, 120)})`;
   // Allocate to the original invoice only when it is in Xero, approved and still owing at least the credit. Paid, part paid below the credit, or not in Xero: the credit stays unallocated.
   let alloc = "";
   if (parsed.refInv && cn.Status === "AUTHORISED") {
     try {
-      const ir = await xeroFetch(env, `api.xro/2.0/Invoices?where=${encodeURIComponent(`Type=="ACCPAY" AND InvoiceNumber=="${parsed.refInv}" AND Contact.ContactID==Guid("${contact.contact_id}")`)}`);
+      const ir = await xf(env, `api.xro/2.0/Invoices?where=${encodeURIComponent(`Type=="ACCPAY" AND InvoiceNumber=="${parsed.refInv}" AND Contact.ContactID==Guid("${contact.contact_id}")`)}`);
       const inv = ir.ok ? (((await ir.json()).Invoices) || []).find((i) => i.Status !== "DELETED" && i.Status !== "VOIDED") : null;
       if (!inv) alloc = `unallocated, original invoice ${parsed.refInv} is not in Xero`;
       else if (inv.Status !== "AUTHORISED" || !(Number(inv.AmountDue) >= parsed.inc - 0.005)) alloc = `unallocated, original invoice ${parsed.refInv} is ${inv.Status === "PAID" || !(Number(inv.AmountDue) > 0) ? "paid" : "not open for the full credit"}`;
       else {
-        const ar = await xeroFetch(env, `api.xro/2.0/CreditNotes/${cn.CreditNoteID}/Allocations`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ Allocations: [{ Amount: parsed.inc, Date: parsed.date, Invoice: { InvoiceID: inv.InvoiceID } }] }) });
+        const ar = await xf(env, `api.xro/2.0/CreditNotes/${cn.CreditNoteID}/Allocations`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ Allocations: [{ Amount: parsed.inc, Date: parsed.date, Invoice: { InvoiceID: inv.InvoiceID } }] }) });
         alloc = ar.ok ? `allocated to invoice ${parsed.refInv}` : `unallocated (Xero ${ar.status}: ${String(await ar.text()).replace(/\s+/g, " ").slice(0, 100)})`;
       }
     } catch (e) { alloc = "unallocated (" + String(e && e.message || e).slice(0, 80) + ")"; }
