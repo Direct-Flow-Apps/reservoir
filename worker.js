@@ -6321,10 +6321,18 @@ async function invOneTimeClear(env) {
     await settingsTable(env);
     await invHistoryTable(env);
     const key = "invhist.wipe.2026-11-16";
-    if (await env.DB.prepare("SELECT 1 AS x FROM app_settings WHERE key = ?").bind(key).first()) return;
+    if (!(await env.DB.prepare("SELECT 1 AS x FROM app_settings WHERE key = ?").bind(key).first())) {
     await env.DB.prepare("DELETE FROM invoice_history").run();
     await env.DB.prepare("DELETE FROM app_settings WHERE key LIKE 'invmail.%.xero' OR key LIKE 'invmail.%.aroflo'").run();
     await env.DB.prepare("INSERT OR REPLACE INTO app_settings (key, value, detail, by_name, at) VALUES (?, '1', 'history cleared', 'Reservoir', datetime('now'))").bind(key).run();
+    }
+  } catch (e) { console.log("history clear failed", String(e && e.message || e)); }
+  // Second one time clear, 16 Nov 2026: credit note lines only.
+  try {
+    const key2 = "invhist.wipe.2026-11-16b";
+    if (await env.DB.prepare("SELECT 1 AS x FROM app_settings WHERE key = ?").bind(key2).first()) return;
+    await env.DB.prepare("DELETE FROM invoice_history WHERE number LIKE 'Credit %'").run();
+    await env.DB.prepare("INSERT OR REPLACE INTO app_settings (key, value, detail, by_name, at) VALUES (?, '1', 'credit history cleared', 'Reservoir', datetime('now'))").bind(key2).run();
   } catch (e) { console.log("history clear failed", String(e && e.message || e)); }
 }
 // What the Uploaded Invoices screen shows: the successes (manual marks one that was entered by hand and ticked off) and the errors (retried marks one whose retry has failed, which gets the tick in place of the retry).
