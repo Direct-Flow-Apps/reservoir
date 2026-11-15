@@ -3670,6 +3670,14 @@ async function xeroCreditFromPdf(env, rule, bytes, fileName, parsed) {
   if (!cr.ok) crWhy = `Xero contact lookup failed (${cr.status})`;
   if (cr.ok) { const cj = await cr.json(); const c = (cj.Contacts || [])[0] || {}; account = String(c.PurchasesDefaultAccountCode || (c.PurchasesDefaultAccount && c.PurchasesDefaultAccount.Code) || ""); }
   if (!account) account = String(rule.account || "");
+  // No default purchases account on the contact: use the account from the original invoice, then from the supplier's latest bill.
+  if (!account) {
+    try {
+      const where = parsed.refInv ? `Type=="ACCPAY" AND InvoiceNumber=="${parsed.refInv}" AND Contact.ContactID==Guid("${contact.contact_id}")` : `Type=="ACCPAY" AND Contact.ContactID==Guid("${contact.contact_id}")`;
+      const br = await xf(env, `api.xro/2.0/Invoices?where=${encodeURIComponent(where)}&order=Date%20DESC&page=1`);
+      if (br.ok) { const bj = await br.json(); const code = ((bj.Invoices || []).flatMap((x) => x.LineItems || []).find((l) => l.AccountCode) || {}).AccountCode; if (code) { account = String(code); crWhy = ""; } }
+    } catch (e) { /* leave it */ }
+  }
   const make = async (status) => {
     const line = { Description: parsed.refInv ? `Credit: Original invoice ${parsed.refInv}` : `${rule.name} Credit`, Quantity: 1, UnitAmount: parsed.inc, TaxType: parsed.gst === 0 ? "EXEMPTEXPENSES" : "INPUT" };
     if (account) line.AccountCode = account;
