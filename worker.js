@@ -6350,11 +6350,56 @@ async function invOneTimeClear(env) {
     await env.DB.prepare("INSERT OR REPLACE INTO app_settings (key, value, detail, by_name, at) VALUES (?, '1', 'credit history cleared', 'Reservoir', datetime('now'))").bind(key3).run();
   } catch (e) { console.log("history clear failed", String(e && e.message || e)); }
 }
+// Puts back the successful invoice lines that the 16 Nov 2026 wipe removed. Reads the Archive folder of the Accounts mailbox from 1 Oct 2026, newest first, works out the supplier and invoice number from each PDF and adds a successful line dated when the email arrived. Lines already there are left alone, credit notes and errored emails are skipped. Works in batches inside a time budget and carries on where it stopped.
+async function invRebuildHistory(env, budgetMs) {
+  const flag = "invhist.rebuild.2026-11-16";
+  try {
+    await settingsTable(env);
+    await invHistoryTable(env);
+    const row = await env.DB.prepare("SELECT value FROM app_settings WHERE key = ?").bind(flag).first();
+    if (row && row.value === "done") return;
+    if (!(await env.DB.prepare("SELECT 1 AS x FROM app_settings WHERE key = 'invhist.wipe.2026-11-16'").first())) return;
+    let skip = row ? Number(row.value) || 0 : 0;
+    const save = (v) => env.DB.prepare("INSERT OR REPLACE INTO app_settings (key, value, detail, by_name, at) VALUES (?, ?, 'history rebuild', 'Reservoir', datetime('now'))").bind(flag, String(v)).run();
+    const addr = mailAddress(env, MAILBOXES.find((x) => x.id === "accounts"));
+    const t0 = Date.now();
+    while (Date.now() - t0 < budgetMs) {
+      const r = await mailGraph(env, addr, `/mailFolders/archive/messages?$top=10&$skip=${skip}&$select=subject,receivedDateTime,categories,from,internetMessageId&$filter=${encodeURIComponent("receivedDateTime ge 2026-10-01T00:00:00Z and hasAttachments eq true")}&$orderby=receivedDateTime desc`);
+      if (!r.ok) { console.log("history rebuild list failed", r.status); return; }
+      const msgs = (r.json && r.json.value) || [];
+      if (!msgs.length) { await save("done"); return; }
+      for (const m of msgs) {
+        const rule = invMatchRule(m);
+        const cats = (m.categories || []).map((c) => String(c).toLowerCase());
+        if (!rule || cats.includes("error!") || cats.includes("credit") || invIsCreditMail(m, rule)) continue;
+        const at = await mailGraph(env, addr, `/messages/${encodeURIComponent(m.id)}/attachments?$select=id,name,contentType,size,isInline`);
+        const pdfs = at.ok ? ((at.json && at.json.value) || []).filter((x) => !x.isInline && (/pdf/i.test(x.contentType || "") || /\.pdf$/i.test(x.name || "")) && Number(x.size || 0) <= MAX_EMAIL) : [];
+        for (const p of pdfs) {
+          const res = await graphFetch(env, `/users/${encodeURIComponent(addr)}/messages/${encodeURIComponent(m.id)}/attachments/${encodeURIComponent(p.id)}/$value`);
+          if (!res.ok) continue;
+          let parsed = null;
+          try { parsed = await rule.parse(await res.arrayBuffer()); } catch (e) { parsed = null; }
+          if (!parsed || parsed.credit) continue;
+          const number = String(parsed.number || p.name || "").slice(0, 80);
+          if (!number) continue;
+          if (await env.DB.prepare("SELECT 1 AS x FROM invoice_history WHERE supplier = ? AND number = ?").bind(rule.name, number).first()) continue;
+          const when = new Date(m.receivedDateTime);
+          const atStr = when.toISOString().slice(0, 19).replace("T", " ");
+          const month = new Date(when.getTime() + 11 * 3600 * 1000).toISOString().slice(0, 7);
+          await env.DB.prepare("INSERT INTO invoice_history (msg, supplier, number, status, detail, at, month, imid) VALUES (?, ?, ?, 'done', '', ?, ?, ?)").bind(invHash(m.internetMessageId || m.id) + ":" + invHash(String(p.name || "invoice.pdf").slice(0, 150)), rule.name, number, atStr, month, m.internetMessageId || "").run();
+        }
+      }
+      skip += msgs.length;
+      await save(skip);
+    }
+  } catch (e) { console.log("history rebuild failed", String(e && e.message || e)); }
+}
 // What the Uploaded Invoices screen shows: the successes (manual marks one that was entered by hand and ticked off) and the errors (retried marks one whose retry has failed, which gets the tick in place of the retry).
 async function invHistoryList(env) {
   await invOneTimeClear(env);
+  await invRebuildHistory(env, 15000);
   await invHistoryTidy(env);
-  const rows = ((await env.DB.prepare("SELECT id, supplier, number, status, detail, at, retried, manual FROM invoice_history ORDER BY id DESC LIMIT 300").all()).results) || [];
+  const rows = ((await env.DB.prepare("SELECT id, supplier, number, status, detail, at, retried, manual FROM invoice_history ORDER BY at DESC, id DESC LIMIT 300").all()).results) || [];
   const out = (r) => ({ id: r.id, supplier: r.supplier, number: r.number, detail: r.detail || "", at: r.at, retried: !!r.retried, manual: !!r.manual || r.detail === "Rectified" });
   return { done: rows.filter((r) => r.status === "done").map(out), errors: rows.filter((r) => r.status === "error").map(out) };
 }
@@ -6627,6 +6672,7 @@ async function invRulesSync(env) {
 }
 async function invMailCron(env) {
   await invOneTimeClear(env);
+  await invRebuildHistory(env, 15000);
   await invRulesSync(env);
   await invSubscribe(env);
   await invMailSweep(env, 2);
