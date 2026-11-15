@@ -3933,7 +3933,7 @@ async function budgetRoutes(request, env, user, url) {
       const bills = [];
       for (let page = 1; page <= 3; page++) {
         const since = new Date(Date.now() - 75 * 864e5), sinceW = `DateTime(${since.getUTCFullYear()}, ${since.getUTCMonth() + 1}, ${since.getUTCDate()})`;
-        const res = await xeroFetch(env, `api.xro/2.0/Invoices?where=${encodeURIComponent(`Type=="ACCPAY" AND (Status=="AUTHORISED" OR Status=="PAID") AND Date>=${sinceW}`)}&page=${page}`);
+        const res = await xeroFetch(env, `api.xro/2.0/Invoices?where=${encodeURIComponent(`Type=="ACCPAY" AND (Status=="AUTHORISED" OR Status=="PAID") AND Date>=${sinceW}`)}&order=${encodeURIComponent("Date DESC")}&page=${page}`);
         if (!res.ok) return reply(env, 200, { ok: false, error: `Xero ${res.status}`, bills: [] });
         const j = await res.json();
         const list = j && j.Invoices || [];
