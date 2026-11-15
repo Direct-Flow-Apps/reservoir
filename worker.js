@@ -3255,7 +3255,11 @@ async function samiosParse(bytes) {
     const cn = first(/^(?:Credit Note|Credit|Invoice)\s*(?:No\.?|Number)?\s*:?\s*(\d{5,})\b/i) || (all.map((t) => t.match(/\b(\d{9})\b/)).find((m) => m) || [])[1] || "";
     const cd = first(/^Date:\s*(\d{1,2}\/\d{1,2}\/\d{2,4})$/i).match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/);
     const cy = cd ? (cd[3].length === 2 ? 2000 + Number(cd[3]) : Number(cd[3])) : 0;
-    return { credit: true, number: cn, date: cd ? `${cy}-${String(cd[2]).padStart(2, "0")}-${String(cd[1]).padStart(2, "0")}` : "", ex: Math.abs(ex) || 0, gst: Math.abs(gst) || 0, inc: Math.abs(inc) || 0, read: { exT, gstT, incT } };
+    // The credit note layout has no Total Ex GST line: it shows "Credit Total:" (with GST) and "Tax included in total:", so ex GST is worked out from those.
+    const cInT = valueOf("Credit Total:") || incT, cGstT = valueOf("Tax included in total:") || gstT;
+    const cInc = Math.abs(money(cInT)) || 0, cGst = Math.abs(money(cGstT)) || 0;
+    const cEx = Math.abs(ex) || Math.round((cInc - cGst) * 100) / 100;
+    return { credit: true, number: cn, date: cd ? `${cy}-${String(cd[2]).padStart(2, "0")}-${String(cd[1]).padStart(2, "0")}` : "", ex: cEx, gst: cGst, inc: cInc, read: { exT: exT || String(cEx), gstT: cGstT, incT: cInT } };
   }
   const dt = first(/^Date:\s*(\d{1,2}\/\d{1,2}\/\d{2,4})$/i).match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/);
   if (!/^\d{5,}$/.test(number) || !dt || !(ex > 0) || !(inc > 0) || Math.abs(ex + gst - inc) > 0.02) return null;
