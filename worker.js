@@ -3256,10 +3256,13 @@ async function samiosParse(bytes) {
     const cd = first(/^Date:\s*(\d{1,2}\/\d{1,2}\/\d{2,4})$/i).match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/);
     const cy = cd ? (cd[3].length === 2 ? 2000 + Number(cd[3]) : Number(cd[3])) : 0;
     // The credit note layout has no Total Ex GST line: it shows "Credit Total:" (with GST) and "Tax included in total:", so ex GST is worked out from those.
+    const rl = items.filter((i) => /^refer invoice:?$/i.test(i.t.trim()))[0];
+    const refItem = rl ? items.filter((i) => i.page === rl.page && Math.abs(i.y - rl.y) < 4 && i.x > rl.x + 10 && /^\d{5,}$/.test(i.t.trim())).sort((a, b) => a.x - b.x)[0] : null;
+    const refInv = refItem ? refItem.t.trim() : "";
     const cInT = valueOf("Credit Total:") || incT, cGstT = valueOf("Tax included in total:") || gstT;
     const cInc = Math.abs(money(cInT)) || 0, cGst = Math.abs(money(cGstT)) || 0;
     const cEx = Math.abs(ex) || Math.round((cInc - cGst) * 100) / 100;
-    return { credit: true, number: cn, date: cd ? `${cy}-${String(cd[2]).padStart(2, "0")}-${String(cd[1]).padStart(2, "0")}` : "", ex: cEx, gst: cGst, inc: cInc, read: { exT: exT || String(cEx), gstT: cGstT, incT: cInT } };
+    return { credit: true, refInv, number: cn, date: cd ? `${cy}-${String(cd[2]).padStart(2, "0")}-${String(cd[1]).padStart(2, "0")}` : "", ex: cEx, gst: cGst, inc: cInc, read: { exT: exT || String(cEx), gstT: cGstT, incT: cInT } };
   }
   const dt = first(/^Date:\s*(\d{1,2}\/\d{1,2}\/\d{2,4})$/i).match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/);
   if (!/^\d{5,}$/.test(number) || !dt || !(ex > 0) || !(inc > 0) || Math.abs(ex + gst - inc) > 0.02) return null;
@@ -3648,7 +3651,7 @@ async function xeroCreditFromPdf(env, rule, bytes, fileName, parsed) {
   if (cr.ok) { const cj = await cr.json(); const c = (cj.Contacts || [])[0] || {}; account = String(c.PurchasesDefaultAccountCode || (c.PurchasesDefaultAccount && c.PurchasesDefaultAccount.Code) || ""); }
   if (!account) account = String(rule.account || "");
   const make = async (status) => {
-    const line = { Description: `${rule.name} credit note ${parsed.number}`, Quantity: 1, UnitAmount: parsed.inc, TaxType: parsed.gst === 0 ? "EXEMPTEXPENSES" : "INPUT" };
+    const line = { Description: parsed.refInv ? `Credit: Original invoice ${parsed.refInv}` : `${rule.name} Credit`, Quantity: 1, UnitAmount: parsed.inc, TaxType: parsed.gst === 0 ? "EXEMPTEXPENSES" : "INPUT" };
     if (account) line.AccountCode = account;
     const body = { CreditNotes: [{ Type: "ACCPAYCREDIT", Contact: { ContactID: contact.contact_id }, CreditNoteNumber: parsed.number, Date: parsed.date, LineAmountTypes: "Inclusive", Status: status, LineItems: [line] }] };
     return xeroFetch(env, "api.xro/2.0/CreditNotes?summarizeErrors=false", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
@@ -3670,7 +3673,21 @@ async function xeroCreditFromPdf(env, rule, bytes, fileName, parsed) {
   let attached = "";
   const at = await xeroFetch(env, `api.xro/2.0/CreditNotes/${cn.CreditNoteID}/Attachments/${encodeURIComponent(fileName)}`, { method: "PUT", headers: { "Content-Type": "application/pdf" }, body: bytes });
   if (!at.ok) attached = `PDF not attached (Xero ${at.status}: ${String(await at.text()).replace(/\s+/g, " ").slice(0, 120)})`;
-  return { ok: true, status: cn.Status, id: cn.CreditNoteID, note: [status === "DRAFT" && why ? `left as draft (${why})` : "", `credit note ${parsed.number}, total ${cn.Total}`, attached].filter(Boolean).join(". ") };
+  // Allocate to the original invoice only when it is in Xero, approved and still owing at least the credit. Paid, part paid below the credit, or not in Xero: the credit stays unallocated.
+  let alloc = "";
+  if (parsed.refInv && cn.Status === "AUTHORISED") {
+    try {
+      const ir = await xeroFetch(env, `api.xro/2.0/Invoices?where=${encodeURIComponent(`Type=="ACCPAY" AND InvoiceNumber=="${parsed.refInv}" AND Contact.ContactID==Guid("${contact.contact_id}")`)}`);
+      const inv = ir.ok ? (((await ir.json()).Invoices) || []).find((i) => i.Status !== "DELETED" && i.Status !== "VOIDED") : null;
+      if (!inv) alloc = `unallocated, original invoice ${parsed.refInv} is not in Xero`;
+      else if (inv.Status !== "AUTHORISED" || !(Number(inv.AmountDue) >= parsed.inc - 0.005)) alloc = `unallocated, original invoice ${parsed.refInv} is ${inv.Status === "PAID" || !(Number(inv.AmountDue) > 0) ? "paid" : "not open for the full credit"}`;
+      else {
+        const ar = await xeroFetch(env, `api.xro/2.0/CreditNotes/${cn.CreditNoteID}/Allocations`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ Allocations: [{ Amount: parsed.inc, Date: parsed.date, Invoice: { InvoiceID: inv.InvoiceID } }] }) });
+        alloc = ar.ok ? `allocated to invoice ${parsed.refInv}` : `unallocated (Xero ${ar.status}: ${String(await ar.text()).replace(/\s+/g, " ").slice(0, 100)})`;
+      }
+    } catch (e) { alloc = "unallocated (" + String(e && e.message || e).slice(0, 80) + ")"; }
+  } else if (!parsed.refInv) alloc = "unallocated, no original invoice on the credit note";
+  return { ok: true, status: cn.Status, id: cn.CreditNoteID, note: [status === "DRAFT" && why ? `left as draft (${why})` : "", `credit note ${parsed.number}, total ${cn.Total}`, alloc, attached].filter(Boolean).join(". ") };
 }
 const INVOICE_MAIL_RULES = [
   { name: "Burnett's", from: "burnetts-noreply@mail.myframeworks.com.au", subject: "BURNETTS PLUMBING SUPPLIES INVOICE", contact: "burnett", account: "", parse: (b) => burnettsParse(b) },
