@@ -3932,6 +3932,12 @@ async function budgetRoutes(request, env, user, url) {
   return reply(env, 404, { error: "not found" });
 }
 // ---- Mail client. Folders, messages, reading, replying, forwarding, sending, deleting and attachments for the four DFP mailboxes, all through Microsoft Graph. Changing mail needs the Mail.ReadWrite and Mail.Send application permissions on the Reservoir Directories app. ----
+async function mailGraphPost(env, path, bodyObj) {
+  const go = () => graphFetch(env, path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(bodyObj) });
+  let res = await go();
+  if (res.status === 401 || res.status === 403) { graphToken = { value: null, at: 0 }; res = await go(); }
+  return { ok: res.ok, status: res.status, text: await res.text() };
+}
 async function mailDo(env, address, path, method, bodyObj) {
   const go = () => graphFetch(env, `/users/${encodeURIComponent(address)}${path}`, { method, headers: { "Content-Type": "application/json" }, body: bodyObj === void 0 ? void 0 : JSON.stringify(bodyObj) });
   let res = await go();
@@ -4241,6 +4247,13 @@ async function mailRoutes(request, env, user, url) {
           if (made.ok && made.json && made.json.id) for (const a of mailAtts(body.attachments)) await mailDo(env, addr, `/messages/${encodeURIComponent(made.json.id)}/attachments`, "POST", a);
         }
         return made.ok && made.json && made.json.id ? reply(env, 200, { ok: true, draftId: made.json.id, worker: WORKER_BUILD }) : done(made);
+      }
+      if (act === "report" && msg) {
+        const cat = body.kind === "phishing" ? "phishing" : "notJunk";
+        const r = await mailGraphPost(env, "/security/threatSubmission/emailThreats", { "@odata.type": "#microsoft.graph.security.emailContentThreatSubmission", category: cat, recipientEmailAddress: addr, messageUrl: `${GRAPH}/users/${encodeURIComponent(addr)}/messages/${encodeURIComponent(msg)}` });
+        if (r.ok) return reply(env, 200, { ok: true, worker: WORKER_BUILD });
+        const denied = r.status === 401 || r.status === 403;
+        return reply(env, 200, { ok: false, denied, error: denied ? "Microsoft refused the report. ThreatSubmission.ReadWrite.All needs adding to Reservoir Directories." : "Microsoft report failed (" + r.status + ")", worker: WORKER_BUILD });
       }
       if ((act === "discarddraft" || act === "purge") && msg) return done(await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}/permanentDelete`, "POST"));
     }
