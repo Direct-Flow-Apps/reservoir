@@ -6305,8 +6305,21 @@ async function invHistoryAdd(env, msg, supplier, number, status, detail, imid) {
     await env.DB.prepare("INSERT INTO invoice_history (msg, supplier, number, status, detail, month, imid) VALUES (?, ?, ?, ?, ?, strftime('%Y-%m', 'now', '+11 hours'), ?)").bind(msg || "", supplier || "", String(number || "").slice(0, 80), status, String(detail || "").slice(0, 800), String(imid || "").slice(0, 400)).run();
   } catch (e) { console.log("invoice history failed", String(e && e.message || e)); }
 }
+// One time wipe asked for on 16 Nov 2026: clears the whole invoice and credit history and the remembered Xero and AroFlo sends, then notes it has been done so it never runs again.
+async function invOneTimeClear(env) {
+  try {
+    await settingsTable(env);
+    await invHistoryTable(env);
+    const key = "invhist.wipe.2026-11-16";
+    if (await env.DB.prepare("SELECT 1 AS x FROM app_settings WHERE key = ?").bind(key).first()) return;
+    await env.DB.prepare("DELETE FROM invoice_history").run();
+    await env.DB.prepare("DELETE FROM app_settings WHERE key LIKE 'invmail.%.xero' OR key LIKE 'invmail.%.aroflo'").run();
+    await env.DB.prepare("INSERT OR REPLACE INTO app_settings (key, value, detail, by_name, at) VALUES (?, '1', 'history cleared', 'Reservoir', datetime('now'))").bind(key).run();
+  } catch (e) { console.log("history clear failed", String(e && e.message || e)); }
+}
 // What the Uploaded Invoices screen shows: the successes (manual marks one that was entered by hand and ticked off) and the errors (retried marks one whose retry has failed, which gets the tick in place of the retry).
 async function invHistoryList(env) {
+  await invOneTimeClear(env);
   await invHistoryTidy(env);
   const rows = ((await env.DB.prepare("SELECT id, supplier, number, status, detail, at, retried, manual FROM invoice_history ORDER BY id DESC LIMIT 300").all()).results) || [];
   const out = (r) => ({ id: r.id, supplier: r.supplier, number: r.number, detail: r.detail || "", at: r.at, retried: !!r.retried, manual: !!r.manual || r.detail === "Rectified" });
@@ -6580,6 +6593,7 @@ async function invRulesSync(env) {
   if (ok) await env.DB.prepare("INSERT OR REPLACE INTO app_settings (key, value, detail, by_name, at) VALUES ('invmail.rules_sync', '1', ?, 'Reservoir', datetime('now'))").bind(sig).run();
 }
 async function invMailCron(env) {
+  await invOneTimeClear(env);
   await invRulesSync(env);
   await invSubscribe(env);
   await invMailSweep(env, 2);
@@ -8342,6 +8356,7 @@ export default {
         const addr = mailAddress(env, box);
         await settingsTable(env);
         await invHistoryTable(env);
+        await invOneTimeClear(env);
         let credits = 0;
         let lastErr = "";
         const creditsOnly = url.searchParams.get("credits") === "1";
