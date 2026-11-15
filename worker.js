@@ -3250,7 +3250,13 @@ async function samiosParse(bytes) {
   const exT = valueOf("Total Ex GST:"), gstT = valueOf("GST:"), incT = valueOf("Total Inc GST:");
   const ex = money(exT), gst = money(gstT), inc = money(incT);
   const credit = /^\(.*\)$|^-|-$|CR$/i.test(exT) || /^\(.*\)$|^-|-$|CR$/i.test(incT) || ex < 0 || inc < 0 || all.some((t) => /credit note|tax credit/i.test(t));
-  if (credit) return { credit: true };
+  if (credit) {
+    // A credit note carries its own number and amounts; read them as positive figures so Xero can raise a supplier credit note.
+    const cn = first(/^(?:Credit Note|Credit|Invoice)\s*(?:No\.?|Number)?\s*:?\s*(\d{5,})\b/i) || (all.map((t) => t.match(/\b(\d{9})\b/)).find((m) => m) || [])[1] || "";
+    const cd = first(/^Date:\s*(\d{1,2}\/\d{1,2}\/\d{2,4})$/i).match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/);
+    const cy = cd ? (cd[3].length === 2 ? 2000 + Number(cd[3]) : Number(cd[3])) : 0;
+    return { credit: true, number: cn, date: cd ? `${cy}-${String(cd[2]).padStart(2, "0")}-${String(cd[1]).padStart(2, "0")}` : "", ex: Math.abs(ex) || 0, gst: Math.abs(gst) || 0, inc: Math.abs(inc) || 0, read: { exT, gstT, incT } };
+  }
   const dt = first(/^Date:\s*(\d{1,2}\/\d{1,2}\/\d{2,4})$/i).match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/);
   if (!/^\d{5,}$/.test(number) || !dt || !(ex > 0) || !(inc > 0) || Math.abs(ex + gst - inc) > 0.02) return null;
   const yr = dt[3].length === 2 ? 2000 + Number(dt[3]) : Number(dt[3]);
@@ -3621,10 +3627,51 @@ async function xeroBillFromPdf(env, rule, bytes, fileName, parsed) {
   if (!at.ok) attached = `PDF not attached (Xero ${at.status}: ${String(await at.text()).replace(/\s+/g, " ").slice(0, 120)})`;
   return { ok: true, status: inv.Status, id: inv.InvoiceID, note: [status === "DRAFT" && why ? `left as draft (${why})` : "", seen, attached].filter(Boolean).join(". ") };
 }
+// Raises a supplier credit note in Xero (ACCPAYCREDIT) from a parsed credit PDF, approved if Xero allows it and a draft if not, and attaches the PDF. Returns { ok, status, id, note }.
+async function xeroCreditFromPdf(env, rule, bytes, fileName, parsed) {
+  if (!parsed || !parsed.number || !parsed.date || !(parsed.inc > 0) || Math.abs(parsed.ex + parsed.gst - parsed.inc) > 0.02) {
+    const r = parsed && parsed.read ? ` (read: number ${parsed.number || "none"}, date ${parsed.date || "none"}, ex ${parsed.read.exT || "none"}, gst ${parsed.read.gstT || "none"}, inc ${parsed.read.incT || "none"})` : "";
+    return { ok: false, note: `The credit note could not be read from the PDF${r}`.slice(0, 220) };
+  }
+  await xeroContactsTable(env);
+  const rows = ((await env.DB.prepare("SELECT contact_id, name FROM xero_contacts WHERE REPLACE(REPLACE(name_lc, char(8217), ''), char(39), '') LIKE ?").bind(`%${rule.contact.toLowerCase()}%`).all()).results) || [];
+  if (rows.length !== 1) return { ok: false, note: rows.length ? `${rows.length} Xero contacts match ${rule.contact}` : `no Xero contact matches ${rule.contact}` };
+  const contact = rows[0];
+  const dup = await xeroFetch(env, `api.xro/2.0/CreditNotes?where=${encodeURIComponent(`Type=="ACCPAYCREDIT" AND CreditNoteNumber=="${parsed.number}" AND Contact.ContactID==Guid("${contact.contact_id}")`)}`);
+  if (dup.ok) { const dj = await dup.json(); if ((dj.CreditNotes || []).some((c) => c.Status !== "DELETED" && c.Status !== "VOIDED")) return { ok: true, status: "EXISTS", note: "already in Xero" }; }
+  let account = "";
+  const cr = await xeroFetch(env, `api.xro/2.0/Contacts/${contact.contact_id}`);
+  if (cr.ok) { const cj = await cr.json(); const c = (cj.Contacts || [])[0] || {}; account = String(c.PurchasesDefaultAccountCode || (c.PurchasesDefaultAccount && c.PurchasesDefaultAccount.Code) || ""); }
+  if (!account) account = String(rule.account || "");
+  const make = async (status) => {
+    const line = { Description: `${rule.name} credit note ${parsed.number}`, Quantity: 1, UnitAmount: parsed.inc, TaxType: parsed.gst === 0 ? "EXEMPTEXPENSES" : "INPUT" };
+    if (account) line.AccountCode = account;
+    const body = { CreditNotes: [{ Type: "ACCPAYCREDIT", Contact: { ContactID: contact.contact_id }, CreditNoteNumber: parsed.number, Date: parsed.date, LineAmountTypes: "Inclusive", Status: status, LineItems: [line] }] };
+    return xeroFetch(env, "api.xro/2.0/CreditNotes?summarizeErrors=false", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  };
+  const created = async (status) => {
+    const res = await make(status);
+    if (!res.ok) return { err: `Xero ${res.status}: ${String(await res.text()).slice(0, 160)}` };
+    const cn = (((await res.json()).CreditNotes) || [])[0] || {};
+    const msgs = [...(cn.ValidationErrors || []), ...(cn.Warnings || [])].map((e) => e.Message).filter(Boolean).join("; ");
+    if (!cn.CreditNoteID || /^0+(-0+)*$/.test(cn.CreditNoteID) || cn.StatusAttributeString === "ERROR") return { err: msgs || "Xero did not save the credit note" };
+    return { cn };
+  };
+  let status = "AUTHORISED";
+  let why = account ? "" : "no purchases account set for the contact";
+  let r = account ? await created("AUTHORISED") : { err: why };
+  if (r.err) { why = r.err; status = "DRAFT"; r = await created("DRAFT"); }
+  if (r.err) return { ok: false, note: `${why ? why + ". " : ""}${r.err}`.slice(0, 220) };
+  const cn = r.cn;
+  let attached = "";
+  const at = await xeroFetch(env, `api.xro/2.0/CreditNotes/${cn.CreditNoteID}/Attachments/${encodeURIComponent(fileName)}`, { method: "PUT", headers: { "Content-Type": "application/pdf" }, body: bytes });
+  if (!at.ok) attached = `PDF not attached (Xero ${at.status}: ${String(await at.text()).replace(/\s+/g, " ").slice(0, 120)})`;
+  return { ok: true, status: cn.Status, id: cn.CreditNoteID, note: [status === "DRAFT" && why ? `left as draft (${why})` : "", `credit note ${parsed.number}, total ${cn.Total}`, attached].filter(Boolean).join(". ") };
+}
 const INVOICE_MAIL_RULES = [
   { name: "Burnett's", from: "burnetts-noreply@mail.myframeworks.com.au", subject: "BURNETTS PLUMBING SUPPLIES INVOICE", contact: "burnett", account: "", parse: (b) => burnettsParse(b) },
   { name: "Harris", from: "mailouts@harristps.com.au", subject: "invoice", contact: "harris", account: "", parse: (b) => harrisParse(b) },
-  { name: "Samios", fromDomain: "samios.net.au", subject: "invoice", contact: "samios", account: "", parse: (b) => samiosParse(b) },
+  { name: "Samios", fromDomain: "samios.net.au", subject: "invoice", contact: "samios", account: "", creditNotes: true, alsoSubject: ["credit note"], parse: (b) => samiosParse(b) },
   { name: "Reece", fromDomain: "reece.com.au", subject: "reece transactions", contact: "reece", account: "", parse: (b) => reeceParse(b) },
   { name: "Tradelink", from: "donotreply@tradelink.com.au", subject: "tax invoice", contact: "tradelink", account: "", parse: (b) => tradelinkParse(b) },
   { name: "Momentum", from: "hello@mail.momentum.com.au", subject: "your electricity bill", contact: "momentum", account: "", xeroOnly: true, parse: (b) => momentumParse(b) },
@@ -3992,7 +4039,7 @@ async function mailRoutes(request, env, user, url) {
       const top = Math.max(1, Math.min(200, Number(url.searchParams.get("top")) || 40));
       const filter = url.searchParams.get("filter") || "";
       const q = String(url.searchParams.get("q") || "").replace(/["\\]/g, " ").trim().slice(0, 100);
-      const fields = "$select=subject,from,toRecipients,receivedDateTime,isRead,bodyPreview,hasAttachments,categories,flag";
+      const fields = "$select=subject,from,toRecipients,receivedDateTime,isRead,bodyPreview,hasAttachments,categories,flag,parentFolderId";
       let rows = [];
       if (q) {
         // A search covers every folder in the mailbox and reads every page of results Graph offers, so older matches are never left out. Graph itself stops a message search at 1,000 results.
@@ -4014,7 +4061,18 @@ async function mailRoutes(request, env, user, url) {
         if (!r.ok) return reply(env, 200, { ok: false, error: mailWhy(r), worker: WORKER_BUILD });
         rows = (r.json && r.json.value) || [];
       }
-      const list = rows.map((m) => ({ id: m.id, from: mailShow(m.from).slice(0, 80), fromAddr: mailPart(m.from).address.toLowerCase(), to: ((m.toRecipients || []).map(mailShow).join(", ")).slice(0, 120), subject: String(m.subject || "(no subject)").slice(0, 160), at: m.receivedDateTime || "", read: !!m.isRead, attach: !!m.hasAttachments, categories: (m.categories || []).slice(0, 6).map((c) => String(c).slice(0, 40)), flag: mailFlag(m.flag), preview: String(m.bodyPreview || "").replace(/\s+/g, " ").slice(0, 140) }));
+      // A search covers every folder, so each result says which folder it is in.
+      const where = new Map();
+      if (q) {
+        try {
+          const tf = await mailGraph(env, addr, "/mailFolders?$top=100&$select=displayName,childFolderCount");
+          const tops = (tf.ok && tf.json && tf.json.value) || [];
+          tops.forEach((f) => where.set(f.id, String(f.displayName || "")));
+          const kids = await Promise.all(tops.filter((f) => Number(f.childFolderCount || 0) > 0).map((f) => mailGraph(env, addr, `/mailFolders/${encodeURIComponent(f.id)}/childFolders?$top=100&$select=displayName`)));
+          kids.forEach((k) => ((k && k.ok && k.json && k.json.value) || []).forEach((f) => where.set(f.id, String(f.displayName || ""))));
+        } catch (e) {}
+      }
+      const list = rows.map((m) => ({ id: m.id, ...(q && where.get(m.parentFolderId) ? { folder: where.get(m.parentFolderId).slice(0, 40) } : null), from: mailShow(m.from).slice(0, 80), fromAddr: mailPart(m.from).address.toLowerCase(), to: ((m.toRecipients || []).map(mailShow).join(", ")).slice(0, 120), subject: String(m.subject || "(no subject)").slice(0, 160), at: m.receivedDateTime || "", read: !!m.isRead, attach: !!m.hasAttachments, categories: (m.categories || []).slice(0, 6).map((c) => String(c).slice(0, 40)), flag: mailFlag(m.flag), preview: String(m.bodyPreview || "").replace(/\s+/g, " ").slice(0, 140) }));
       return reply(env, 200, { ok: true, label: box.label, messages: list, more: !q && list.length >= top, worker: WORKER_BUILD });
     }
     if (url.pathname === "/api/mail/message" && !post) {
@@ -6248,7 +6306,7 @@ async function invClaim(env, key) {
 const invMatchRule = (m) => {
   const from = String((m.from && m.from.emailAddress && m.from.emailAddress.address) || "").toLowerCase();
   const subj = String(m.subject || "").toLowerCase();
-  return invRulesSorted().find((r) => (r.from ? from === r.from.toLowerCase() : from.endsWith("@" + String(r.fromDomain || "").toLowerCase())) && subj.includes(r.subject.toLowerCase())) || null;
+  return invRulesSorted().find((r) => (r.from ? from === r.from.toLowerCase() : from.endsWith("@" + String(r.fromDomain || "").toLowerCase())) && [r.subject, ...(r.alsoSubject || [])].some((t) => subj.includes(t.toLowerCase()))) || null;
 };
 // Work out one email. Returns null when there is nothing to do with it, { credit: true } for a credit, otherwise the result shown on the screen.
 // redo is only passed by a retry: it says which file starts again from nothing (true for every file in the email).
@@ -6275,7 +6333,7 @@ async function invProcessHit(env, actor, addr, rule, hit, inFolder, redo) {
     got.push({ p, buf, parsed });
   }
   // A credit goes back to the inbox with the Credit tag, for a person to deal with.
-  if (got.some((g) => g.parsed && g.parsed.credit)) {
+  if (!rule.creditNotes && got.some((g) => g.parsed && g.parsed.credit)) {
     await patch({ categories: [...new Set([...(hit.categories || []), "Credit"])] });
     if (inFolder) await moveTo("inbox");
     return { credit: true };
@@ -6286,7 +6344,8 @@ async function invProcessHit(env, actor, addr, rule, hit, inFolder, redo) {
   for (const g of got) {
     const p = g.p;
     const fname = String(p.name || "invoice.pdf").slice(0, 150);
-    const it = { file: fname, supplier: rule.name, number: g.parsed ? g.parsed.number : "", aroflo: "", xero: "", xeroNote: "" };
+    const isCredit = !!(rule.creditNotes && g.parsed && g.parsed.credit);
+    const it = { file: fname, supplier: rule.name, number: g.parsed ? (isCredit ? "Credit " : "") + (g.parsed.number || "") : "", aroflo: "", xero: "", xeroNote: "" };
     items.push(it);
     if (g.big) { failed.push(`${fname} is over 3.5 MB`); allOk = false; continue; }
     if (g.bad) { failed.push(`${fname} could not be read`); allOk = false; continue; }
@@ -6299,7 +6358,7 @@ async function invProcessHit(env, actor, addr, rule, hit, inFolder, redo) {
     if (await done(key + ".xero")) { it.xero = "already done"; inXero = true; }
     else {
       let x = { ok: false, note: "the PDF could not be read" };
-      try { if (g.parsed) x = await xeroBillFromPdf(env, rule, g.buf, fname, g.parsed); } catch (e) { x = { ok: false, note: String(e && e.message || e).slice(0, 600) }; }
+      try { if (g.parsed) x = isCredit ? await xeroCreditFromPdf(env, rule, g.buf, fname, g.parsed) : await xeroBillFromPdf(env, rule, g.buf, fname, g.parsed); } catch (e) { x = { ok: false, note: String(e && e.message || e).slice(0, 600) }; }
       if (x.ok && x.status === "AUTHORISED") { await mark(key + ".xero", "approved"); it.xero = "approved"; it.xeroNote = x.note || ""; inXero = true; }
       else if (x.ok && x.status === "EXISTS") { await mark(key + ".xero", "exists"); it.xero = "already in Xero"; inXero = true; }
       else if (x.ok) { await mark(key + ".xero", "draft"); it.xero = "draft"; it.xeroNote = x.note || ""; inXero = true; }
@@ -6307,7 +6366,7 @@ async function invProcessHit(env, actor, addr, rule, hit, inFolder, redo) {
     }
     // AroFlo only once the bill is in Xero. If Xero failed, this invoice has been sent nowhere.
     if (!inXero) it.aroflo = "not sent";
-    else if (rule.xeroOnly) it.aroflo = "not needed";
+    else if (rule.xeroOnly || isCredit) it.aroflo = "not needed";
     else if (await done(key + ".aroflo")) it.aroflo = "already sent";
     else { try { await mailAttachment(env, actor, aroflo, fname, "application/pdf", b64); await mark(key + ".aroflo", "sent"); it.aroflo = "sent"; } catch (e) { allOk = false; it.aroflo = "failed"; failed.push(`AroFlo: ${String(e.message || "").slice(0, 80)}`); } }
   }
@@ -6405,7 +6464,7 @@ async function invFolderHits(env, addr, folderId) {
     const rule = invMatchRule(m);
     if (!rule) continue;
     const cats = (m.categories || []).map((c) => String(c).toLowerCase());
-    if (cats.includes("error!") || cats.includes("credit")) continue;
+    if (cats.includes("error!") || (cats.includes("credit") && !rule.creditNotes)) continue;
     hits.push({ m, rule });
   }
   hits.sort((a, b) => a.rule.name.localeCompare(b.rule.name) || String(a.m.receivedDateTime).localeCompare(String(b.m.receivedDateTime)));
@@ -6461,7 +6520,7 @@ async function invRulesSync(env) {
   const addr = mailAddress(env, MAILBOXES.find((x) => x.id === "accounts"));
   const folderId = await invFolderId(env, addr);
   if (!folderId) return;
-  const sig = invHash(JSON.stringify(INVOICE_MAIL_RULES.map((r) => [r.name, r.from || "", r.fromDomain || "", r.subject])) + folderId);
+  const sig = invHash(JSON.stringify(INVOICE_MAIL_RULES.map((r) => [r.name, r.from || "", r.fromDomain || "", r.subject, r.alsoSubject || []])) + folderId);
   const row = await env.DB.prepare("SELECT detail FROM app_settings WHERE key = 'invmail.rules_sync'").first();
   if (row && row.detail === sig) return;
   const base = `/users/${encodeURIComponent(addr)}/mailFolders/inbox/messageRules`;
@@ -6474,7 +6533,7 @@ async function invRulesSync(env) {
   for (let i = 0; i < sorted.length; i++) {
     const r = sorted[i];
     const name = `Reservoir invoices: ${r.name}`;
-    const body = JSON.stringify({ displayName: name, sequence: i + 1, isEnabled: true, conditions: { senderContains: [r.from ? r.from : "@" + r.fromDomain], subjectContains: [r.subject], hasAttachments: true }, actions: { moveToFolder: folderId, stopProcessingRules: true } });
+    const body = JSON.stringify({ displayName: name, sequence: i + 1, isEnabled: true, conditions: { senderContains: [r.from ? r.from : "@" + r.fromDomain], subjectContains: [r.subject, ...(r.alsoSubject || [])], hasAttachments: true }, actions: { moveToFolder: folderId, stopProcessingRules: true } });
     const res = have[name]
       ? await graphFetch(env, `${base}/${have[name]}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body })
       : await graphFetch(env, base, { method: "POST", headers: { "Content-Type": "application/json" }, body });
@@ -8266,9 +8325,9 @@ export default {
           const r = await mailGraph(env, addr, `/mailFolders/inbox/messages?$top=${rule.fromDomain ? 50 : 25}&$select=subject,receivedDateTime,categories,from,internetMessageId&$filter=${encodeURIComponent(f)}&$orderby=receivedDateTime desc`);
           if (!r.ok) { lastErr = mailWhy(r); continue; }
           const dom = rule.fromDomain ? "@" + rule.fromDomain.toLowerCase() : "";
-          const hits = ((r.json && r.json.value) || []).filter((m) => (!dom || String((m.from && m.from.emailAddress && m.from.emailAddress.address) || "").toLowerCase().endsWith(dom)) && String(m.subject || "").toLowerCase().includes(rule.subject.toLowerCase())).slice(0, 10);
+          const hits = ((r.json && r.json.value) || []).filter((m) => (!dom || String((m.from && m.from.emailAddress && m.from.emailAddress.address) || "").toLowerCase().endsWith(dom)) && [rule.subject, ...(rule.alsoSubject || [])].some((t) => String(m.subject || "").toLowerCase().includes(t.toLowerCase()))).slice(0, 10);
           for (const hit of hits) {
-            if ((hit.categories || []).some((c) => String(c).toLowerCase() === "credit")) { credits++; continue; }
+            if (!rule.creditNotes && (hit.categories || []).some((c) => String(c).toLowerCase() === "credit")) { credits++; continue; }
             // An email Reservoir tagged ERROR! waits until the tag is removed in Outlook.
             if ((hit.categories || []).some((c) => String(c).toLowerCase() === "error!")) continue;
             const res = await invProcessHit(env, user, addr, rule, hit, false);
