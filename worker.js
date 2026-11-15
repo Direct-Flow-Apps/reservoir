@@ -6389,7 +6389,8 @@ async function invProcessHit(env, actor, addr, rule, hit, inFolder, redo) {
     if (redo === true || redo === invHash(fname)) await env.DB.prepare("DELETE FROM app_settings WHERE key IN (?, ?)").bind(key + ".xero", key + ".aroflo").run();
     // Xero first.
     let inXero = false;
-    if (await done(key + ".xero")) { it.xero = "already done"; inXero = true; }
+    // A credit note always asks Xero itself whether it is there (by its number), so a credit deleted in Xero can be done again.
+    if (!isCredit && await done(key + ".xero")) { it.xero = "already done"; inXero = true; }
     else {
       let x = { ok: false, note: "the PDF could not be read" };
       try { if (g.parsed) x = isCredit ? await xeroCreditFromPdf(env, rule, g.buf, fname, g.parsed) : await xeroBillFromPdf(env, rule, g.buf, fname, g.parsed); } catch (e) { x = { ok: false, note: String(e && e.message || e).slice(0, 600) }; }
