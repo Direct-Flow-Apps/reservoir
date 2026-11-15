@@ -3644,8 +3644,16 @@ async function xeroCreditFromPdf(env, rule, bytes, fileName, parsed) {
   const rows = ((await env.DB.prepare("SELECT contact_id, name FROM xero_contacts WHERE REPLACE(REPLACE(name_lc, char(8217), ''), char(39), '') LIKE ?").bind(`%${rule.contact.toLowerCase()}%`).all()).results) || [];
   if (rows.length !== 1) return { ok: false, note: rows.length ? `${rows.length} Xero contacts match ${rule.contact}` : `no Xero contact matches ${rule.contact}` };
   const contact = rows[0];
-  const dup = await xeroFetch(env, `api.xro/2.0/CreditNotes?where=${encodeURIComponent(`Type=="ACCPAYCREDIT" AND CreditNoteNumber=="${parsed.number}" AND Contact.ContactID==Guid("${contact.contact_id}")`)}`);
-  if (dup.ok) { const dj = await dup.json(); if ((dj.CreditNotes || []).some((c) => c.Status !== "DELETED" && c.Status !== "VOIDED")) return { ok: true, status: "EXISTS", note: "already in Xero" }; }
+  // Xero will not reuse the number of a deleted or voided credit note (it tries to edit the dead one), so a number that was deleted is saved with -2, -3 and so on, and the Reference keeps the real number.
+  let xNumber = parsed.number, reused = "";
+  for (let n = 1; n <= 6; n++) {
+    const dup = await xeroFetch(env, `api.xro/2.0/CreditNotes?where=${encodeURIComponent(`Type=="ACCPAYCREDIT" AND CreditNoteNumber=="${xNumber}" AND Contact.ContactID==Guid("${contact.contact_id}")`)}`);
+    const list = dup.ok ? (((await dup.json()).CreditNotes) || []) : [];
+    if (list.some((c) => c.Status !== "DELETED" && c.Status !== "VOIDED")) return { ok: true, status: "EXISTS", note: "already in Xero" };
+    if (!list.length) break;
+    reused = parsed.number;
+    xNumber = `${parsed.number}-${n + 1}`;
+  }
   let account = "";
   const cr = await xeroFetch(env, `api.xro/2.0/Contacts/${contact.contact_id}`);
   if (cr.ok) { const cj = await cr.json(); const c = (cj.Contacts || [])[0] || {}; account = String(c.PurchasesDefaultAccountCode || (c.PurchasesDefaultAccount && c.PurchasesDefaultAccount.Code) || ""); }
@@ -3653,7 +3661,7 @@ async function xeroCreditFromPdf(env, rule, bytes, fileName, parsed) {
   const make = async (status) => {
     const line = { Description: parsed.refInv ? `Credit: Original invoice ${parsed.refInv}` : `${rule.name} Credit`, Quantity: 1, UnitAmount: parsed.inc, TaxType: parsed.gst === 0 ? "EXEMPTEXPENSES" : "INPUT" };
     if (account) line.AccountCode = account;
-    const body = { CreditNotes: [{ Type: "ACCPAYCREDIT", Contact: { ContactID: contact.contact_id }, CreditNoteNumber: parsed.number, Date: parsed.date, LineAmountTypes: "Inclusive", Status: status, LineItems: [line] }] };
+    const body = { CreditNotes: [{ Type: "ACCPAYCREDIT", Contact: { ContactID: contact.contact_id }, CreditNoteNumber: xNumber, Reference: parsed.number, Date: parsed.date, LineAmountTypes: "Inclusive", Status: status, LineItems: [line] }] };
     return xeroFetch(env, "api.xro/2.0/CreditNotes?summarizeErrors=false", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
   };
   const created = async (status) => {
@@ -3687,7 +3695,7 @@ async function xeroCreditFromPdf(env, rule, bytes, fileName, parsed) {
       }
     } catch (e) { alloc = "unallocated (" + String(e && e.message || e).slice(0, 80) + ")"; }
   } else if (!parsed.refInv) alloc = "unallocated, no original invoice on the credit note";
-  return { ok: true, status: cn.Status, id: cn.CreditNoteID, note: [status === "DRAFT" && why ? `left as draft (${why})` : "", `credit note ${parsed.number}, total ${cn.Total}`, alloc, attached].filter(Boolean).join(". ") };
+  return { ok: true, status: cn.Status, id: cn.CreditNoteID, note: [status === "DRAFT" && why ? `left as draft (${why})` : "", `credit note ${xNumber}${reused ? ` (${reused} was used by a deleted credit note)` : ""}, total ${cn.Total}`, alloc, attached].filter(Boolean).join(". ") };
 }
 const INVOICE_MAIL_RULES = [
   { name: "Burnett's", from: "burnetts-noreply@mail.myframeworks.com.au", subject: "BURNETTS PLUMBING SUPPLIES INVOICE", contact: "burnett", account: "", parse: (b) => burnettsParse(b) },
