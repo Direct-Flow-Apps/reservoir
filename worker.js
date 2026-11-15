@@ -4242,7 +4242,7 @@ async function mailRoutes(request, env, user, url) {
         }
         return made.ok && made.json && made.json.id ? reply(env, 200, { ok: true, draftId: made.json.id, worker: WORKER_BUILD }) : done(made);
       }
-      if (act === "discarddraft" && msg) return done(await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}/permanentDelete`, "POST"));
+      if ((act === "discarddraft" || act === "purge") && msg) return done(await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}/permanentDelete`, "POST"));
     }
   } catch (e) { return reply(env, 200, { ok: false, error: String(e && e.message || e).slice(0, 160), worker: WORKER_BUILD }); }
   return reply(env, 404, { error: "not found" });
