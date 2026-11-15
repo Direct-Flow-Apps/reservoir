@@ -3675,7 +3675,9 @@ async function xeroCreditFromPdf(env, rule, bytes, fileName, parsed) {
   let status = "AUTHORISED";
   let why = account ? "" : "no purchases account set for the contact";
   let r = account ? await created("AUTHORISED") : { err: why };
+  if (r.err && /valid status/i.test(r.err)) { xNumber = `${parsed.number}-2`; reused = parsed.number; why = ""; r = await created("AUTHORISED"); }
   if (r.err) { why = r.err; status = "DRAFT"; r = await created("DRAFT"); }
+  if (r.err && /valid status/i.test(r.err) && xNumber === parsed.number) { xNumber = `${parsed.number}-2`; reused = parsed.number; r = await created("DRAFT"); }
   if (r.err) return { ok: false, note: `${why ? why + ". " : ""}${r.err}`.slice(0, 220) };
   const cn = r.cn;
   let attached = "";
