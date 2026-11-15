@@ -3654,12 +3654,35 @@ async function xeroCreditFromPdf(env, rule, bytes, fileName, parsed) {
   const rows = ((await env.DB.prepare("SELECT contact_id, name FROM xero_contacts WHERE REPLACE(REPLACE(name_lc, char(8217), ''), char(39), '') LIKE ?").bind(`%${rule.contact.toLowerCase()}%`).all()).results) || [];
   if (rows.length !== 1) return { ok: false, note: rows.length ? `${rows.length} Xero contacts match ${rule.contact}` : `no Xero contact matches ${rule.contact}` };
   const contact = rows[0];
+  // Allocate to the original invoice only when it is in Xero, approved and still owing at least the credit. Paid, short, or not in Xero: the credit stays unallocated.
+  const allocate = async (cn) => {
+    if (!parsed.refInv) return "unallocated, no original invoice on the credit note";
+    if (cn.Status !== "AUTHORISED") return `unallocated, the credit note is ${String(cn.Status || "not approved").toLowerCase()}`;
+    try {
+      const ir = await xf(env, `api.xro/2.0/Invoices?where=${encodeURIComponent(`Type=="ACCPAY" AND InvoiceNumber=="${parsed.refInv}" AND Contact.ContactID==Guid("${contact.contact_id}")`)}`);
+      if (!ir.ok) return `unallocated (Xero invoice lookup ${ir.status})`;
+      const inv = (((await ir.json()).Invoices) || []).find((i) => i.Status !== "DELETED" && i.Status !== "VOIDED");
+      if (!inv) return `unallocated, original invoice ${parsed.refInv} is not in Xero`;
+      if (inv.Status !== "AUTHORISED") return `unallocated, original invoice ${parsed.refInv} is ${String(inv.Status).toLowerCase()}`;
+      if (!(Number(inv.AmountDue) > 0)) return `unallocated, original invoice ${parsed.refInv} is paid`;
+      if (Number(inv.AmountDue) < parsed.inc - 0.005) return `unallocated, original invoice ${parsed.refInv} only has ${inv.AmountDue} owing`;
+      const ar = await xf(env, `api.xro/2.0/CreditNotes/${cn.CreditNoteID}/Allocations`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ Allocations: [{ Amount: parsed.inc, Date: parsed.date, Invoice: { InvoiceID: inv.InvoiceID } }] }) });
+      return ar.ok ? `allocated to invoice ${parsed.refInv}` : `unallocated (Xero ${ar.status}: ${String(await ar.text()).replace(/\s+/g, " ").slice(0, 100)})`;
+    } catch (e) { return "unallocated (" + String(e && e.message || e).slice(0, 80) + ")"; }
+  };
   // Xero will not reuse the number of a deleted or voided credit note (it tries to edit the dead one), so a number that was deleted is saved with -2, -3 and so on, and the Reference keeps the real number.
   let xNumber = parsed.number, reused = "";
   for (let n = 1; n <= 6; n++) {
     const dup = await xf(env, `api.xro/2.0/CreditNotes?where=${encodeURIComponent(`Type=="ACCPAYCREDIT" AND CreditNoteNumber=="${xNumber}" AND Contact.ContactID==Guid("${contact.contact_id}")`)}`);
     const list = dup.ok ? (((await dup.json()).CreditNotes) || []) : [];
-    if (list.some((c) => c.Status !== "DELETED" && c.Status !== "VOIDED")) return { ok: true, status: "EXISTS", note: "already in Xero" };
+    const live = list.find((c) => c.Status !== "DELETED" && c.Status !== "VOIDED");
+    if (live) {
+      // Already there. If it was never allocated and still has all its credit left, allocate it now.
+      let more = "";
+      if (parsed.refInv && live.Status === "AUTHORISED" && Number(live.RemainingCredit) >= parsed.inc - 0.005) more = await allocate(live);
+      else if (parsed.refInv && Number(live.RemainingCredit) < parsed.inc - 0.005) more = "already allocated";
+      return { ok: true, status: "EXISTS", note: ["already in Xero", more].filter(Boolean).join(". ") };
+    }
     if (!list.length) break;
     reused = parsed.number;
     xNumber = `${parsed.number}-${n + 1}`;
@@ -3703,20 +3726,7 @@ async function xeroCreditFromPdf(env, rule, bytes, fileName, parsed) {
   let attached = "";
   const at = await xf(env, `api.xro/2.0/CreditNotes/${cn.CreditNoteID}/Attachments/${encodeURIComponent(fileName)}`, { method: "PUT", headers: { "Content-Type": "application/pdf" }, body: bytes });
   if (!at.ok) attached = `PDF not attached (Xero ${at.status}: ${String(await at.text()).replace(/\s+/g, " ").slice(0, 120)})`;
-  // Allocate to the original invoice only when it is in Xero, approved and still owing at least the credit. Paid, part paid below the credit, or not in Xero: the credit stays unallocated.
-  let alloc = "";
-  if (parsed.refInv && cn.Status === "AUTHORISED") {
-    try {
-      const ir = await xf(env, `api.xro/2.0/Invoices?where=${encodeURIComponent(`Type=="ACCPAY" AND InvoiceNumber=="${parsed.refInv}" AND Contact.ContactID==Guid("${contact.contact_id}")`)}`);
-      const inv = ir.ok ? (((await ir.json()).Invoices) || []).find((i) => i.Status !== "DELETED" && i.Status !== "VOIDED") : null;
-      if (!inv) alloc = `unallocated, original invoice ${parsed.refInv} is not in Xero`;
-      else if (inv.Status !== "AUTHORISED" || !(Number(inv.AmountDue) >= parsed.inc - 0.005)) alloc = `unallocated, original invoice ${parsed.refInv} is ${inv.Status === "PAID" || !(Number(inv.AmountDue) > 0) ? "paid" : "not open for the full credit"}`;
-      else {
-        const ar = await xf(env, `api.xro/2.0/CreditNotes/${cn.CreditNoteID}/Allocations`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ Allocations: [{ Amount: parsed.inc, Date: parsed.date, Invoice: { InvoiceID: inv.InvoiceID } }] }) });
-        alloc = ar.ok ? `allocated to invoice ${parsed.refInv}` : `unallocated (Xero ${ar.status}: ${String(await ar.text()).replace(/\s+/g, " ").slice(0, 100)})`;
-      }
-    } catch (e) { alloc = "unallocated (" + String(e && e.message || e).slice(0, 80) + ")"; }
-  } else if (!parsed.refInv) alloc = "unallocated, no original invoice on the credit note";
+  const alloc = await allocate(cn);
   return { ok: true, status: cn.Status, id: cn.CreditNoteID, note: [status === "DRAFT" && why ? `left as draft (${why})` : "", `credit note ${xNumber}${reused ? ` (${reused} was used by a deleted credit note)` : ""}, total ${cn.Total}`, alloc, attached].filter(Boolean).join(". ") };
 }
 const INVOICE_MAIL_RULES = [
@@ -6446,7 +6456,7 @@ async function invProcessHit(env, actor, addr, rule, hit, inFolder, redo) {
       let x = { ok: false, note: "the PDF could not be read" };
       try { if (g.parsed) x = isCredit ? await xeroCreditFromPdf(env, rule, g.buf, fname, g.parsed) : await xeroBillFromPdf(env, rule, g.buf, fname, g.parsed); } catch (e) { x = { ok: false, note: String(e && e.message || e).slice(0, 600) }; }
       if (x.ok && x.status === "AUTHORISED") { await mark(key + ".xero", "approved"); it.xero = "approved"; it.xeroNote = x.note || ""; inXero = true; }
-      else if (x.ok && x.status === "EXISTS") { await mark(key + ".xero", "exists"); it.xero = "already in Xero"; inXero = true; }
+      else if (x.ok && x.status === "EXISTS") { await mark(key + ".xero", "exists"); it.xero = "already in Xero"; if (isCredit) it.xeroNote = String(x.note || "").replace(/^already in Xero\.? ?/, ""); inXero = true; }
       else if (x.ok) { await mark(key + ".xero", "draft"); it.xero = "draft"; it.xeroNote = x.note || ""; inXero = true; }
       else { it.xero = "failed"; it.xeroNote = x.note || ""; allOk = false; }
     }
