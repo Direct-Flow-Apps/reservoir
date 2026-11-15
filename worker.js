@@ -6467,8 +6467,10 @@ async function invRetry(env, actor, id) {
     await env.DB.prepare("DELETE FROM app_settings WHERE key = ?").bind(lock).run().catch(() => null);
   }
 }
-// Emails waiting in the Reservoir folder, matched to a supplier rule, in supplier order (A to Z).
-async function invFolderHits(env, addr, folderId) {
+// A Samios credit note email. These are only ever done by hand from the Credits test button, never by the automatic runs or the normal invoice press.
+const invIsCreditMail = (m, rule) => !!(rule && rule.creditNotes && /credit note/i.test(String(m.subject || "")));
+// Emails waiting in the Reservoir folder, matched to a supplier rule, in supplier order (A to Z). creditsOnly gives just the credit notes, otherwise credit notes are left out.
+async function invFolderHits(env, addr, folderId, creditsOnly) {
   const f = "receivedDateTime ge 1900-01-01T00:00:00Z and hasAttachments eq true";
   const r = await mailGraph(env, addr, `/mailFolders/${folderId}/messages?$top=50&$select=subject,receivedDateTime,categories,from,internetMessageId&$filter=${encodeURIComponent(f)}&$orderby=receivedDateTime desc`);
   if (!r.ok) return { err: mailWhy(r), hits: [] };
@@ -6478,6 +6480,7 @@ async function invFolderHits(env, addr, folderId) {
     if (!rule) continue;
     const cats = (m.categories || []).map((c) => String(c).toLowerCase());
     if (cats.includes("error!") || (cats.includes("credit") && !rule.creditNotes)) continue;
+    if (invIsCreditMail(m, rule) !== !!creditsOnly) continue;
     hits.push({ m, rule });
   }
   hits.sort((a, b) => a.rule.name.localeCompare(b.rule.name) || String(a.m.receivedDateTime).localeCompare(String(b.m.receivedDateTime)));
@@ -8319,9 +8322,10 @@ export default {
         await invHistoryTable(env);
         let credits = 0;
         let lastErr = "";
+        const creditsOnly = url.searchParams.get("credits") === "1";
         const folderId = await invFolderId(env, addr);
         if (folderId) {
-          const fh = await invFolderHits(env, addr, folderId);
+          const fh = await invFolderHits(env, addr, folderId, creditsOnly);
           if (fh.err) lastErr = fh.err;
           for (const { m, rule } of fh.hits) {
             if (!(await invClaim(env, "invmail.claim." + invHash(m.internetMessageId || m.id)))) continue;
@@ -8340,6 +8344,7 @@ export default {
           const dom = rule.fromDomain ? "@" + rule.fromDomain.toLowerCase() : "";
           const hits = ((r.json && r.json.value) || []).filter((m) => (!dom || String((m.from && m.from.emailAddress && m.from.emailAddress.address) || "").toLowerCase().endsWith(dom)) && [rule.subject, ...(rule.alsoSubject || [])].some((t) => String(m.subject || "").toLowerCase().includes(t.toLowerCase()))).slice(0, 10);
           for (const hit of hits) {
+            if (invIsCreditMail(hit, rule) !== creditsOnly) continue;
             if (!rule.creditNotes && (hit.categories || []).some((c) => String(c).toLowerCase() === "credit")) { credits++; continue; }
             // An email Reservoir tagged ERROR! waits until the tag is removed in Outlook.
             if ((hit.categories || []).some((c) => String(c).toLowerCase() === "error!")) continue;
