@@ -4201,6 +4201,13 @@ async function mailRoutes(request, env, user, url) {
       if (!res.ok) return new Response(null, { status: 404, headers: cors(env) });
       return new Response(res.body, { status: 200, headers: { ...cors(env), "Content-Type": res.headers.get("Content-Type") || "image/jpeg", "Cache-Control": "private, max-age=3600" } });
     }
+    if (url.pathname === "/api/mail/attlink" && !post) {
+      const lm = mailId(url.searchParams.get("msg")), la = mailId(url.searchParams.get("att"));
+      if (!lm || !la) return reply(env, 400, { error: "bad request" });
+      const le = Date.now() + 120000;
+      const ls = await xeroSign(env, `dl|${addr}|${lm}|${la}|${le}`);
+      return reply(env, 200, { ok: true, url: `${new URL(request.url).origin}/api/mail/dl?b=${encodeURIComponent(addr)}&m=${encodeURIComponent(lm)}&a=${encodeURIComponent(la)}&e=${le}&s=${encodeURIComponent(ls)}&n=${encodeURIComponent(String(url.searchParams.get("n") || "attachment"))}`, worker: WORKER_BUILD });
+    }
     if (url.pathname === "/api/mail/attachment" && !post) {
       const msg = mailId(url.searchParams.get("msg")), att = mailId(url.searchParams.get("att"));
       if (!msg || !att) return reply(env, 400, { error: "bad request" });
@@ -6706,6 +6713,18 @@ export default {
     let env = rawEnv;
     if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: cors(env) });
     const earlyUrl = new URL(request.url);
+    if (earlyUrl.pathname === "/api/mail/dl" && request.method === "GET") {
+      // A short-lived signed link, so an attachment can be dragged out of the browser into another program. Valid for two minutes.
+      const q = earlyUrl.searchParams;
+      const dlAddr = String(q.get("b") || "").toLowerCase(), dlMsg = mailId(q.get("m")), dlAtt = mailId(q.get("a")), dlExp = Number(q.get("e") || 0);
+      if (!/^[a-z0-9._-]+@directflow\.com\.au$/.test(dlAddr) || !dlMsg || !dlAtt || !dlExp || dlExp < Date.now() || dlExp > Date.now() + 600000) return new Response("Link expired", { status: 410, headers: cors(env) });
+      const want = await xeroSign(env, `dl|${dlAddr}|${dlMsg}|${dlAtt}|${dlExp}`);
+      if (want !== q.get("s")) return new Response("Forbidden", { status: 403, headers: cors(env) });
+      const dlRes = await graphFetch(env, `/users/${encodeURIComponent(dlAddr)}/messages/${encodeURIComponent(dlMsg)}/attachments/${encodeURIComponent(dlAtt)}/$value`);
+      if (!dlRes.ok) return new Response("Not found", { status: 404, headers: cors(env) });
+      const nm = String(q.get("n") || "attachment").replace(/[\r\n"\\/]/g, "_").slice(0, 120);
+      return new Response(dlRes.body, { status: 200, headers: { ...cors(env), "Content-Type": dlRes.headers.get("Content-Type") || "application/octet-stream", "Content-Disposition": `attachment; filename="${nm}"`, "Cache-Control": "no-store" } });
+    }
     if (earlyUrl.pathname === "/api/ping" && request.method === "GET") return reply(env, 200, { worker: WORKER_BUILD, xeroMe: true, xeroStaff: true });
     if (earlyUrl.pathname === "/api/invoices/notify" && request.method === "POST") {
       // Microsoft pings here when mail lands in the Reservoir folder. The first call after the registration is made carries a validation token that must be echoed back.
