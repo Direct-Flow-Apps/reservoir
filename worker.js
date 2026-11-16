@@ -5289,7 +5289,7 @@ async function pushLoadBiz(env) {
   return PUSH_BIZ;
 }
 const bizText = (w) => { const f = (m) => `${String(Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`; return { start: f(w[0]), end: f(w[1]) }; };
-const pushModeOf = (row) => (row && row.hours_mode && Object.prototype.hasOwnProperty.call(PUSH_MODES, row.hours_mode)) ? row.hours_mode : (row && row.all_hours ? "24" : "default");
+const pushModeOf = (row) => (row && row.tier && row.tier !== "T1" && row.tier !== "T2") ? "default" : (row && row.hours_mode && Object.prototype.hasOwnProperty.call(PUSH_MODES, row.hours_mode)) ? row.hours_mode : (row && row.all_hours ? "24" : "default");
 function pushInHours(mode, d) {
   let w = PUSH_MODES[mode || "default"];
   if (w === "biz") w = PUSH_BIZ;
@@ -5420,6 +5420,12 @@ async function pushRoutes(request, env, user, url) {
   if (url.pathname === "/api/push/unsubscribe") {
     await env.DB.prepare("DELETE FROM push_subs WHERE endpoint = ? AND email = ?").bind(String(body.endpoint || ""), email).run();
     return reply(env, 200, { ok: true });
+  }
+  if (url.pathname === "/api/push/test" && body.silent) {
+    const row = await env.DB.prepare("SELECT * FROM push_subs WHERE endpoint = ? AND email = ?").bind(String(body.endpoint || ""), email).first();
+    if (!row) return reply(env, 200, { silent: true, sent: 0, missing: true });
+    const r = await pushSendOne(env, row, { test: String(body.id || "").slice(0, 40), title: "Reservoir", body: "Checking notifications", tag: "launch-test" });
+    return reply(env, 200, { silent: true, sent: r === "sent" ? 1 : 0, result: r });
   }
   if (url.pathname === "/api/push/test") {
     const rows = ((await env.DB.prepare("SELECT * FROM push_subs WHERE email = ?").bind(email).all()).results) || [];

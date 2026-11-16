@@ -4,6 +4,16 @@ self.addEventListener("activate", (e) => e.waitUntil(self.clients.claim()));
 self.addEventListener("push", (e) => {
   let d = {};
   try { d = e.data ? e.data.json() : {}; } catch (err) { d = {}; }
+  if (d.test) {
+    e.waitUntil((async () => {
+      const all = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
+      all.forEach((c) => { try { c.postMessage({ type: "push-ack", id: d.test }); } catch (err) {} });
+      await self.registration.showNotification("Reservoir", { body: "Checking notifications", tag: "launch-test", silent: true, icon: "icon-192.png", badge: "icon-192.png" });
+      const n = await self.registration.getNotifications({ tag: "launch-test" });
+      n.forEach((x) => x.close());
+    })());
+    return;
+  }
   e.waitUntil(self.registration.showNotification(d.title || "Reservoir", {
     body: d.body || "Open Reservoir",
     tag: d.tag || undefined,
