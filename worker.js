@@ -4164,7 +4164,7 @@ async function mailRoutes(request, env, user, url) {
     if (url.pathname === "/api/mail/categories" && !post) {
       const r = await mailGraph(env, addr, "/outlook/masterCategories");
       if (!r.ok) return reply(env, 200, { ok: false, error: mailWhy(r), worker: WORKER_BUILD });
-      return reply(env, 200, { ok: true, categories: ((r.json && r.json.value) || []).map((c) => ({ name: String(c.displayName || "").slice(0, 40), color: String(c.color || "") })), worker: WORKER_BUILD });
+      return reply(env, 200, { ok: true, categories: ((r.json && r.json.value) || []).map((c) => ({ id: String(c.id || ""), name: String(c.displayName || "").slice(0, 40), color: String(c.color || "") })), worker: WORKER_BUILD });
     }
     if (url.pathname === "/api/mail/contacts" && !post) {
       const q = String(url.searchParams.get("q") || "").replace(/['"\\]/g, " ").trim().slice(0, 60);
@@ -4232,6 +4232,23 @@ async function mailRoutes(request, env, user, url) {
       const act = url.pathname.replace("/api/mail/", "");
       const msg = mailId(body && body.msg);
       const done = (r) => r.ok ? reply(env, 200, { ok: true, worker: WORKER_BUILD }) : reply(env, 200, { ok: false, error: mailWhy(r, true), worker: WORKER_BUILD });
+      if (act === "catadd") {
+        const nm = String(body.name || "").replace(/\s+/g, " ").trim().slice(0, 40);
+        if (!nm) return reply(env, 200, { ok: false, error: "Give the category a name.", worker: WORKER_BUILD });
+        const col = /^preset\d{1,2}$/.test(String(body.color || "")) ? String(body.color) : "preset7";
+        return done(await mailDo(env, addr, "/outlook/masterCategories", "POST", { displayName: nm, color: col }));
+      }
+      if (act === "catcolor") {
+        const cid = mailId(body.catid);
+        const col = /^preset\d{1,2}$/.test(String(body.color || "")) ? String(body.color) : "";
+        if (!cid || !col) return reply(env, 200, { ok: false, error: "Choose a colour.", worker: WORKER_BUILD });
+        return done(await mailDo(env, addr, `/outlook/masterCategories/${encodeURIComponent(cid)}`, "PATCH", { color: col }));
+      }
+      if (act === "catdel") {
+        const cid = mailId(body.catid);
+        if (!cid) return reply(env, 200, { ok: false, error: "Choose a category.", worker: WORKER_BUILD });
+        return done(await mailDo(env, addr, `/outlook/masterCategories/${encodeURIComponent(cid)}`, "DELETE"));
+      }
       if (act === "read" && msg) return done(await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}`, "PATCH", { isRead: !!body.read }));
       if (act === "archive" && msg) { const ar = await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}/move`, "POST", { destinationId: "archive" }); return ar.ok ? reply(env, 200, { ok: true, newId: String((ar.json && ar.json.id) || ""), worker: WORKER_BUILD }) : done(ar); }
       if (act === "movefolder" && msg) {
@@ -4806,7 +4823,8 @@ async function arofloRoutes(request, env, user, url) {
       const idOf = (rec) => String(rec && (rec.id ?? rec.projectId ?? rec.taskId ?? rec.ID) || "");
       const numOf = (rec) => { const sh = arofloShape(rec); return sh.number; };
       let coll = "", rec = null, id = "";
-      for (const c of ["/tasks", "/projects", "/jobs"]) {
+      const forced = /^\/(tasks|projects|jobs)$/.test(String(url.searchParams.get("coll") || "")) ? String(url.searchParams.get("coll")) : "";
+      for (const c of forced ? [forced] : ["/tasks", "/projects", "/jobs"]) {
         const r = await arofloGet(env, `${c}/${encodeURIComponent(want)}`);
         steps.push(`${c}/${want} answered ${r.status}`);
         if (r.ok && r.json && typeof r.json === "object") { coll = c; rec = (r.json.data && typeof r.json.data === "object" && !Array.isArray(r.json.data)) ? r.json.data : r.json; id = idOf(rec) || want; break; }
@@ -4856,12 +4874,12 @@ async function arofloRoutes(request, env, user, url) {
           const person = (pre) => [get(new RegExp(`${pre}.*givenName$`, "i")), get(new RegExp(`${pre}.*familyName$`, "i"))].filter(Boolean).join(" ");
           const plain = (h) => String(h || "").replace(/<br\s*\/?>/gi, "\n").replace(/<\/p>\s*<p[^>]*>/gi, "\n").replace(/<[^>]+>/g, "").replace(/&nbsp;/g, " ").replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/\n{3,}/g, "\n\n").trim();
           if (seg === "notes") return { text: plain(get(/(^|\.)content$/i)), by: person("postedBy"), when: get(/(timestampCreated|created)/i), fields: [] };
-          return { id: (flat.find(([k]) => k === "id") || [])[1] || "", name: get(/(^|\.)displayName$/i) || get(/(^|\.)name$/i), fileName: get(/(^|\.)fileName$/i), by: person("insertedByUser"), when: get(/datetimeInserted/i), original: get(/(^|\.)original$/i), thumbnail: get(/(^|\.)thumbnail$/i), type: get(/documentType/i), size: Number(get(/fileSizeBytes/i)) || 0, fields: [] };
+          return { id: (flat.find(([k]) => k === "id") || [])[1] || "", name: get(/(^|\.)displayName$/i) || get(/(^|\.)name$/i), fileName: get(/(^|\.)fileName$/i), by: person("insertedByUser"), when: get(/datetimeInserted/i), original: get(/(^|\.)original$/i), thumbnail: get(/(^|\.)thumbnail$/i), type: get(/documentType/i), size: Number(get(/fileSizeBytes/i)) || 0, filter: flat.filter(([k, v]) => /(filter|visib|internal|contractor|permission|access|scope)/i.test(k) && v !== "" && v !== "(empty list)").map(([k, v]) => `${k.slice(k.lastIndexOf(".") + 1)} ${String(v).slice(0, 40)}`).join(", "), fields: flat.filter(([k, v]) => v !== "" && v !== "(empty list)" && !/(thumbnail|original|insertedByUser)/i.test(k)).slice(0, 30).map(([k, v]) => `${k}: ${String(v).slice(0, 60)}`) };
         });
       }
       const nameFlat = jobFlat.filter(([k, v]) => v !== "" && v !== "(empty list)");
       const taskNameF = nameFlat.find(([k]) => /^(taskName|name|title|summary|description)$/i.test(k)) || nameFlat.find(([k]) => /(^|\.)(taskName|title|summary)$/i.test(k));
-      return reply(env, 200, { ok: true, collection: coll, id, taskName: taskNameF ? String(taskNameF[1]).slice(0, 200) : "", number: shape.number || want, client: bestName ? String(bestName[1]) : shape.client, address: siteAddress || shape.address, fields: jobFlat.slice(0, 120), notes: subs.notes || [], documents: subs.documents || subs.attachments || subs.files || subs.photos || [], haveNotes: !!subs.notes, haveDocs: !!(subs.documents || subs.attachments || subs.files || subs.photos), steps, worker: WORKER_BUILD });
+      return reply(env, 200, { ok: true, collection: coll, id, taskName: taskNameF ? String(taskNameF[1]).slice(0, 200) : "", description: (() => { const d = nameFlat.find(([k]) => /(^|\.)(description|details|summary|jobDescription|taskDescription)$/i.test(k) && !/(photo|document|note)/i.test(k)); return d ? String(d[1]).replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim().slice(0, 300) : ""; })(), number: shape.number || want, client: bestName ? String(bestName[1]) : shape.client, address: siteAddress || shape.address, fields: jobFlat.slice(0, 120), notes: subs.notes || [], documents: subs.documents || subs.attachments || subs.files || subs.photos || [], haveNotes: !!subs.notes, haveDocs: !!(subs.documents || subs.attachments || subs.files || subs.photos), steps, worker: WORKER_BUILD });
     }
     // One project pulled raw. Lists every field AroFlo sends for it.
     if (url.pathname === "/api/aroflo/project") {
