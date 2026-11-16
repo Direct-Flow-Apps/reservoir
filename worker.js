@@ -5344,6 +5344,21 @@ async function noticesTable(env) {
       await migMark(env, "tayler_notices_reset_v1", `${d && d.meta ? d.meta.changes : 0} notices removed`);
     } catch (e) { /* tried again on the next start */ }
   }
+  // One time, 17 November 2026: Tayler's remaining policy notices go too, as he asked while testing.
+  if (!(await migDone(env, "tayler_notices_reset_v2"))) {
+    try {
+      const d = await env.DB.prepare("DELETE FROM notices WHERE lower(to_email) = 'tayler@directflow.com.au'").run();
+      await migMark(env, "tayler_notices_reset_v2", `${d && d.meta ? d.meta.changes : 0} notices removed`);
+    } catch (e) { /* tried again on the next start */ }
+  }
+  // One time, 17 November 2026: Mitch's two reimbursements from 16 November go back to waiting so they can be processed again and sent to Xero.
+  if (!(await migDone(env, "mitch_reimb_reopen_v1"))) {
+    try {
+      await receiptRecordsTable(env);
+      const d = await env.DB.prepare("UPDATE receipt_records SET status = 'submitted', done_date = '' WHERE type = 'reimbursement' AND lower(by_email) LIKE 'mitch%' AND sent_date = '2026-11-16'").run();
+      await migMark(env, "mitch_reimb_reopen_v1", `${d && d.meta ? d.meta.changes : 0} reimbursements reopened`);
+    } catch (e) { /* tried again on the next start */ }
+  }
   // One time: the timesheet notices that were kept on their own are brought across.
   if (!(await migDone(env, "ts_notices_to_notices_v1"))) {
     try {
