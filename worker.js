@@ -4011,6 +4011,9 @@ async function mailDraftSend(env, addr, msg, op, text, to, extra) {
   const html = /<body[^>]*>/i.test(old) ? old.replace(/<body[^>]*>/i, (m) => m + mine) : mine + old;
   const patch = { body: { contentType: "HTML", content: html } };
   if (to && to.length) patch.toRecipients = to;
+  else if (x.setTo) { const t = mailRecipients(x.to); if (t.length) patch.toRecipients = t; }
+  if (x.setTo) { patch.ccRecipients = mailRecipients(x.cc); patch.bccRecipients = mailRecipients(x.bcc); }
+  else if (x.bcc) patch.bccRecipients = mailRecipients(x.bcc);
   if (x.importance === "high") patch.importance = "high";
   const at = mailWhenOk(x.sendAt);
   if (at) patch.singleValueExtendedProperties = [{ id: "SystemTime 0x3FEF", value: at }];
