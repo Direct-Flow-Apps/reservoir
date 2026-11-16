@@ -4458,7 +4458,10 @@ async function arofloRoutes(request, env, user, url) {
           ["json base64 displayName and base64", up, J, JSON.stringify({ displayName: name, fileName: name, base64: b64 })],
           ["json base64 with content type", up, J, JSON.stringify({ name, fileName: name, contentType: type, mimeType: type, data: b64, content: b64 })]
         ];
-        for (const [lab, p, h, b] of tries) { if (ok) break; ok = await tryIt(`photo, ${lab}, POST`, p, { method: "POST", headers: h, body: b }); }
+        // This body is the one AroFlo answers 201 to. A 201 is the upload, so it counts without a second look at the job's list, which does not always show the new name straight away.
+        const win = tries.find((t) => t[0] === "json base64 displayName and base64");
+        if (win) { ok = await send2(`photo, ${win[0]}, POST`, win[1], { method: "POST", headers: win[2], body: win[3] }); }
+        for (const [lab, p, h, b] of tries) { if (ok) break; if (win && lab === win[0]) continue; ok = await tryIt(`photo, ${lab}, POST`, p, { method: "POST", headers: h, body: b }); }
       }
       return reply(env, 200, { ok, attempts, worker: WORKER_BUILD });
     }
