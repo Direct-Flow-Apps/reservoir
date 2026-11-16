@@ -5240,6 +5240,16 @@ async function noticesTable(env) {
   if (!(await migDone(env, "notices_fresh_start_w144"))) {
     try { await env.DB.prepare("DELETE FROM notices").run(); await migMark(env, "notices_fresh_start_w144", "all notices cleared"); } catch (e) { noticesReady = false; throw e; }
   }
+  // One time, 16 November 2026: Mitch's notices are cleared except the policy and handbook ones he still has to acknowledge.
+  if (!(await migDone(env, "mitch_notices_reset_v1"))) {
+    try {
+      const mx = await env.DB.prepare("SELECT lower(email) AS e FROM dfp_xero WHERE lower(name) = 'mitchell saba' AND email IS NOT NULL AND email <> '' LIMIT 1").first();
+      if (mx && mx.e) {
+        const d = await env.DB.prepare("DELETE FROM notices WHERE lower(to_email) = ? AND COALESCE(kind, '') <> 'policy'").bind(mx.e).run();
+        await migMark(env, "mitch_notices_reset_v1", `${d && d.meta ? d.meta.changes : 0} notices removed`);
+      }
+    } catch (e) { /* tried again on the next start */ }
+  }
   // One time: the timesheet notices that were kept on their own are brought across.
   if (!(await migDone(env, "ts_notices_to_notices_v1"))) {
     try {
