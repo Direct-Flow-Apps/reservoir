@@ -8626,9 +8626,12 @@ export default {
         const date = /^\d{4}-\d{2}-\d{2}$/.test(String(body.date || "")) ? body.date : today;
         await env.DB.prepare("UPDATE receipt_records SET status = ?, done_date = ? WHERE id = ?").bind(body.status, date, rrm[1]).run();
         // The person being reimbursed is told it is processed, even when the director who processed it is the one who logged it.
-        if (body.status === "paid") {
+        {
           const rr = await env.DB.prepare("SELECT by_email, type FROM receipt_records WHERE id = ?").bind(rrm[1]).first();
-          if (rr && rr.by_email && rr.type === "reimbursement") await notify(env, { to: rr.by_email, kind: "receipt", title: "Reimbursement request processed", body: "Your reimbursement has been paid. Open Receipts to see it.", link: "receipts", by: user.name || mail });
+          if (rr && rr.by_email && rr.type === "reimbursement") {
+            if (body.status === "paid") await notify(env, { to: rr.by_email, kind: "receipt", title: "Reimbursement request processed", body: "Your reimbursement has been paid. Open Receipts to see it.", link: "receipts", by: user.name || mail });
+            else await notify(env, { to: rr.by_email, kind: "receipt", title: "Reimbursement request declined", body: "Your reimbursement was not approved. Open Receipts to see it.", link: "receipts", by: user.name || mail });
+          }
         }
         return reply(env, 200, { ok: true });
       }
