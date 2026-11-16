@@ -5359,6 +5359,14 @@ async function noticesTable(env) {
       await migMark(env, "mitch_reimb_reopen_v1", `${d && d.meta ? d.meta.changes : 0} reimbursements reopened`);
     } catch (e) { /* tried again on the next start */ }
   }
+  // One time, 17 November 2026: second try, matching Mitch by first name or email, so his two reimbursements from 16 November are waiting again.
+  if (!(await migDone(env, "mitch_reimb_reopen_v2"))) {
+    try {
+      await receiptRecordsTable(env);
+      const d = await env.DB.prepare("UPDATE receipt_records SET status = 'submitted', done_date = '' WHERE type = 'reimbursement' AND status = 'paid' AND (lower(by_name) LIKE 'mitch%' OR lower(by_email) LIKE 'mitch%') AND sent_date >= '2026-11-15'").run();
+      await migMark(env, "mitch_reimb_reopen_v2", `${d && d.meta ? d.meta.changes : 0} reimbursements reopened`);
+    } catch (e) { /* tried again on the next start */ }
+  }
   // One time: the timesheet notices that were kept on their own are brought across.
   if (!(await migDone(env, "ts_notices_to_notices_v1"))) {
     try {
