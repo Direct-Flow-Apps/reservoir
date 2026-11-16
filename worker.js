@@ -5334,6 +5334,13 @@ async function noticesTable(env) {
       }
     } catch (e) { /* tried again on the next start */ }
   }
+  // One time, 17 November 2026: Tayler's notices are cleared except the policy and handbook ones he still has to acknowledge.
+  if (!(await migDone(env, "tayler_notices_reset_v1"))) {
+    try {
+      const d = await env.DB.prepare("DELETE FROM notices WHERE lower(to_email) = 'tayler@directflow.com.au' AND COALESCE(kind, '') <> 'policy'").run();
+      await migMark(env, "tayler_notices_reset_v1", `${d && d.meta ? d.meta.changes : 0} notices removed`);
+    } catch (e) { /* tried again on the next start */ }
+  }
   // One time: the timesheet notices that were kept on their own are brought across.
   if (!(await migDone(env, "ts_notices_to_notices_v1"))) {
     try {
