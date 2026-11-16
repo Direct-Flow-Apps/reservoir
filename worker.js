@@ -4006,6 +4006,19 @@ async function mailDraftSend(env, addr, msg, op, text, to, extra) {
   const made = await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}/${op}`, "POST", {});
   if (!made.ok || !made.json || !made.json.id) return made;
   const id = made.json.id;
+  // A forward carries the original's attachments. The ones taken off in the editor are removed from the draft before it goes.
+  if (op === "createForward" && Array.isArray(x.dropAtt) && x.dropAtt.length) {
+    const drop = x.dropAtt.map((n) => String(n || "").toLowerCase());
+    const list = await mailGraph(env, addr, `/messages/${encodeURIComponent(id)}/attachments?$select=id,name,isInline`);
+    const rows = list.ok && list.json && Array.isArray(list.json.value) ? list.json.value : [];
+    const left = drop.slice();
+    for (const a of rows) {
+      const k = left.indexOf(String(a.name || "").toLowerCase());
+      if (k < 0 || a.isInline) continue;
+      left.splice(k, 1);
+      await mailDo(env, addr, `/messages/${encodeURIComponent(id)}/attachments/${encodeURIComponent(a.id)}`, "DELETE");
+    }
+  }
   const old = String((made.json.body && made.json.body.content) || "");
   const mine = mailBodyHtml(x, text) + "<br>";
   const html = /<body[^>]*>/i.test(old) ? old.replace(/<body[^>]*>/i, (m) => m + mine) : mine + old;
