@@ -4221,6 +4221,12 @@ async function mailRoutes(request, env, user, url) {
       const done = (r) => r.ok ? reply(env, 200, { ok: true, worker: WORKER_BUILD }) : reply(env, 200, { ok: false, error: mailWhy(r, true), worker: WORKER_BUILD });
       if (act === "read" && msg) return done(await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}`, "PATCH", { isRead: !!body.read }));
       if (act === "archive" && msg) { const ar = await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}/move`, "POST", { destinationId: "archive" }); return ar.ok ? reply(env, 200, { ok: true, newId: String((ar.json && ar.json.id) || ""), worker: WORKER_BUILD }) : done(ar); }
+      if (act === "movefolder" && msg) {
+        const dest = mailFolderId(body.folder);
+        if (!dest) return reply(env, 200, { ok: false, error: "Choose a folder to move it to.", worker: WORKER_BUILD });
+        const mv = await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}/move`, "POST", { destinationId: dest });
+        return mv.ok ? reply(env, 200, { ok: true, newId: String((mv.json && mv.json.id) || ""), worker: WORKER_BUILD }) : done(mv);
+      }
       if (act === "moveto" && msg) {
         const tb = MAILBOXES.find((x) => x.id === String(body.target || "") && (!x.only || mailAllowed(x, user)));
         if (!tb || tb.id === box.id) return reply(env, 200, { ok: false, error: "Choose another mailbox to move it to.", worker: WORKER_BUILD });
