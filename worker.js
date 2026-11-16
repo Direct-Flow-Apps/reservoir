@@ -224,6 +224,9 @@ async function driveBytes(env, id) {
   return file.arrayBuffer();
 }
 
+// While testing, a director viewing as someone can do everything that person can. Set false before go live to make View As read only again.
+const VIEW_AS_WRITES = true;
+
 async function sendToXero(env, user, meta) {
   if (!env.XERO_BILLS_EMAIL) throw new Error("XERO_BILLS_EMAIL is not set on the Worker");
   const bytes = await driveBytes(env, meta.id);
@@ -4062,7 +4065,7 @@ async function mailRoutes(request, env, user, url) {
   if (/@directflow\.com\.au$/.test(ownEmail) && !mine.some((b) => b.only)) mine.push({ id: "me", label: "My Email", address: ownEmail, only: [ownEmail] });
   const post = request.method === "POST";
   if (request.method !== "GET" && !post) return reply(env, 404, { error: "not found" });
-  if (post && user.viewAs) return reply(env, 403, { error: "Viewing as someone else is read only." });
+  if (post && user.viewAs && !VIEW_AS_WRITES) return reply(env, 403, { error: "Viewing as someone else is read only." });
   try {
     if (url.pathname === "/api/mail/boxes" && !post) {
       const out = await Promise.all(mine.map(async (b) => {
@@ -5485,7 +5488,7 @@ async function pushRoutes(request, env, user, url) {
     return reply(env, 200, { subscribed: !!row, mode: row ? pushModeOf(row) : "", devices: n ? n.n : 0 });
   }
   if (request.method !== "POST") return reply(env, 405, { error: "method not allowed" });
-  if (user.viewAs) return reply(env, 403, { error: "Viewing as someone else is read only." });
+  if (user.viewAs && !VIEW_AS_WRITES) return reply(env, 403, { error: "Viewing as someone else is read only." });
   let body = {};
   try { body = await request.json(); } catch (e) { body = {}; }
   if (url.pathname === "/api/push/subscribe") {
@@ -6878,7 +6881,7 @@ export default {
       let v;
       try { v = JSON.parse(decodeURIComponent(viewHeader)); } catch (e) { v = null; }
       if (!v || !v.e || !["T1", "T2", "T3", "T4", "T5"].includes(v.t)) return reply(env, 400, { error: "bad view as" });
-      if (request.method !== "GET") return reply(env, 403, { error: "Viewing as someone else is read only." });
+      if (request.method !== "GET" && !VIEW_AS_WRITES) return reply(env, 403, { error: "Viewing as someone else is read only." });
       console.log("view as", user.email, "->", String(v.e).toLowerCase(), v.t);
       user = { tier: v.t, name: String(v.n || ""), email: String(v.e).toLowerCase(), viewAs: true, realUser: user };
     }
@@ -8014,7 +8017,7 @@ export default {
     if (url.pathname === "/api/ppe/audit" && request.method === "POST") {
       // Push an audit: everyone who has had a PPE bag handover has to tick their bag again. T1 and T2 only.
       if (user.tier !== "T1" && user.tier !== "T2") return reply(env, 403, { error: "forbidden" });
-      if (user.viewAs) return reply(env, 403, { error: "Viewing as someone else is read only." });
+      if (user.viewAs && !VIEW_AS_WRITES) return reply(env, 403, { error: "Viewing as someone else is read only." });
       const at = new Date().toISOString().slice(0, 19).replace("T", " ");
       await env.DB.prepare("INSERT INTO app_settings (key, value, by_name, at) VALUES ('ppe.audit_at', ?, ?, datetime('now')) ON CONFLICT(key) DO UPDATE SET value = excluded.value, by_name = excluded.by_name, at = excluded.at").bind(at, user.name || "").run();
       return reply(env, 200, { ok: true, at });
@@ -8023,7 +8026,7 @@ export default {
       // The PPE editor behind the PPE tile on the Operations home screen. T1 and T2 only. Deleting hides the item, so old bags and orders still read correctly.
       if (user.tier !== "T1" && user.tier !== "T2") return reply(env, 403, { error: "forbidden" });
       if (request.method === "POST") {
-        if (user.viewAs) return reply(env, 403, { error: "Viewing as someone else is read only." });
+        if (user.viewAs && !VIEW_AS_WRITES) return reply(env, 403, { error: "Viewing as someone else is read only." });
         let body;
         try { body = await request.json(); } catch (e) { return reply(env, 400, { error: "bad json" }); }
         const name = String(body.label || "").trim().slice(0, 80);
@@ -8396,7 +8399,7 @@ export default {
         return reply(env, 200, { items: rows.map((r) => ({ id: r.id, group: r.grp, item: r.item, spec: r.spec || "" })) });
       }
       if (request.method !== "POST") return reply(env, 405, { error: "method not allowed" });
-      if (user.viewAs) return reply(env, 403, { error: "Viewing as someone else is read only." });
+      if (user.viewAs && !VIEW_AS_WRITES) return reply(env, 403, { error: "Viewing as someone else is read only." });
       let body;
       try { body = await request.json(); } catch (e) { return reply(env, 400, { error: "bad json" }); }
       const name = String(body.item || "").trim().slice(0, 80), spec = String(body.spec || "").trim().slice(0, 120);
@@ -8428,7 +8431,7 @@ export default {
       if (request.method === "GET") return reply(env, 200, { items: await teamRows() });
       if (request.method !== "POST") return reply(env, 405, { error: "method not allowed" });
       if (user.tier !== "T1" && user.tier !== "T2") return reply(env, 403, { error: "forbidden" });
-      if (user.viewAs) return reply(env, 403, { error: "Viewing as someone else is read only." });
+      if (user.viewAs && !VIEW_AS_WRITES) return reply(env, 403, { error: "Viewing as someone else is read only." });
       let body;
       try { body = await request.json(); } catch (e) { return reply(env, 400, { error: "bad json" }); }
       const name = String(body.item || "").trim().slice(0, 80), spec = String(body.spec || "").trim().slice(0, 120);
@@ -8558,7 +8561,7 @@ export default {
     if (url.pathname === "/api/invoices/mailbox" && request.method === "POST") {
       // Do the next waiting supplier email in the Accounts mailbox: first the Reservoir folder, then the inbox (A to Z by supplier). One email per press.
       if (user.tier !== "T1") return reply(env, 403, { error: "forbidden" });
-      if (user.viewAs) return reply(env, 403, { error: "Viewing as someone else is read only." });
+      if (user.viewAs && !VIEW_AS_WRITES) return reply(env, 403, { error: "Viewing as someone else is read only." });
       if (!env.AROFLO_BILLS_EMAIL) return reply(env, 501, { error: "not set", detail: "AROFLO_BILLS_EMAIL is not set on the Worker" });
       try {
         const box = MAILBOXES.find((x) => x.id === "accounts");
@@ -8616,7 +8619,7 @@ export default {
     const ih = url.pathname.match(/^\/api\/invoices\/history\/(\d{1,12})$/);
     if (ih && request.method === "DELETE") {
       if (user.tier !== "T1") return reply(env, 403, { error: "forbidden" });
-      if (user.viewAs) return reply(env, 403, { error: "Viewing as someone else is read only." });
+      if (user.viewAs && !VIEW_AS_WRITES) return reply(env, 403, { error: "Viewing as someone else is read only." });
       await invHistoryTable(env);
       await env.DB.prepare("DELETE FROM invoice_history WHERE id = ?").bind(Number(ih[1])).run();
       return reply(env, 200, { ok: true });
@@ -8625,13 +8628,13 @@ export default {
     if (ih && request.method === "PATCH") {
       // Tick: the retry failed, the invoice was entered by hand, so the line moves to the successful history marked Manual.
       if (user.tier !== "T1") return reply(env, 403, { error: "forbidden" });
-      if (user.viewAs) return reply(env, 403, { error: "Viewing as someone else is read only." });
+      if (user.viewAs && !VIEW_AS_WRITES) return reply(env, 403, { error: "Viewing as someone else is read only." });
       return reply(env, 200, { ok: await invManual(env, Number(ih[1])) });
     }
     const iry = url.pathname.match(/^\/api\/invoices\/history\/(\d{1,12})\/retry$/);
     if (iry && request.method === "POST") {
       if (user.tier !== "T1") return reply(env, 403, { error: "forbidden" });
-      if (user.viewAs) return reply(env, 403, { error: "Viewing as someone else is read only." });
+      if (user.viewAs && !VIEW_AS_WRITES) return reply(env, 403, { error: "Viewing as someone else is read only." });
       if (!env.AROFLO_BILLS_EMAIL) return reply(env, 501, { error: "not set", detail: "AROFLO_BILLS_EMAIL is not set on the Worker" });
       try {
         return reply(env, 200, await invRetry(env, user, Number(iry[1])));
