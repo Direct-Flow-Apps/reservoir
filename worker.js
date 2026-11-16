@@ -6745,7 +6745,7 @@ export default {
       const dlRes = await graphFetch(env, `/users/${encodeURIComponent(dlAddr)}/messages/${encodeURIComponent(dlMsg)}/attachments/${encodeURIComponent(dlAtt)}/$value`);
       if (!dlRes.ok) return new Response("Not found", { status: 404, headers: cors(env) });
       const nm = String(q.get("n") || "attachment").replace(/[\r\n"\\/]/g, "_").slice(0, 120);
-      return new Response(dlRes.body, { status: 200, headers: { ...cors(env), "Content-Type": dlRes.headers.get("Content-Type") || "application/octet-stream", "Content-Disposition": `attachment; filename="${nm}"`, "Cache-Control": "no-store" } });
+      return new Response(dlRes.body, { status: 200, headers: { ...cors(env), "Access-Control-Allow-Origin": "*", "Content-Type": dlRes.headers.get("Content-Type") || "application/octet-stream", "Content-Disposition": `attachment; filename="${nm}"`, "Cache-Control": "no-store" } });
     }
     if (earlyUrl.pathname === "/api/ping" && request.method === "GET") return reply(env, 200, { worker: WORKER_BUILD, xeroMe: true, xeroStaff: true });
     if (earlyUrl.pathname === "/api/invoices/notify" && request.method === "POST") {
