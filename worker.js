@@ -4865,9 +4865,19 @@ async function arofloRoutes(request, env, user, url) {
       const pick = (flat, re, skip) => { const f = flat.find(([k, v]) => re.test(k) && !(skip && skip.test(k)) && v !== "" && v !== "(empty list)"); return f ? String(f[1]) : ""; };
       const subs = {};
       for (const seg of ["notes", "documents", "attachments", "files", "photos"]) {
-        const r = await arofloGet(env, `${coll}/${encodeURIComponent(id)}/${seg}`);
-        const list = r.ok ? arofloList(r.json) : null;
+        let r = await arofloGet(env, `${coll}/${encodeURIComponent(id)}/${seg}`);
+        let list = r.ok ? arofloList(r.json) : null;
         steps.push(`${coll}/${id}/${seg} answered ${r.status}${list ? `, ${list.length} items` : r.ok ? ", no list" : ""}`);
+        // A project keeps its documents apart from its tasks'. If the usual path gives nothing, try the other places AroFlo might put them.
+        if (!list && seg === "documents" && coll === "/projects") {
+          const e2 = encodeURIComponent(id);
+          for (const alt of [`/projects/${e2}/projectdocuments`, `/projects/${e2}/project-documents`, `/projects/${e2}/documentsandphotos`, `/projects/${e2}/documents-and-photos`, `/projects/${e2}/files`, `/documents?projectId=${e2}`, `/documents?project=${e2}`, `/documents?projectid=${e2}`, `/projectdocuments?projectId=${e2}`, `/documents?parentType=project&parentId=${e2}`]) {
+            const ra = await arofloGet(env, alt);
+            const la = ra.ok ? arofloList(ra.json) : null;
+            steps.push(`${alt} answered ${ra.status}${la ? `, ${la.length} items` : ra.ok ? ", no list" : ""}`);
+            if (la) { r = ra; list = la; break; }
+          }
+        }
         if (list) subs[seg] = list.slice(0, 50).map((it) => {
           const flat = arofloFlat(it, "", [], 0);
           const get = (re) => { const f = flat.find(([k, v]) => re.test(k) && v !== "" && v !== "(empty list)"); return f ? String(f[1]) : ""; };
