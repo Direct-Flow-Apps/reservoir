@@ -8665,7 +8665,7 @@ export default {
       if (user.tier !== "T1" && user.tier !== "T2") return reply(env, 403, { error: "forbidden" });
       try {
         const meta = await driveMeta(env, xm[1]);
-        if (!meta) return reply(env, 404, { error: "not found", worker: WORKER_BUILD });
+        if (!meta) return reply(env, 404, { error: "not found", detail: "the file is no longer in SharePoint or its id is not valid", worker: WORKER_BUILD });
         if (meta.folder.startsWith("Receipts/Reimbursements") && user.tier !== "T1") return reply(env, 403, { error: "forbidden" });
         await sendToXero(env, user, meta);
         return reply(env, 200, { ok: true });
