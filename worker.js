@@ -4863,6 +4863,18 @@ async function arofloRoutes(request, env, user, url) {
         siteAddress = Array.from(new Set(g.sort((a, b) => rank(a[0]) - rank(b[0])).map((x) => x[1]))).join(", ");
       }
       const pick = (flat, re, skip) => { const f = flat.find(([k, v]) => re.test(k) && !(skip && skip.test(k)) && v !== "" && v !== "(empty list)"); return f ? String(f[1]) : ""; };
+      // Finding AroFlo's real documents paths: any link the record itself names, and any schema AroFlo publishes.
+      if (coll === "/projects") {
+        const linkVals = jobFlat.filter(([k, v]) => /_links/i.test(k) && /^\//.test(String(v)) && !/(office|avatar)/i.test(k) && !/^\/(users|DocStorage|ims)/.test(String(v))).map(([k, v]) => String(v));
+        steps.push(`links named by the project: ${linkVals.join(", ") || "none"}`);
+        for (const lp of Array.from(new Set(linkVals)).slice(0, 12)) { const rl = await arofloGet(env, lp.replace(/^\/v2/, "")); steps.push(`${lp} answered ${rl.status}`); }
+        for (const sp of ["", "/", "/openapi.json", "/swagger.json", "/openapi", "/api-docs", "/docs", "/schema", "/documents", "/documents/upload", "/projects/" + encodeURIComponent(id) + "/documents/upload"]) {
+          const rs = await arofloGet(env, sp || "");
+          const keys = rs.json && typeof rs.json === "object" ? Object.keys(rs.json).slice(0, 12).join(",") : "";
+          const paths = rs.json && rs.json.paths ? Object.keys(rs.json.paths).filter((x) => /(document|photo|file|attach)/i.test(x)).slice(0, 25) : [];
+          steps.push(`${sp || "(root)"} answered ${rs.status}${keys ? `, keys ${keys}` : ""}${paths.length ? `, document paths ${paths.join(" ")}` : ""}`);
+        }
+      }
       const subs = {};
       for (const seg of ["notes", "documents", "attachments", "files", "photos"]) {
         let r = await arofloGet(env, `${coll}/${encodeURIComponent(id)}/${seg}`);
