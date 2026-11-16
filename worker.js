@@ -4410,7 +4410,7 @@ async function mailDraftsSweep(env) {
 async function arofloRoutes(request, env, user, url) {
   if (!url.pathname.startsWith("/api/aroflo")) return null;
   if (user.tier !== "T1") return reply(env, 403, { error: "forbidden" });
-  const isPush = (url.pathname === "/api/aroflo/push-test" || url.pathname === "/api/aroflo/push-note" || url.pathname === "/api/aroflo/push-file") && request.method === "POST";
+  const isPush = (url.pathname === "/api/aroflo/filter-test" || url.pathname === "/api/aroflo/push-test" || url.pathname === "/api/aroflo/push-note" || url.pathname === "/api/aroflo/push-file") && request.method === "POST";
   if (request.method !== "GET" && !isPush) return reply(env, 404, { error: "not found" });
   if (!env.AROFLO_TOKEN) return reply(env, 200, { ok: false, error: "The AROFLO_TOKEN secret is not set on the Worker.", worker: WORKER_BUILD });
   try {
@@ -4494,6 +4494,28 @@ async function arofloRoutes(request, env, user, url) {
         for (const [lab, p, h, b] of tries) { if (ok) break; if (win && lab === win[0]) continue; ok = await tryIt(`photo, ${lab}, POST`, p, { method: "POST", headers: h, body: b }); }
       }
       return reply(env, 200, { ok, attempts, worker: WORKER_BUILD });
+    }
+    // Maps the document filter. Uploads a tiny text file with each filter value and reports what AroFlo answered, including the filter it says it stored. A made up value goes first so AroFlo's own error can list the real ones.
+    if (url.pathname === "/api/aroflo/filter-test") {
+      let body = {};
+      try { body = await request.json(); } catch (e) { body = {}; }
+      const coll = String(body.coll || ""), id = String(body.id || "");
+      if (!/^\/(tasks|projects|jobs)$/.test(coll) || !/^[A-Za-z0-9_.-]{1,60}$/.test(id)) return reply(env, 400, { error: "bad job" });
+      const up = `${coll}/${encodeURIComponent(id)}/documents/upload`;
+      const b64 = btoa("filter test");
+      const out = [];
+      const vals = ["ZZZ_NOT_A_FILTER", "INTERNAL_ONLY", "INTERNAL_ADMIN_ONLY", "INTERNAL_ADMIN_AND_MANAGER_ONLY", "INTERNAL_ADMIN_MANAGER_ONLY", "SHOW_CLIENT", "SHOW_CONTRACTOR", "SHOW_ALL"];
+      let n = 0;
+      for (const v of vals) {
+        n++;
+        try {
+          const res = await fetch(AROFLO_BASE + up, { method: "POST", headers: { Authorization: "Bearer " + env.AROFLO_TOKEN, Accept: "application/json", "Content-Type": "application/json" }, body: JSON.stringify({ displayName: `filter-test-${n}`, fileName: `filter-test-${n}.txt`, base64: b64, documentFilter: v }) });
+          const t = (await res.text()).replace(/\s+/g, " ");
+          const m = /"documentFilter"\s*:\s*"([^"]*)"/.exec(t);
+          out.push({ sent: v, status: res.status, stored: m ? m[1] : "", body: t.slice(0, 260) });
+        } catch (e) { out.push({ sent: v, status: 0, stored: "", body: String(e && e.message || e).slice(0, 160) }); }
+      }
+      return reply(env, 200, { ok: true, results: out, worker: WORKER_BUILD });
     }
     if (isPush) {
       let body = {};
