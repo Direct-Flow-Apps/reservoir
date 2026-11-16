@@ -8574,8 +8574,8 @@ export default {
       if (user.tier !== "T1") return reply(env, 403, { error: "forbidden" });
       await receiptRecordsTable(env);
       const row = await env.DB.prepare("SELECT item_id FROM receipt_records WHERE id = ?").bind(rdel[1]).first();
-      if (row && row.item_id) {
-        try { await graphFetch(env, `/sites/${siteId(env)}/drive/items/${row.item_id}`, { method: "DELETE" }); } catch (e) { /* the record still goes */ }
+      for (const one of String((row && row.item_id) || "").split(",").map((x) => x.trim()).filter(Boolean)) {
+        try { await graphFetch(env, `/sites/${siteId(env)}/drive/items/${one}`, { method: "DELETE" }); } catch (e) { /* the record still goes */ }
       }
       await env.DB.prepare("DELETE FROM receipt_records WHERE id = ?").bind(rdel[1]).run();
       return reply(env, 200, { ok: true });
@@ -8616,7 +8616,7 @@ export default {
         }
         if (type === "reimbursement" && body.status === "paid" && user.tier === "T1") { rowStatus = "paid"; doneOn = date; }
         await env.DB.prepare("INSERT OR IGNORE INTO receipt_records (id, by_name, by_email, type, amount, note, item_id, file_name, status, view, sent_date, done_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
-          .bind(id, byName, byMail, type, type === "reimbursement" ? txt(body.amount, 12) : "", txt(body.text, 500), txt(body.itemId, 200), txt(body.fileName, 200), rowStatus, view, date, doneOn).run();
+          .bind(id, byName, byMail, type, type === "reimbursement" ? txt(body.amount, 12) : "", txt(body.text, 500), txt(body.itemId, 600), txt(body.fileName, 600), rowStatus, view, date, doneOn).run();
         if (type === "reimbursement" && rowStatus === "paid") await notify(env, { to: byMail, kind: "receipt", title: "Reimbursement request processed", body: "Your reimbursement has been paid. Open Receipts to see it.", link: "receipts", by: user.name || mail });
         return reply(env, 200, { ok: true });
       }
