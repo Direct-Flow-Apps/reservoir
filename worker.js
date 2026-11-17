@@ -6836,9 +6836,21 @@ async function invRulesSync(env) {
 // VBA 360 sign in codes. The VBA emails a six digit code to DFP Jobs. It goes to Tayler, Andrew and Mitch as a notice with a tick; when one of them ticks it, the other notices clear and the email is archived.
 const VBA_SUBJECT = /VBA\s*360\s*verification\s*code/i;
 const VBA_PEOPLE = /^(tayler|andrew|mitch)/i;
+// Read receipts that AroFlo mail sends back to DFP Jobs ("Read: ..." with "was read on") go straight to the archive.
+async function jobsReadSweep(env) {
+  const jobs = MAILBOXES.find((x) => x.id === "jobs");
+  const addr = mailAddress(env, jobs);
+  const r = await mailGraph(env, addr, `/mailFolders/inbox/messages?$top=50&$select=id,subject,bodyPreview&$filter=${encodeURIComponent("startswith(subject,'Read:')")}`);
+  if (!r.ok) { console.log("read sweep", r.status); return; }
+  for (const m of ((r.json && r.json.value) || [])) {
+    if (!/^read:\s/i.test(String(m.subject || "")) || !/was read on/i.test(String(m.bodyPreview || ""))) continue;
+    try { await mailDo(env, addr, `/messages/${encodeURIComponent(m.id)}/move`, "POST", { destinationId: "archive" }); } catch (e) { console.log("read archive failed", String(e && e.message || e)); }
+  }
+}
 async function vbaWatch(env) {
   if (!env.GRAPH_CLIENT_SECRET) return;
   await settingsTable(env);
+  await jobsReadSweep(env).catch((e) => console.log("read sweep failed", String(e && e.message || e)));
   const jobs = MAILBOXES.find((x) => x.id === "jobs");
   const addr = mailAddress(env, jobs);
   const since = new Date(Date.now() - 40 * 60000).toISOString();
