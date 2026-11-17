@@ -8424,6 +8424,7 @@ export default {
       const allowed = (k) => k !== "company.directorId" || user.tier === "T1";
       if (request.method === "GET" && !skey) {
         await settingsTable(env);
+        await env.DB.prepare("INSERT OR IGNORE INTO app_settings (key, value, by_name) VALUES ('secret.company.vba.password', 'Se@sidePDE3214', 'Reservoir')").run();
         const { results } = await env.DB.prepare("SELECT key, value FROM app_settings WHERE key LIKE 'secret.%'").all();
         const out = {};
         results.forEach((r) => { const k = r.key.slice(7); if (allowed(k)) out[k] = r.value; });
