@@ -3587,6 +3587,24 @@ async function apexParse(bytes) {
   if (!/^\d{5,}$/.test(number) || !date || !(ex > 0) || !(inc > 0) || Math.abs(ex + gst - inc) > 0.02) return null;
   return { number, date, due: due || date, ex, gst, inc, order: side("Order No:") };
 }
+async function melbourneDrainParse(bytes) {
+  const items = await pdfTextRuns(bytes);
+  if (!items.length) return null;
+  const money = (t) => Number(String(t).replace(/[^0-9.]/g, ""));
+  const lab = (name) => items.filter((i) => i.t.trim().toLowerCase() === name.toLowerCase()).sort((a, b) => a.y - b.y)[0];
+  const side = (name) => { const l = lab(name); if (!l) return ""; const v = items.filter((i) => i.page === l.page && Math.abs(i.y - l.y) < 4 && i.x > l.x + 20 && i.t.trim()).sort((a, b) => a.x - b.x)[0]; return v ? v.t.trim() : ""; };
+  const below = (name) => { const l = lab(name); if (!l) return ""; const v = items.filter((i) => i.page === l.page && Math.abs(i.x - l.x) < 4 && i.y < l.y - 3 && i.y > l.y - 20 && i.t.trim()).sort((a, b) => b.y - a.y)[0]; return v ? v.t.trim() : ""; };
+  const dateOf = (t) => { const m = String(t).trim().match(/(\d{1,2})\/(\d{1,2})\/(\d{4})/); return m ? `${m[3]}-${String(m[2]).padStart(2, "0")}-${String(m[1]).padStart(2, "0")}` : ""; };
+  const exT = side("Subtotal:"), gstT = side("Total GST:"), incT = side("Invoice Total:");
+  const ex = money(exT), gst = money(gstT), inc = money(incT);
+  if (items.some((i) => /credit note/i.test(i.t)) || /^-|\(/.test(incT)) return { credit: true };
+  const number = below("Invoice No");
+  const date = dateOf(below("Invoice Date"));
+  const dueItem = items.find((i) => /^Due Date:/i.test(i.t.trim()));
+  const due = dueItem ? dateOf(dueItem.t) : "";
+  if (!/^\d{3,}$/.test(number) || !date || !(ex > 0) || !(inc > 0) || Math.abs(ex + gst - inc) > 0.02) return null;
+  return { number, date, due: due || date, ex, gst, inc, order: side("Job Number:") };
+}
 async function estimateOneParse(bytes) {
   const items = await pdfTextRuns(bytes);
   if (!items.length) return null;
@@ -3795,6 +3813,7 @@ const INVOICE_MAIL_RULES = [
   { name: "Estimate One", from: "accounts@estimateone.com", subject: "your e1 invoice", contact: "estimate one", account: "", xeroOnly: true, parse: (b) => estimateOneParse(b) },
   { name: "Geelong Commercial", from: "emaildelivery@console.com.au", subject: "invoice for 41 seaside pde", contact: "geelong commercial", account: "", xeroOnly: true, parse: (b) => geelongCommercialParse(b) },
   { name: "Apex", fromDomain: "apexsteel.com.au", subject: "invoice", contact: "apex", account: "", parse: (b) => apexParse(b) },
+  { name: "Melbourne Drain Relining", fromDomain: "inboundemail.aroflo.com", subject: "from melbourne drain relining", contact: "melbourne drain", account: "", forwardBack: "Invoice sent to Xero and AroFlo. Download the links in this email and upload them to AroFlo.", parse: (b) => melbourneDrainParse(b) },
   { name: "Teleca", from: "cs@teleca.com.au", subject: "telephone billing", contact: "teleca", account: "", xeroOnly: true, parse: (b) => telecaParse(b) }
 ];
 const MAILBOXES = [
@@ -6718,6 +6737,10 @@ async function invProcessHit(env, actor, addr, rule, hit, inFolder, redo) {
     for (const it of items) await invHistoryAdd(env, msgKey + ":" + invHash(it.file), rule.name, it.number || it.file, "error", failed.join(". ") || it.xeroNote, hit.internetMessageId);
     if (!items.length) await invHistoryAdd(env, msgKey, rule.name, "", "error", failed.join(". "), hit.internetMessageId);
   } else {
+    // Some suppliers put the real invoice behind a link in the email. Once everything is in, the email goes back to Accounts with a note so the links get downloaded and uploaded by hand.
+    if (rule.forwardBack && !(await done(msgKey + ".fwd"))) {
+      try { const fw = await mailDraftSend(env, addr, hit.id, "createForward", rule.forwardBack, mailRecipients(addr)); if (fw && fw.ok) await mark(msgKey + ".fwd", "sent"); else console.log("forward back failed", fw && fw.status); } catch (e) { console.log("forward back failed", String(e && e.message || e)); }
+    }
     await patch({ isRead: true });
     const mv = await moveTo("archive");
     archived = mv && mv.ok ? "archived" : `not archived (Microsoft ${mv ? mv.status : "no answer"})`;
