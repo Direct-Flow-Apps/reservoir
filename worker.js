@@ -7477,6 +7477,7 @@ export default {
           await env.DB.prepare("UPDATE profile_requests SET status = 'processed', processed_by = ?, processed_at = datetime('now'), seen_at = NULL WHERE id = ?").bind(user.email || "unknown", row.id).run();
           const doneRow = await env.DB.prepare("SELECT * FROM profile_requests WHERE id = ?").bind(row.id).first();
           await profileAudit(env, "processed", doneRow, user.name || user.email || "unknown", vals.address !== undefined || vals.mobile !== undefined ? "Written to Xero and read back" : "Saved");
+          { const what = vals.address !== undefined ? "Address" : vals.mobile !== undefined ? "Mobile" : row.section === "emergency" ? "Emergency contact" : "Profile"; await notify(env, { to: row.email, kind: "request", title: `${what} change confirmed`, body: "Your profile has been updated.", link: "profile", by: user.name || "Reservoir" }); }
           return reply(env, 200, { request: profileRequestOut(doneRow), xero: vals.address !== undefined || vals.mobile !== undefined });
         }
         if (row.section === "bank" || row.section === "super") {
@@ -7505,6 +7506,7 @@ export default {
           await env.DB.prepare("UPDATE profile_requests SET status = 'processed', processed_by = ?, processed_at = datetime('now'), seen_at = NULL WHERE id = ?").bind(user.email || "unknown", row.id).run();
           const doneRow = await env.DB.prepare("SELECT * FROM profile_requests WHERE id = ?").bind(row.id).first();
           await profileAudit(env, "processed", doneRow, user.name || user.email || "unknown", row.section === "super" ? "Pulled from Xero" : "Written to Xero");
+          await notify(env, { to: row.email, kind: "request", title: `${row.section === "super" ? "Super" : "Bank details"} change confirmed`, body: "Your profile has been updated.", link: "profile", by: user.name || "Reservoir" });
           return reply(env, 200, { request: profileRequestOut(doneRow), xero: true });
         }
         let values = {};
