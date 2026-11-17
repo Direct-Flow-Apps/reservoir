@@ -227,123 +227,6 @@ async function driveBytes(env, id) {
 // While testing, a director viewing as someone can do everything that person can. Set false before go live to make View As read only again.
 const VIEW_AS_WRITES = true;
 
-// Xero's bills inbox is happiest with PDFs, so a photo or screenshot is wrapped in a one page PDF before it is emailed.
-async function zInflate(u8) {
-  const s = new Blob([u8]).stream().pipeThrough(new DecompressionStream("deflate"));
-  return new Uint8Array(await new Response(s).arrayBuffer());
-}
-async function zDeflate(u8) {
-  const s = new Blob([u8]).stream().pipeThrough(new CompressionStream("deflate"));
-  return new Uint8Array(await new Response(s).arrayBuffer());
-}
-async function pngToRgb(u8) {
-  const dv = new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
-  let p = 8, w = 0, h = 0, depth = 0, ctype = 0, interlace = 0, plte = null, trns = null;
-  const idat = [];
-  while (p + 8 <= u8.length) {
-    const len = dv.getUint32(p);
-    const type = String.fromCharCode(u8[p + 4], u8[p + 5], u8[p + 6], u8[p + 7]);
-    const d = u8.subarray(p + 8, p + 8 + len);
-    if (type === "IHDR") { w = dv.getUint32(p + 8); h = dv.getUint32(p + 12); depth = u8[p + 16]; ctype = u8[p + 17]; interlace = u8[p + 20]; }
-    else if (type === "PLTE") plte = d;
-    else if (type === "tRNS") trns = d;
-    else if (type === "IDAT") idat.push(d);
-    else if (type === "IEND") break;
-    p += 12 + len;
-  }
-  if (interlace) throw new Error("interlaced png");
-  if (depth !== 8 && depth !== 16) throw new Error("png depth");
-  const chans = { 0: 1, 2: 3, 3: 1, 4: 2, 6: 4 }[ctype];
-  if (!chans) throw new Error("png type");
-  const total = idat.reduce((n, a) => n + a.length, 0);
-  const all = new Uint8Array(total);
-  let o = 0;
-  for (const a of idat) { all.set(a, o); o += a.length; }
-  const raw = await zInflate(all);
-  const bps = depth / 8, bpp = chans * bps, stride = w * bpp;
-  const cur = new Uint8Array(stride), prev = new Uint8Array(stride);
-  const out = new Uint8Array(w * h * 3);
-  let rp = 0, op = 0;
-  for (let y = 0; y < h; y++) {
-    const f = raw[rp++];
-    for (let i = 0; i < stride; i++) {
-      const x = raw[rp++];
-      const a = i >= bpp ? cur[i - bpp] : 0, b = prev[i], c = i >= bpp ? prev[i - bpp] : 0;
-      let v;
-      if (f === 0) v = x;
-      else if (f === 1) v = x + a;
-      else if (f === 2) v = x + b;
-      else if (f === 3) v = x + ((a + b) >> 1);
-      else {
-        const pa = Math.abs(b - c), pb = Math.abs(a - c), pc = Math.abs(a + b - 2 * c);
-        v = x + (pa <= pb && pa <= pc ? a : pb <= pc ? b : c);
-      }
-      cur[i] = v & 255;
-    }
-    for (let x = 0; x < w; x++) {
-      const s = x * bpp;
-      let r, g, bl, al = 255;
-      if (ctype === 3) { const idx = cur[s]; r = plte[idx * 3]; g = plte[idx * 3 + 1]; bl = plte[idx * 3 + 2]; if (trns && idx < trns.length) al = trns[idx]; }
-      else if (ctype === 0) { r = g = bl = cur[s]; }
-      else if (ctype === 4) { r = g = bl = cur[s]; al = cur[s + bps]; }
-      else { r = cur[s]; g = cur[s + bps]; bl = cur[s + 2 * bps]; if (ctype === 6) al = cur[s + 3 * bps]; }
-      if (al < 255) { r = (r * al + 255 * (255 - al)) / 255; g = (g * al + 255 * (255 - al)) / 255; bl = (bl * al + 255 * (255 - al)) / 255; }
-      out[op++] = r; out[op++] = g; out[op++] = bl;
-    }
-    prev.set(cur);
-  }
-  return { w, h, rgb: out };
-}
-function jpegInfo(u8) {
-  let p = 2;
-  while (p + 9 < u8.length) {
-    if (u8[p] !== 0xFF) { p++; continue; }
-    const m = u8[p + 1];
-    if (m >= 0xC0 && m <= 0xCF && m !== 0xC4 && m !== 0xC8 && m !== 0xCC) return { h: (u8[p + 5] << 8) | u8[p + 6], w: (u8[p + 7] << 8) | u8[p + 8], comps: u8[p + 9] };
-    p += 2 + ((u8[p + 2] << 8) | u8[p + 3]);
-  }
-  throw new Error("jpeg size");
-}
-async function imageToPdf(bytes, kind) {
-  const u8 = new Uint8Array(bytes);
-  let w, h, data, filter, cs, extra = "";
-  if (kind === "jpg") {
-    const j = jpegInfo(u8);
-    w = j.w; h = j.h; data = u8; filter = "/DCTDecode";
-    cs = j.comps === 1 ? "/DeviceGray" : j.comps === 4 ? "/DeviceCMYK" : "/DeviceRGB";
-    if (j.comps === 4) extra = " /Decode [1 0 1 0 1 0 1 0]";
-  } else {
-    const r = await pngToRgb(u8);
-    w = r.w; h = r.h; data = await zDeflate(r.rgb); filter = "/FlateDecode"; cs = "/DeviceRGB";
-  }
-  const k = Math.min(1, 842 / Math.max(w, h));
-  const pw = +(w * k).toFixed(2), ph = +(h * k).toFixed(2);
-  const enc = new TextEncoder();
-  const parts = [];
-  const offs = [];
-  let len = 0;
-  const add = (x) => { const b = typeof x === "string" ? enc.encode(x) : x; parts.push(b); len += b.length; };
-  add("%PDF-1.4\n");
-  const obj = (n, body) => { offs[n] = len; add(`${n} 0 obj\n`); add(body); add("\nendobj\n"); };
-  obj(1, "<< /Type /Catalog /Pages 2 0 R >>");
-  obj(2, "<< /Type /Pages /Kids [3 0 R] /Count 1 >>");
-  obj(3, `<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ${pw} ${ph}] /Resources << /XObject << /Im0 5 0 R >> >> /Contents 4 0 R >>`);
-  const content = `q ${pw} 0 0 ${ph} 0 0 cm /Im0 Do Q`;
-  obj(4, `<< /Length ${content.length} >>\nstream\n${content}\nendstream`);
-  offs[5] = len;
-  add(`5 0 obj\n<< /Type /XObject /Subtype /Image /Width ${w} /Height ${h} /ColorSpace ${cs} /BitsPerComponent 8 /Filter ${filter}${extra} /Length ${data.length} >>\nstream\n`);
-  add(data);
-  add("\nendstream\nendobj\n");
-  const xref = len;
-  let x = "xref\n0 6\n0000000000 65535 f \n";
-  for (let i = 1; i <= 5; i++) x += String(offs[i]).padStart(10, "0") + " 00000 n \n";
-  add(x + `trailer\n<< /Size 6 /Root 1 0 R >>\nstartxref\n${xref}\n%%EOF`);
-  const out = new Uint8Array(len);
-  let q = 0;
-  for (const b of parts) { out.set(b, q); q += b.length; }
-  return out.buffer;
-}
-
 async function sendToXero(env, user, meta) {
   if (!env.XERO_BILLS_EMAIL) throw new Error("XERO_BILLS_EMAIL is not set on the Worker");
   const bytes = await driveBytes(env, meta.id);
@@ -359,13 +242,7 @@ async function sendToXero(env, user, meta) {
   else if (ascii(0, 3) === "GIF") throw new Error("Xero cannot read GIF files. Send a PDF, JPG or PNG.");
   const mimeOf = { pdf: "application/pdf", png: "image/png", jpg: "image/jpeg" };
   let fileName = String(meta.name || "receipt");
-  let sendBytes = bytes;
-  if (kind === "png" || kind === "jpg") {
-    try {
-      const pdf = await imageToPdf(bytes, kind);
-      if (pdf.byteLength <= MAX_EMAIL) { sendBytes = pdf; kind = "pdf"; }
-    } catch (e) { /* send the image as it is */ }
-  }
+  const sendBytes = bytes;
   if (kind) fileName = fileName.replace(/\.[A-Za-z0-9]{2,5}$/, "") + "." + kind;
   const sender = env.MAIL_SENDER || MAIL_SENDER_DEFAULT;
   const payload = JSON.stringify({
