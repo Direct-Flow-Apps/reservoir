@@ -426,22 +426,22 @@ async function receiptRecordsTable(env) {
 let xeroVerifyAt = 0;
 async function xeroVerify(env) {
   await receiptRecordsTable(env);
-  const rows = (await env.DB.prepare("SELECT id, xero_name, xero_at, xero_state FROM receipt_records WHERE xero_name IS NOT NULL AND xero_state IN ('waiting','missing') AND xero_at > ?").bind(new Date(Date.now() - 36 * 3600 * 1000).toISOString()).all()).results || [];
+  const rows = (await env.DB.prepare("SELECT id, amount, xero_name, xero_at, xero_state FROM receipt_records WHERE xero_name IS NOT NULL AND xero_state IN ('waiting','missing') AND xero_at > ?").bind(new Date(Date.now() - 36 * 3600 * 1000).toISOString()).all()).results || [];
   if (!rows.length) return;
-  const res = await xeroFetch(env, "files.xro/1.0/Files?pagesize=100&sort=CreatedDateUTC&direction=DESC");
-  if (res.status === 401 || res.status === 403) {
-    for (const r of rows) await env.DB.prepare("UPDATE receipt_records SET xero_state = 'noscope' WHERE id = ?").bind(r.id).run();
-    return;
-  }
+  // Xero turns each emailed receipt into a draft bill, so look for new drafts made since the send, and use up one draft per file sent. A record with a known amount must match a draft total as well.
+  rows.sort((a, b) => String(a.xero_at).localeCompare(String(b.xero_at)));
+  const earliest = new Date(Date.parse(rows[0].xero_at) - 120000).toUTCString();
+  const res = await xeroFetch(env, `api.xro/2.0/Invoices?where=${encodeURIComponent('Type=="ACCPAY" AND Status=="DRAFT"')}&order=${encodeURIComponent("UpdatedDateUTC DESC")}&page=1`, { headers: { "If-Modified-Since": earliest } });
   if (!res.ok) return;
-  const items = ((await res.json()).Items) || [];
   const stamp = (v) => { const m = /\/Date\((-?\d+)/.exec(String(v || "")); return m ? Number(m[1]) : (Date.parse(String(v || "")) || 0); };
-  const seen = items.map((f) => ({ name: String(f.Name || "").toLowerCase(), at: stamp(f.CreatedDateUtc) }));
+  const drafts = (((await res.json()).Invoices) || []).map((d) => ({ at: stamp(d.UpdatedDateUTC), total: Number(d.Total) || 0, used: false }));
   for (const r of rows) {
     const since = Date.parse(r.xero_at) - 120000;
-    const names = String(r.xero_name).split("|").filter(Boolean);
-    const all = names.every((n) => seen.some((f) => f.name === n.toLowerCase() && f.at >= since));
-    const state = all ? "ok" : (Date.now() - Date.parse(r.xero_at) > 10 * 60000 ? "missing" : "waiting");
+    const need = String(r.xero_name).split("|").filter(Boolean).length || 1;
+    const amt = Number(String(r.amount || "").replace(/[^0-9.]/g, "")) || 0;
+    const pool = drafts.filter((d) => !d.used && d.at >= since && (!amt || !d.total || Math.abs(d.total - amt) < 0.005));
+    const state = pool.length >= need ? "ok" : (Date.now() - Date.parse(r.xero_at) > 10 * 60000 ? "missing" : "waiting");
+    if (state === "ok") pool.slice(0, need).forEach((d) => { d.used = true; });
     if (state !== r.xero_state) await env.DB.prepare("UPDATE receipt_records SET xero_state = ? WHERE id = ?").bind(state, r.id).run();
   }
 }
@@ -455,7 +455,7 @@ const WORKER_BUILD = "Reservoir-Worker-2026.11.05-w220";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.izzyandloki.workers.dev/api/xero/callback";
-const XERO_SCOPES_DEFAULT = "offline_access accounting.contacts accounting.settings accounting.invoices payroll.employees payroll.settings payroll.payruns payroll.payslip payroll.timesheets accounting.attachments files.read";
+const XERO_SCOPES_DEFAULT = "offline_access accounting.contacts accounting.settings accounting.invoices payroll.employees payroll.settings payroll.payruns payroll.payslip payroll.timesheets accounting.attachments";
 const xeroId = (env) => env.XERO_CLIENT_ID || XERO_CLIENT_ID_DEFAULT;
 const xeroRedirect = (env) => env.XERO_REDIRECT || XERO_REDIRECT_DEFAULT;
 const b64enc = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
