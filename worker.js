@@ -689,10 +689,19 @@ function xeroAddressParts(addr, current) {
   return { AddressLine1: m[1].trim(), City: m[2].trim(), Region: m[3].toUpperCase(), PostalCode: m[4], Country: String(current && current.Country || "AUSTRALIA") };
 }
 // Address and mobile go to Xero, then are read straight back from Xero into the local table, so what staff see is what Xero holds.
+// Addresses typed or picked in capitals are written to Xero in proper case: 16 Miramar Dr, Armstrong Creek VIC 3217.
+function titleAddress(text) {
+  const keep = /^(VIC|NSW|QLD|SA|WA|TAS|NT|ACT|PO|GPO|CMB|RMB|RSD)$/;
+  return String(text || "").replace(/[A-Za-z][A-Za-z'’-]*/g, (w) => {
+    if (keep.test(w.toUpperCase())) return w.toUpperCase();
+    if (w !== w.toUpperCase() || w.length < 2) return w;
+    return w.toLowerCase().replace(/(^|['’-])([a-z])/g, (m, a, b) => a + b.toUpperCase()).replace(/^Mc([a-z])/, (m, c) => "Mc" + c.toUpperCase());
+  }).replace(/\b(\d+)([a-z])\b/g, (m, n, l) => n + l.toUpperCase());
+}
 async function xeroPushPersonal(env, employeeId, v, email) {
   const rec = await xeroEmployeeRecord(env, employeeId);
   const patch = {};
-  if (v.address !== undefined) patch.HomeAddress = xeroAddressParts(v.address, rec.HomeAddress);
+  if (v.address !== undefined) patch.HomeAddress = xeroAddressParts(titleAddress(v.address), rec.HomeAddress);
   if (v.mobile !== undefined) {
     const d = digitsOnly(normPhone(v.mobile));
     if (d.length < 8 || d.length > 12) throw new Error("The mobile number does not look right.");
@@ -707,6 +716,7 @@ async function xeroPushPersonal(env, employeeId, v, email) {
   if (patch.HomeAddress) { sets.push("address = ?"); binds.push(staff.address); }
   if (patch.Mobile) { sets.push("mobile = ?"); binds.push(staff.mobile); }
   if (sets.length) await env.DB.prepare(`UPDATE dfp_xero SET ${sets.join(", ")}, updated_by = ?, updated_at = datetime('now') WHERE lower(email) = ?`).bind(...binds, "Xero", String(email || "").toLowerCase()).run();
+  return { address: patch.HomeAddress ? staff.address : "", mobile: patch.Mobile ? staff.mobile : "" };
 }
 const profileRequestOut = (r) => {
   let fields = [], values = {};
@@ -7612,7 +7622,15 @@ export default {
               if (vals.address !== undefined || vals.mobile !== undefined) {
                 const empId = dx && dx.xero_employee_id;
                 if (!empId) return reply(env, 409, { error: "This person is not linked to a Xero employee record yet, so nothing was changed." });
-                await xeroPushPersonal(env, empId, vals, mail);
+                const back = await xeroPushPersonal(env, empId, vals, mail);
+                // The history shows the address the way Xero now holds it, not the way it was typed.
+                if (back && back.address && vals.address) {
+                  const was = String(vals.address);
+                  const esc = was.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+                  const swap = (t) => String(t || "").replace(new RegExp(esc, "i"), back.address);
+                  const newVals = { ...vals, address: back.address };
+                  await env.DB.prepare("UPDATE profile_requests SET text = ?, vals = ? WHERE id = ?").bind(swap(row.text), JSON.stringify(newVals), row.id).run();
+                }
               }
               if (vals.preferredName !== undefined) await reservoirOwnSet(env, row.email, row.name, { preferred_name: String(vals.preferredName || "").trim().slice(0, 40) || null }, user.email);
               if (vals.personalEmail !== undefined) {
