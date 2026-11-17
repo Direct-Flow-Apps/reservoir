@@ -297,6 +297,7 @@ async function receiptRecordsTable(env) {
   receiptRecordsReady = true;
   await env.DB.prepare("CREATE TABLE IF NOT EXISTS receipt_records (id TEXT PRIMARY KEY, by_name TEXT, by_email TEXT, type TEXT, amount TEXT, note TEXT, item_id TEXT, file_name TEXT, status TEXT, view TEXT, sent_date TEXT, done_date TEXT, created_at TEXT DEFAULT (datetime('now')))").run();
   for (const col of ["xero_name TEXT", "xero_at TEXT", "xero_state TEXT"]) { try { await env.DB.prepare(`ALTER TABLE receipt_records ADD COLUMN ${col}`).run(); } catch (e) { /* already there */ } }
+  try { await env.DB.prepare("UPDATE receipt_records SET xero_state = NULL").run(); } catch (e) { /* ignore */ }
 }
 
 // Xero never replies to the bills inbox email, so Reservoir looks in the Xero Files inbox for the file it sent. Waiting for 10 minutes without finding it means Xero did not take it.
@@ -6970,7 +6971,7 @@ export default {
   // Runs on a Cloudflare cron trigger if one is added (for example Thursday early morning). It only refreshes leave balances and leave history from Xero into D1.
   async scheduled(event, env, ctx) {
     // A five minute trigger, if one is added, only looks for new mail so pings arrive quickly.
-    if (event && event.cron === "*/5 * * * *") { ctx.waitUntil(mailWatch(env).catch((e) => console.log("mail watch failed", String(e && e.message || e)))); ctx.waitUntil(vbaSubscribe(env).then(() => vbaWatch(env)).catch((e) => console.log("vba watch failed", String(e && e.message || e)))); ctx.waitUntil(xeroVerify(env).catch((e) => console.log("xero verify failed", String(e && e.message || e)))); return; }
+    if (event && event.cron === "*/5 * * * *") { ctx.waitUntil(mailWatch(env).catch((e) => console.log("mail watch failed", String(e && e.message || e)))); ctx.waitUntil(vbaSubscribe(env).then(() => vbaWatch(env)).catch((e) => console.log("vba watch failed", String(e && e.message || e)))); return; }
     // Every run checks the automatic timesheets and the payroll sweeps. The leave sync keeps its own schedule and is skipped on the half hourly one.
     ctx.waitUntil(tsAutoRun(env).catch((e) => console.log("auto timesheets failed", String(e && e.message || e))));
     ctx.waitUntil(pushFlushHeld(env));
@@ -8852,16 +8853,7 @@ export default {
         const meta = await driveMeta(env, xm[1]);
         if (!meta) return reply(env, 404, { error: "not found", detail: "the file is no longer in SharePoint or its id is not valid", worker: WORKER_BUILD });
         if (meta.folder.startsWith("Receipts/Reimbursements") && user.tier !== "T1") return reply(env, 403, { error: "forbidden" });
-        const sentName = await sendToXero(env, user, meta);
-        try {
-          await receiptRecordsTable(env);
-          const now = new Date().toISOString();
-          const rec = await env.DB.prepare("SELECT id, xero_name, xero_at FROM receipt_records WHERE (',' || item_id || ',') LIKE ?").bind(`%,${xm[1]},%`).first();
-          if (rec) {
-            const fresh = rec.xero_at && Date.now() - Date.parse(rec.xero_at) < 60000 && rec.xero_name;
-            await env.DB.prepare("UPDATE receipt_records SET xero_name = ?, xero_at = ?, xero_state = 'waiting' WHERE id = ?").bind(fresh ? `${rec.xero_name}|${sentName}` : sentName, fresh ? rec.xero_at : now, rec.id).run();
-          }
-        } catch (e) { /* the check is a bonus, the send already happened */ }
+        await sendToXero(env, user, meta);
         return reply(env, 200, { ok: true });
       } catch (e) {
         return reply(env, e.message === "too large" ? 413 : 502, { error: "send failed", detail: String(e.message || "").slice(0, 200) });
@@ -8890,7 +8882,6 @@ export default {
       const mail = String(user.email || "").toLowerCase();
       const today = new Date().toISOString().slice(0, 10);
       if (request.method === "GET" && !rrm[1]) {
-        if ((user.tier === "T1" || user.tier === "T2") && Date.now() - xeroVerifyAt > 20000) { xeroVerifyAt = Date.now(); try { await xeroVerify(env); } catch (e) { /* try again next time */ } }
         const rows = user.tier === "T1"
           ? await env.DB.prepare("SELECT * FROM receipt_records ORDER BY created_at DESC LIMIT 300").all()
           : await env.DB.prepare("SELECT * FROM receipt_records WHERE by_email = ? ORDER BY created_at DESC LIMIT 300").bind(mail).all();
