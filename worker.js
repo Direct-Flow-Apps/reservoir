@@ -6881,9 +6881,29 @@ async function vbaClear(env, row, user) {
     await mailDo(env, mailAddress(env, jobs), `/messages/${encodeURIComponent(d.vbaMsg)}/move`, "POST", { destinationId: "archive" });
   } catch (e) { console.log("vba archive failed", String(e && e.message || e)); }
 }
+// A server side rule in DFP Jobs: read receipts go to the Archive as they arrive, so they never reach the inbox. Needs MailboxSettings.ReadWrite, the same as the Accounts rules.
+async function jobsRulesSync(env) {
+  const addr = mailAddress(env, MAILBOXES.find((x) => x.id === "jobs"));
+  const row = await env.DB.prepare("SELECT detail FROM app_settings WHERE key = 'jobsmail.rules_sync'").first();
+  const sig = "readreceipts-v1";
+  if (row && row.detail === sig) return;
+  const fr = await graphFetch(env, `/users/${encodeURIComponent(addr)}/mailFolders/archive?$select=id`);
+  const fid = fr.ok ? ((await fr.json()).id || "") : "";
+  if (!fid) { console.log("jobs rule: no archive folder", fr.status); return; }
+  const base = `/users/${encodeURIComponent(addr)}/mailFolders/inbox/messageRules`;
+  const list = await graphFetch(env, base);
+  if (!list.ok) { console.log("jobs rules list failed", list.status); return; }
+  const name = "Reservoir: read receipts to Archive";
+  const have = (((await list.json()).value) || []).find((x) => x.displayName === name);
+  const body = JSON.stringify({ displayName: name, sequence: 1, isEnabled: true, conditions: { subjectContains: ["Read: "], bodyContains: ["was read on"] }, actions: { moveToFolder: fid, stopProcessingRules: true } });
+  const res = have ? await graphFetch(env, `${base}/${have.id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body }) : await graphFetch(env, base, { method: "POST", headers: { "Content-Type": "application/json" }, body });
+  if (!res.ok) { console.log("jobs rule failed", res.status, (await res.text()).slice(0, 200)); return; }
+  await env.DB.prepare("INSERT OR REPLACE INTO app_settings (key, value, detail, by_name, at) VALUES ('jobsmail.rules_sync', '1', ?, 'Reservoir', datetime('now'))").bind(sig).run();
+}
 async function vbaSubscribe(env) {
   if (!env.GRAPH_CLIENT_SECRET) return;
   await settingsTable(env);
+  await jobsRulesSync(env).catch((e) => console.log("jobs rule sync failed", String(e && e.message || e)));
   const addr = mailAddress(env, MAILBOXES.find((x) => x.id === "jobs"));
   const row = await env.DB.prepare("SELECT value, detail FROM app_settings WHERE key = 'vba.sub'").first();
   const left = row && row.detail ? Date.parse(row.detail) - Date.now() : 0;
