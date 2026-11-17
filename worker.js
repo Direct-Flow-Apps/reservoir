@@ -4091,7 +4091,9 @@ async function mailDraftSend(env, addr, msg, op, text, to, extra) {
   }
   const old = String((made.json.body && made.json.body.content) || "");
   const mine = mailBodyHtml(x, text) + "<br>";
-  const html = /<body[^>]*>/i.test(old) ? old.replace(/<body[^>]*>/i, (m) => m + mine) : mine + old;
+  // The trail now sits in the editor, where it can be edited or deleted. "graph" means it was left untouched (the real trail from Microsoft goes under the message), "edited" means what is in the message is the trail, and "none" means it was deleted. Nothing sent means the old behaviour.
+  const keepTrail = x.trail !== "edited" && x.trail !== "none";
+  const html = !keepTrail ? mine : /<body[^>]*>/i.test(old) ? old.replace(/<body[^>]*>/i, (m) => m + mine) : mine + old;
   const patch = { body: { contentType: "HTML", content: html } };
   if (to && to.length) patch.toRecipients = to;
   else if (x.setTo) { const t = mailRecipients(x.to); if (t.length) patch.toRecipients = t; }
