@@ -5604,6 +5604,29 @@ async function pushForNotice(env, n, id) {
     }));
   } catch (e) { console.log("push for notice failed", String(e && e.message || e).slice(0, 160)); }
 }
+// ---- Incentives (T1 only). Tayler gives a team member a lunch or a voucher and notes why. ----
+const INCENTIVE_KINDS = ["Lunch", "Voucher"];
+async function incentivesTable(env) {
+  await env.DB.prepare("CREATE TABLE IF NOT EXISTS incentives (id TEXT PRIMARY KEY, to_name TEXT, to_email TEXT, kind TEXT, note TEXT, by_name TEXT, at TEXT)").run();
+}
+async function incentivesRoutes(request, env, user, url) {
+  if (url.pathname !== "/api/incentives") return null;
+  if (user.tier !== "T1") return reply(env, 403, { error: "forbidden" });
+  await incentivesTable(env);
+  if (request.method === "GET") {
+    const rows = await env.DB.prepare("SELECT id, to_name, to_email, kind, note, at FROM incentives ORDER BY at DESC LIMIT 100").all();
+    return reply(env, 200, { ok: true, kinds: INCENTIVE_KINDS, items: (rows.results || []).map((r) => ({ id: r.id, name: r.to_name, email: r.to_email, kind: r.kind, note: r.note, at: r.at })) });
+  }
+  let body = {};
+  try { body = await request.json(); } catch (e) { body = {}; }
+  const name = String(body.name || "").replace(/\s+/g, " ").trim().slice(0, 80);
+  const kind = INCENTIVE_KINDS.find((k) => k === String(body.kind || ""));
+  const note = String(body.note || "").trim().slice(0, 1000);
+  if (!name || !kind || !note) return reply(env, 400, { error: "Choose a person and an incentive, and say why." });
+  const id = crypto.randomUUID();
+  await env.DB.prepare("INSERT INTO incentives (id, to_name, to_email, kind, note, by_name, at) VALUES (?, ?, ?, ?, ?, ?, datetime('now'))").bind(id, name, String(body.email || "").toLowerCase().slice(0, 120), kind, note, String(user.name || "")).run();
+  return reply(env, 200, { ok: true, id });
+}
 async function pushRoutes(request, env, user, url) {
   if (!url.pathname.startsWith("/api/push/")) return null;
   const email = String(user.email || "").toLowerCase();
@@ -7135,6 +7158,8 @@ export default {
     if (leaveReply) return leaveReply;
     const timesheetReply = await timesheetRoutes(request, env, user, url);
     if (timesheetReply) return timesheetReply;
+    const incReply = await incentivesRoutes(request, env, user, url);
+    if (incReply) return incReply;
     const pushReply = await pushRoutes(request, env, user, url);
     if (pushReply) return pushReply;
     const reqsReply = await appRequestsRoutes(request, env, user, url);
