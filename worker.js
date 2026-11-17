@@ -4085,8 +4085,26 @@ function mailSafeHtml(h) {
   return String(h || "").slice(0, 400000).replace(/<script[\s\S]*?<\/script>/gi, "").replace(/\son[a-z]+\s*=\s*("[^"]*"|'[^']*')/gi, "").replace(/\scontenteditable="[^"]*"/gi, "");
 }
 const mailBodyHtml = (b, text) => b && typeof b.html === "string" && b.html.trim() ? `<div style="font-family:Calibri,sans-serif;font-size:11pt">${mailSafeHtml(b.html)}</div>` : mailHtml(String(text || "").slice(0, 200000));
+// The signature logo is a link to the Reservoir site, which iPhone Mail and others drop from the quoted trail when a client replies. Swap the link for an inline attachment so the logo travels inside the email.
+let mailLogoCache = null;
+async function mailEmbedLogo(env, body) {
+  try {
+    if (!body || typeof body.html !== "string") return;
+    const m = body.html.match(/https:\/\/[^"'\s<>]+\/dfp-signature-logo\.png/i);
+    if (!m) return;
+    const okHost = String(env.ALLOWED_ORIGIN || "").split(",").map((x) => x.trim().replace(/\/$/, "")).filter(Boolean).some((o) => m[0].toLowerCase().startsWith(o.toLowerCase() + "/"));
+    if (!okHost) return;
+    if (!mailLogoCache) {
+      const r = await fetch(m[0]);
+      if (!r.ok) return;
+      mailLogoCache = toB64(await r.arrayBuffer());
+    }
+    body.html = body.html.split(m[0]).join("cid:dfplogo");
+    body.attachments = [...(Array.isArray(body.attachments) ? body.attachments : []), { name: "dfp-signature-logo.png", type: "image/png", data: mailLogoCache, cid: "dfplogo" }];
+  } catch (e) { console.log("logo embed failed", String(e && e.message || e)); }
+}
 function mailAtts(list) {
-  return (Array.isArray(list) ? list : []).slice(0, 8).filter((a) => a && a.name && typeof a.data === "string" && a.data.length < 4500000).map((a) => ({ "@odata.type": "#microsoft.graph.fileAttachment", name: String(a.name).slice(0, 150), contentType: String(a.type || "application/octet-stream").slice(0, 100), contentBytes: a.data }));
+  return (Array.isArray(list) ? list : []).slice(0, 8).filter((a) => a && a.name && typeof a.data === "string" && a.data.length < 4500000).map((a) => ({ "@odata.type": "#microsoft.graph.fileAttachment", name: String(a.name).slice(0, 150), contentType: String(a.type || "application/octet-stream").slice(0, 100), contentBytes: a.data, ...(a.cid ? { isInline: true, contentId: String(a.cid).slice(0, 60) } : {}) }));
 }
 const mailWhenOk = (v) => { const t = Date.parse(String(v || "")); return t && t > Date.now() + 30000 ? new Date(t).toISOString() : ""; };
 // Reply and forward: make the draft, put the typed words (in Calibri 11) above the quoted mail, then send it. extra can carry the formatted body, attachments, importance, a send time, or noSend to keep it as a draft.
@@ -4322,6 +4340,7 @@ async function mailRoutes(request, env, user, url) {
     if (post) {
       const act = url.pathname.replace("/api/mail/", "");
       const msg = mailId(body && body.msg);
+      if (["send", "reply", "replyall", "forward", "savedraft"].includes(act)) await mailEmbedLogo(env, body);
       const done = (r) => r.ok ? reply(env, 200, { ok: true, worker: WORKER_BUILD }) : reply(env, 200, { ok: false, error: mailWhy(r, true), worker: WORKER_BUILD });
       if (act === "catadd") {
         const nm = String(body.name || "").replace(/\s+/g, " ").trim().slice(0, 40);
