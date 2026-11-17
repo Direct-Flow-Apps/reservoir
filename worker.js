@@ -6835,10 +6835,10 @@ async function vbaWatch(env) {
     const key = "vba.done." + String(m.id).slice(-60);
     const seen = await env.DB.prepare("SELECT 1 AS x FROM app_settings WHERE key = ?").bind(key).first();
     if (seen) continue;
-    await env.DB.prepare("INSERT OR REPLACE INTO app_settings (key, value, detail, by_name, at) VALUES (?, '1', 'vba code sent', 'Reservoir', datetime('now'))").bind(key).run();
     const text = String((m.bodyPreview || "") + " " + String((m.body && m.body.content) || "").replace(/<[^>]*>/g, " "));
     const mm = text.match(/(?<!\d)(\d{6})(?!\d)/);
     if (!mm) continue;
+    await env.DB.prepare("INSERT OR REPLACE INTO app_settings (key, value, detail, by_name, at) VALUES (?, '1', 'vba code sent', 'Reservoir', datetime('now'))").bind(key).run();
     for (const e of to) await notify(env, { to: e, kind: "vba", title: `VBA 360 code ${mm[1]}`, body: "Tick this once you have used the code. It clears for the others and the email is archived.", todo: true, data: { vbaMsg: m.id, box: "jobs" }, by: "Reservoir" });
   }
 }
@@ -6882,7 +6882,7 @@ export default {
   // Runs on a Cloudflare cron trigger if one is added (for example Thursday early morning). It only refreshes leave balances and leave history from Xero into D1.
   async scheduled(event, env, ctx) {
     // A five minute trigger, if one is added, only looks for new mail so pings arrive quickly.
-    if (event && event.cron === "*/5 * * * *") { ctx.waitUntil(mailWatch(env).catch((e) => console.log("mail watch failed", String(e && e.message || e)))); return; }
+    if (event && event.cron === "*/5 * * * *") { ctx.waitUntil(mailWatch(env).catch((e) => console.log("mail watch failed", String(e && e.message || e)))); ctx.waitUntil(vbaSubscribe(env).then(() => vbaWatch(env)).catch((e) => console.log("vba watch failed", String(e && e.message || e)))); return; }
     // Every run checks the automatic timesheets and the payroll sweeps. The leave sync keeps its own schedule and is skipped on the half hourly one.
     ctx.waitUntil(tsAutoRun(env).catch((e) => console.log("auto timesheets failed", String(e && e.message || e))));
     ctx.waitUntil(pushFlushHeld(env));
