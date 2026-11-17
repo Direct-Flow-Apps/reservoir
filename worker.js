@@ -227,57 +227,6 @@ async function driveBytes(env, id) {
 // While testing, a director viewing as someone can do everything that person can. Set false before go live to make View As read only again.
 const VIEW_AS_WRITES = true;
 
-// Receipts go into Xero as a draft bill made straight through the API with the file attached, so Xero itself confirms it is there. Reimbursements are filed under the team member, company receipts under a Company Receipts contact.
-async function xeroDraftFromReceipt(env, user, meta, rec) {
-  await xeroContactsTable(env);
-  const bytes = await driveBytes(env, meta.id);
-  if (bytes.byteLength > 10 * 1024 * 1024) throw new Error("That file is over Xero's 10 MB attachment limit.");
-  const head = new Uint8Array(bytes.slice(0, 16));
-  const ascii = (a0, a1) => String.fromCharCode(...head.slice(a0, a1));
-  let kind = "", mime = "";
-  if (ascii(0, 4) === "%PDF") { kind = "pdf"; mime = "application/pdf"; }
-  else if (head[0] === 0x89 && ascii(1, 4) === "PNG") { kind = "png"; mime = "image/png"; }
-  else if (head[0] === 0xFF && head[1] === 0xD8) { kind = "jpg"; mime = "image/jpeg"; }
-  else if (ascii(4, 8) === "ftyp" && /heic|heif|mif1|msf1|heix/i.test(ascii(8, 12))) { kind = "heic"; mime = "image/heic"; }
-  else mime = (meta.file && meta.file.mimeType) || "application/octet-stream";
-  let fileName = String(meta.name || "receipt");
-  if (kind) fileName = fileName.replace(/\.[A-Za-z0-9]{2,5}$/, "") + "." + kind;
-  // A receipt sent while it is being uploaded has no saved record yet, so the person comes from the file name (for example "20261116 Reimbursement Mitch 1311.pdf").
-  const nameMatch = /reimbursement\s+([A-Za-z'-]+)/i.exec(String(meta.name || ""));
-  const isReimb = rec ? rec.type === "reimbursement" : (!!nameMatch || String(meta.folder || "").startsWith("Receipts/Reimbursements"));
-  let contactName = "Company Receipts";
-  if (isReimb) {
-    let person = null;
-    if (rec && rec.by_email) person = await env.DB.prepare("SELECT name FROM dfp_xero WHERE lower(email) = ?").bind(String(rec.by_email).toLowerCase()).first();
-    const first = rec && rec.by_name ? rec.by_name : (nameMatch ? nameMatch[1] : "");
-    if (!person && first) person = await env.DB.prepare("SELECT name FROM dfp_xero WHERE lower(name) LIKE ? ORDER BY name LIMIT 1").bind(`${first.toLowerCase()} %`).first();
-    contactName = String((person && person.name) || first || "Reimbursement").trim();
-  }
-  const found = ((await env.DB.prepare("SELECT contact_id FROM xero_contacts WHERE name_lc = ?").bind(contactName.toLowerCase()).all()).results) || [];
-  let contactId = found.length ? found[0].contact_id : "";
-  if (!contactId) {
-    const q = await xeroFetch(env, `api.xro/2.0/Contacts?where=${encodeURIComponent(`Name=="${contactName.replace(/"/g, "")}"`)}`);
-    if (q.ok) contactId = ((((await q.json()).Contacts) || [])[0] || {}).ContactID || "";
-  }
-  if (!contactId) {
-    const c = await xeroFetch(env, "api.xro/2.0/Contacts", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ Contacts: [{ Name: contactName }] }) });
-    if (!c.ok) throw new Error(`Could not create the Xero contact ${contactName} (Xero ${c.status})`);
-    contactId = ((((await c.json()).Contacts) || [])[0] || {}).ContactID || "";
-    if (!contactId) throw new Error(`Xero did not create the contact ${contactName}`);
-  }
-  const amount = Number(String((rec && rec.amount) || "").replace(/[^0-9.]/g, "")) || 0;
-  const today = new Date(Date.now() + 11 * 3600 * 1000).toISOString().slice(0, 10);
-  const label = isReimb ? `Reimbursement - ${contactName}` : "Company receipt";
-  const body = { Invoices: [{ Type: "ACCPAY", Contact: { ContactID: contactId }, Date: today, DueDate: billDueDate(today), Reference: fileName.slice(0, 60), LineAmountTypes: "Inclusive", Status: "DRAFT", LineItems: [{ Description: `${label} (${fileName})`.slice(0, 250), Quantity: 1, UnitAmount: amount }] }] };
-  const res = await xeroFetch(env, "api.xro/2.0/Invoices?summarizeErrors=false", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
-  if (!res.ok) throw new Error(`Xero ${res.status}: ${String(await res.text()).replace(/\s+/g, " ").slice(0, 160)}`);
-  const inv = (((await res.json()).Invoices) || [])[0] || {};
-  const msgs = [...(inv.ValidationErrors || []), ...(inv.Warnings || [])].map((e) => e.Message).filter(Boolean).join("; ");
-  if (!inv.InvoiceID || /^0+(-0+)*$/.test(inv.InvoiceID) || inv.StatusAttributeString === "ERROR") throw new Error(msgs || "Xero did not save the draft bill");
-  const at = await xeroFetch(env, `api.xro/2.0/Invoices/${inv.InvoiceID}/Attachments/${encodeURIComponent(fileName)}`, { method: "PUT", headers: { "Content-Type": mime }, body: bytes });
-  if (!at.ok) throw new Error(`The draft bill was made in Xero but the file did not attach (Xero ${at.status}: ${String(await at.text()).replace(/\s+/g, " ").slice(0, 120)})`);
-  return { fileName, invoiceId: inv.InvoiceID };
-}
 async function sendToXero(env, user, meta) {
   if (!env.XERO_BILLS_EMAIL) throw new Error("XERO_BILLS_EMAIL is not set on the Worker");
   const bytes = await driveBytes(env, meta.id);
@@ -8895,26 +8844,24 @@ export default {
       }
     }
 
-    const xm = url.pathname.match(/^\/api\/(docs|receipts)\/([A-Za-z0-9!_-]{1,200})\/xero$/);
+    const xm = url.pathname.match(/^\/api\/(?:docs|receipts)\/([A-Za-z0-9!_-]{1,200})\/xero$/);
     if (xm && request.method === "POST") {
       // Email a stored PDF to the Xero bills inbox. Reimbursements can only be released by T1.
       if (user.tier !== "T1" && user.tier !== "T2") return reply(env, 403, { error: "forbidden" });
       try {
-        const meta = await driveMeta(env, xm[2]);
+        const meta = await driveMeta(env, xm[1]);
         if (!meta) return reply(env, 404, { error: "not found", detail: "the file is no longer in SharePoint or its id is not valid", worker: WORKER_BUILD });
         if (meta.folder.startsWith("Receipts/Reimbursements") && user.tier !== "T1") return reply(env, 403, { error: "forbidden" });
-        if (xm[1] === "docs") { await sendToXero(env, user, meta); return reply(env, 200, { ok: true }); }
-        await receiptRecordsTable(env);
-        const rec = await env.DB.prepare("SELECT id, type, by_name, by_email, amount FROM receipt_records WHERE (',' || item_id || ',') LIKE ?").bind(`%,${xm[2]},%`).first();
-        const made = await xeroDraftFromReceipt(env, user, meta, rec);
+        const sentName = await sendToXero(env, user, meta);
         try {
+          await receiptRecordsTable(env);
+          const now = new Date().toISOString();
+          const rec = await env.DB.prepare("SELECT id, xero_name, xero_at FROM receipt_records WHERE (',' || item_id || ',') LIKE ?").bind(`%,${xm[1]},%`).first();
           if (rec) {
-            const now = new Date().toISOString();
-            const prior = await env.DB.prepare("SELECT xero_name, xero_at FROM receipt_records WHERE id = ?").bind(rec.id).first();
-            const fresh = prior && prior.xero_at && Date.now() - Date.parse(prior.xero_at) < 60000 && prior.xero_name;
-            await env.DB.prepare("UPDATE receipt_records SET xero_name = ?, xero_at = ?, xero_state = 'ok' WHERE id = ?").bind(fresh ? `${prior.xero_name}|${made.fileName}` : made.fileName, fresh ? prior.xero_at : now, rec.id).run();
+            const fresh = rec.xero_at && Date.now() - Date.parse(rec.xero_at) < 60000 && rec.xero_name;
+            await env.DB.prepare("UPDATE receipt_records SET xero_name = ?, xero_at = ?, xero_state = 'waiting' WHERE id = ?").bind(fresh ? `${rec.xero_name}|${sentName}` : sentName, fresh ? rec.xero_at : now, rec.id).run();
           }
-        } catch (e) { /* the draft is already in Xero */ }
+        } catch (e) { /* the check is a bonus, the send already happened */ }
         return reply(env, 200, { ok: true });
       } catch (e) {
         return reply(env, e.message === "too large" ? 413 : 502, { error: "send failed", detail: String(e.message || "").slice(0, 200) });
