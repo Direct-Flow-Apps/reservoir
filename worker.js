@@ -5606,6 +5606,7 @@ async function noticesRoutes(request, env, user, url) {
     if (!row) return reply(env, 404, { error: "That notice is not there any more." });
     if (m[2] === "read") await env.DB.prepare("UPDATE notices SET read_at = COALESCE(read_at, datetime('now')) WHERE id = ?").bind(row.id).run();
     else await env.DB.prepare("UPDATE notices SET done_at = COALESCE(done_at, datetime('now')), read_at = COALESCE(read_at, datetime('now')), done_by = COALESCE(done_by, ?) WHERE id = ?").bind(user.name || email, row.id).run();
+    if (m[2] === "done" && row.kind === "vba") await vbaClear(env, row, user);
     return reply(env, 200, { ok: true });
   }
   return reply(env, 404, { error: "not found" });
@@ -6814,6 +6815,61 @@ async function invRulesSync(env) {
   }
   if (ok) await env.DB.prepare("INSERT OR REPLACE INTO app_settings (key, value, detail, by_name, at) VALUES ('invmail.rules_sync', '1', ?, 'Reservoir', datetime('now'))").bind(sig).run();
 }
+
+// VBA 360 sign in codes. The VBA emails a six digit code to DFP Jobs. It goes to Tayler, Andrew and Mitch as a notice with a tick; when one of them ticks it, the other notices clear and the email is archived.
+const VBA_SUBJECT = /VBA\s*360\s*verification\s*code/i;
+const VBA_PEOPLE = /^(tayler|andrew|mitch)/i;
+async function vbaWatch(env) {
+  if (!env.GRAPH_CLIENT_SECRET) return;
+  await settingsTable(env);
+  const jobs = MAILBOXES.find((x) => x.id === "jobs");
+  const addr = mailAddress(env, jobs);
+  const since = new Date(Date.now() - 40 * 60000).toISOString();
+  const r = await mailGraph(env, addr, `/mailFolders/inbox/messages?$top=15&$select=id,subject,receivedDateTime,bodyPreview,body&$orderby=receivedDateTime desc&$filter=${encodeURIComponent("receivedDateTime ge " + since)}`);
+  if (!r.ok) { console.log("vba watch", r.status); return; }
+  const hits = ((r.json && r.json.value) || []).filter((m) => VBA_SUBJECT.test(String(m.subject || "")));
+  if (!hits.length) return;
+  const tiers = await accessTiers(env);
+  const to = Object.keys(tiers).filter((e) => (tiers[e] === "T1" || tiers[e] === "T2") && VBA_PEOPLE.test(e.split("@")[0]));
+  for (const m of hits) {
+    const key = "vba.done." + String(m.id).slice(-60);
+    const seen = await env.DB.prepare("SELECT 1 AS x FROM app_settings WHERE key = ?").bind(key).first();
+    if (seen) continue;
+    await env.DB.prepare("INSERT OR REPLACE INTO app_settings (key, value, detail, by_name, at) VALUES (?, '1', 'vba code sent', 'Reservoir', datetime('now'))").bind(key).run();
+    const text = String((m.bodyPreview || "") + " " + String((m.body && m.body.content) || "").replace(/<[^>]*>/g, " "));
+    const mm = text.match(/(?<!\d)(\d{6})(?!\d)/);
+    if (!mm) continue;
+    for (const e of to) await notify(env, { to: e, kind: "vba", title: `VBA 360 code ${mm[1]}`, body: "Tick this once you have used the code. It clears for the others and the email is archived.", todo: true, data: { vbaMsg: m.id, box: "jobs" }, by: "Reservoir" });
+  }
+}
+async function vbaClear(env, row, user) {
+  let d = null;
+  try { d = row.data ? JSON.parse(row.data) : null; } catch (e) { d = null; }
+  if (!d || !d.vbaMsg) return;
+  await env.DB.prepare("UPDATE notices SET done_at = COALESCE(done_at, datetime('now')), read_at = COALESCE(read_at, datetime('now')), done_by = COALESCE(done_by, ?) WHERE kind = 'vba' AND data = ?").bind(user.name || user.email || "", row.data).run();
+  try {
+    const jobs = MAILBOXES.find((x) => x.id === "jobs");
+    await mailDo(env, mailAddress(env, jobs), `/messages/${encodeURIComponent(d.vbaMsg)}/move`, "POST", { destinationId: "archive" });
+  } catch (e) { console.log("vba archive failed", String(e && e.message || e)); }
+}
+async function vbaSubscribe(env) {
+  if (!env.GRAPH_CLIENT_SECRET) return;
+  await settingsTable(env);
+  const addr = mailAddress(env, MAILBOXES.find((x) => x.id === "jobs"));
+  const row = await env.DB.prepare("SELECT value, detail FROM app_settings WHERE key = 'vba.sub'").first();
+  const left = row && row.detail ? Date.parse(row.detail) - Date.now() : 0;
+  if (row && row.value && left > 24 * 3600 * 1000) return;
+  const expires = new Date(Date.now() + 4200 * 60000).toISOString();
+  const save = (id) => env.DB.prepare("INSERT OR REPLACE INTO app_settings (key, value, detail, by_name, at) VALUES ('vba.sub', ?, ?, 'Reservoir', datetime('now'))").bind(id, expires).run();
+  if (row && row.value) {
+    const r = await graphFetch(env, `/subscriptions/${encodeURIComponent(row.value)}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ expirationDateTime: expires }) });
+    if (r.ok) { await save(row.value); return; }
+  }
+  const r = await graphFetch(env, "/subscriptions", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ changeType: "created", notificationUrl: `${env.API_ORIGIN || "https://reservoir-api.directflow.workers.dev"}/api/vba/notify`, resource: `users/${addr}/mailFolders/inbox/messages`, expirationDateTime: expires, clientState: await invClientState(env) }) });
+  const j = await r.json().catch(() => ({}));
+  if (r.ok && j.id) await save(j.id);
+  else console.log("vba subscription failed", r.status, JSON.stringify(j).slice(0, 300));
+}
 async function invMailCron(env) {
   await invOneTimeClear(env);
   await invRebuildHistory(env, 15000);
@@ -6837,6 +6893,7 @@ export default {
     ctx.waitUntil(mailWatch(env).catch((e) => console.log("mail watch failed", String(e && e.message || e))));
     ctx.waitUntil(mailDraftsSweep(env).catch((e) => console.log("drafts sweep failed", String(e && e.message || e))));
     ctx.waitUntil(invMailCron(env).catch((e) => console.log("invoice mail cron failed", String(e && e.message || e))));
+    ctx.waitUntil(vbaSubscribe(env).then(() => vbaWatch(env)).catch((e) => console.log("vba watch failed", String(e && e.message || e))));
     ctx.waitUntil(payrollSweep(env).catch((e) => console.log("payroll sweep failed", String(e && e.message || e))));
     ctx.waitUntil(incidentReminders(env).catch((e) => console.log("incident reminders failed", String(e && e.message || e))));
     if (event && (event.cron === "*/30 * * * *" || event.cron === "*/15 * * * *")) return;
@@ -6868,6 +6925,17 @@ export default {
         const want = await invClientState(env);
         const real = ((body && body.value) || []).filter((n) => n && n.clientState === want);
         if (real.length && ctx) ctx.waitUntil(invMailSweep(env, 1).catch((e) => console.log("invoice ping failed", String(e && e.message || e))));
+      } catch (e) { /* a bad ping is ignored */ }
+      return new Response(null, { status: 202 });
+    }
+    if (earlyUrl.pathname === "/api/vba/notify" && request.method === "POST") {
+      const vt = earlyUrl.searchParams.get("validationToken");
+      if (vt) return new Response(vt, { status: 200, headers: { "Content-Type": "text/plain" } });
+      try {
+        const body = await request.json();
+        const want = await invClientState(env);
+        const real = ((body && body.value) || []).filter((n) => n && n.clientState === want);
+        if (real.length && ctx) ctx.waitUntil(vbaWatch(env).catch((e) => console.log("vba ping failed", String(e && e.message || e))));
       } catch (e) { /* a bad ping is ignored */ }
       return new Response(null, { status: 202 });
     }
