@@ -231,13 +231,25 @@ async function sendToXero(env, user, meta) {
   if (!env.XERO_BILLS_EMAIL) throw new Error("XERO_BILLS_EMAIL is not set on the Worker");
   const bytes = await driveBytes(env, meta.id);
   if (bytes.byteLength > MAX_EMAIL) throw new Error("too large");
+  // Xero only reads PDF, JPG and PNG. Go by what the file really is, not by its name or the type SharePoint guessed, and give it the matching name and type.
+  const head = new Uint8Array(bytes.slice(0, 16));
+  const ascii = (a0, a1) => String.fromCharCode(...head.slice(a0, a1));
+  let kind = "";
+  if (ascii(0, 4) === "%PDF") kind = "pdf";
+  else if (head[0] === 0x89 && ascii(1, 4) === "PNG") kind = "png";
+  else if (head[0] === 0xFF && head[1] === 0xD8) kind = "jpg";
+  else if (ascii(4, 8) === "ftyp" && /heic|heif|mif1|msf1|heix/i.test(ascii(8, 12))) throw new Error("This file is a HEIC photo, which Xero cannot read. Take the photo again as JPG or send a screenshot.");
+  else if (ascii(0, 3) === "GIF") throw new Error("Xero cannot read GIF files. Send a PDF, JPG or PNG.");
+  const mimeOf = { pdf: "application/pdf", png: "image/png", jpg: "image/jpeg" };
+  let fileName = String(meta.name || "receipt");
+  if (kind) fileName = fileName.replace(/\.[A-Za-z0-9]{2,5}$/, "") + "." + kind;
   const sender = env.MAIL_SENDER || MAIL_SENDER_DEFAULT;
   const payload = JSON.stringify({
     message: {
-      subject: meta.name,
+      subject: fileName,
       body: { contentType: "Text", content: `Sent from Reservoir by ${user.name}.` },
       toRecipients: [{ emailAddress: { address: env.XERO_BILLS_EMAIL } }],
-      attachments: [{ "@odata.type": "#microsoft.graph.fileAttachment", name: meta.name, contentType: (meta.file && meta.file.mimeType) || "application/pdf", contentBytes: toB64(bytes) }]
+      attachments: [{ "@odata.type": "#microsoft.graph.fileAttachment", name: fileName, contentType: kind ? mimeOf[kind] : ((meta.file && meta.file.mimeType) || "application/pdf"), contentBytes: toB64(bytes) }]
     },
     saveToSentItems: true
   });
