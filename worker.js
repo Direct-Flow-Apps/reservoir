@@ -6840,7 +6840,7 @@ const VBA_PEOPLE = /^(tayler|andrew|mitch)/i;
 async function jobsReadSweep(env) {
   const jobs = MAILBOXES.find((x) => x.id === "jobs");
   const addr = mailAddress(env, jobs);
-  const r = await mailGraph(env, addr, `/mailFolders/inbox/messages?$top=50&$select=id,subject,bodyPreview&$filter=${encodeURIComponent("startswith(subject,'Read:')")}`);
+  const r = await mailGraph(env, addr, `/mailFolders/inbox/messages?$top=100&$select=id,subject,bodyPreview&$filter=${encodeURIComponent("startswith(subject,'Read:')")}`);
   if (!r.ok) { console.log("read sweep", r.status); return; }
   for (const m of ((r.json && r.json.value) || [])) {
     if (!/^read:\s/i.test(String(m.subject || "")) || !/was read on/i.test(String(m.bodyPreview || ""))) continue;
