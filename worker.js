@@ -3823,7 +3823,7 @@ const MAILBOXES = [
   { id: "tayler", label: "Tayler", address: "tayler@directflow.com.au", only: ["tayler@directflow.com.au"] }
 ];
 const mailAddress = (env, b) => String((env && env["MAILBOX_" + b.id.toUpperCase()]) || b.address).toLowerCase();
-const mailAllowed = (b, user) => b.only ? b.only.includes(String(user.email || "").toLowerCase()) : b.tiers.includes(user.tier);
+const mailAllowed = (b, user) => b.only ? (b.only.includes(String(user.email || "").toLowerCase()) || (b.id === "tayler" && user.tier === "T1" && (/^tayler/i.test(String(user.email || "")) || /^tayler\b/i.test(String(user.name || ""))))) : b.tiers.includes(user.tier);
 async function mailGraph(env, address, qs) {
   // qs is a path inside the mailbox, or the full next page link Graph handed back.
   const target = qs.startsWith(GRAPH + "/") ? qs : `/users/${encodeURIComponent(address)}${qs}`;
