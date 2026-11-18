@@ -329,7 +329,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
   await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
 }
 
-const WORKER_BUILD = "Reservoir-Worker-2026.11.19-w223";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.19-w224";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.izzyandloki.workers.dev/api/xero/callback";
@@ -4212,6 +4212,24 @@ const mailPart = (x) => ({ name: String((x && x.emailAddress && x.emailAddress.n
 const mailShow = (x) => { const a = mailPart(x); return a.name || a.address; };
 // What was last done with a message: Outlook keeps it in the last verb property (102 reply, 103 reply all, 104 forward).
 const mailAns = (m) => { const p = ((m && m.singleValueExtendedProperties) || []).find((x) => x && /1081/i.test(String(x.id))); const v = p ? Number(p.value) : 0; return v === 102 || v === 103 ? "reply" : v === 104 ? "forward" : ""; };
+// Notes on emails and the "not urgent" switch are shared by everyone who can open the mailbox. They are matched on the email's internet id, which stays the same when the email is moved or archived.
+async function mailExtraTable(env) {
+  await env.DB.prepare("CREATE TABLE IF NOT EXISTS mail_extra (box TEXT NOT NULL, imid TEXT NOT NULL, note TEXT NOT NULL DEFAULT '', note_by TEXT, note_at TEXT, urgent_off INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (box, imid))").run();
+}
+async function mailExtraFor(env, boxId, imids) {
+  const out = new Map();
+  const ids = [...new Set(imids.filter(Boolean).map((x) => String(x).slice(0, 300)))];
+  if (!ids.length) return out;
+  try {
+    await mailExtraTable(env);
+    for (let i = 0; i < ids.length; i += 40) {
+      const part = ids.slice(i, i + 40);
+      const r = await env.DB.prepare(`SELECT imid, note, note_by, note_at, urgent_off FROM mail_extra WHERE box = ? AND imid IN (${part.map(() => "?").join(",")})`).bind(boxId, ...part).all();
+      ((r && r.results) || []).forEach((x) => out.set(x.imid, x));
+    }
+  } catch (e) {}
+  return out;
+}
 const mailFlag = (f) => (f && (f.flagStatus === "flagged" || f.flagStatus === "complete")) ? f.flagStatus : "";
 const mailId = (v) => { const t = String(v || ""); return t && t.length < 600 ? t : ""; };
 const mailFolderId = (v) => { const t = String(v || "inbox"); return /^[A-Za-z0-9_\-=+\/.]{1,300}$/.test(t) ? t : "inbox"; };
@@ -4280,7 +4298,7 @@ async function mailRoutes(request, env, user, url) {
       const top = Math.max(1, Math.min(200, Number(url.searchParams.get("top")) || 40));
       const filter = url.searchParams.get("filter") || "";
       const q = String(url.searchParams.get("q") || "").replace(/["\\]/g, " ").trim().slice(0, 100);
-      const fields = "$select=subject,from,toRecipients,receivedDateTime,isRead,bodyPreview,hasAttachments,categories,flag,parentFolderId&$expand=singleValueExtendedProperties($filter=id eq 'Integer 0x1081')";
+      const fields = "$select=subject,from,toRecipients,receivedDateTime,isRead,bodyPreview,hasAttachments,categories,flag,parentFolderId,internetMessageId&$expand=singleValueExtendedProperties($filter=id eq 'Integer 0x1081')";
       let rows = [];
       if (q) {
         // A search covers every folder in the mailbox and reads every page of results Graph offers, so older matches are never left out. Graph itself stops a message search at 1,000 results.
@@ -4319,12 +4337,14 @@ async function mailRoutes(request, env, user, url) {
         } catch (e) {}
       }
       const list = rows.map((m) => ({ id: m.id, pf: String(m.parentFolderId || ""), ...(q && where.get(m.parentFolderId) ? { folder: where.get(m.parentFolderId).slice(0, 40) } : null), from: mailShow(m.from).slice(0, 80), fromAddr: mailPart(m.from).address.toLowerCase(), to: ((m.toRecipients || []).map(mailShow).join(", ")).slice(0, 120), subject: String(m.subject || "(no subject)").slice(0, 160), at: m.receivedDateTime || "", read: !!m.isRead, attach: !!m.hasAttachments, categories: (m.categories || []).slice(0, 6).map((c) => String(c).slice(0, 40)), flag: mailFlag(m.flag), ans: mailAns(m), preview: String(m.bodyPreview || "").replace(/\s+/g, " ").slice(0, 140) }));
+      const extra = await mailExtraFor(env, box.id, rows.map((m) => m.internetMessageId));
+      list.forEach((it, i) => { const imid = rows[i] && rows[i].internetMessageId; if (!imid) return; it.imid = String(imid).slice(0, 300); const x = extra.get(it.imid); if (x) { if (x.note) it.note = true; if (x.urgent_off) it.uoff = true; } });
       return reply(env, 200, { ok: true, label: box.label, messages: list, more: !q && list.length >= top, worker: WORKER_BUILD });
     }
     if (url.pathname === "/api/mail/message" && !post) {
       const msg = mailId(url.searchParams.get("msg"));
       if (!msg) return reply(env, 400, { error: "bad request" });
-      const r = await mailGraph(env, addr, `/messages/${encodeURIComponent(msg)}?$select=subject,from,toRecipients,ccRecipients,receivedDateTime,sentDateTime,body,hasAttachments,isRead,categories,flag&$expand=attachments($select=id,name,size,contentType,isInline)`);
+      const r = await mailGraph(env, addr, `/messages/${encodeURIComponent(msg)}?$select=subject,from,toRecipients,ccRecipients,receivedDateTime,sentDateTime,body,hasAttachments,isRead,categories,flag,internetMessageId&$expand=attachments($select=id,name,size,contentType,isInline)`);
       if (!r.ok) return reply(env, 200, { ok: false, error: mailWhy(r), worker: WORKER_BUILD });
       const m = r.json || {};
       const html = !!(m.body && String(m.body.contentType || "").toLowerCase() === "html");
@@ -4343,7 +4363,9 @@ async function mailRoutes(request, env, user, url) {
           } catch (e) {}
         }
       }
-      return reply(env, 200, { ok: true, id: m.id, subject: String(m.subject || "(no subject)"), from: mailPart(m.from), to: (m.toRecipients || []).map(mailPart), cc: (m.ccRecipients || []).map(mailPart), at: m.receivedDateTime || m.sentDateTime || "", read: !!m.isRead, categories: (m.categories || []).slice(0, 6).map((c) => String(c).slice(0, 40)), flag: mailFlag(m.flag), html, body: shown, attachments: (m.attachments || []).filter((a) => !a.isInline).map((a) => ({ id: a.id, name: String(a.name || "attachment").slice(0, 160), size: Number(a.size || 0), type: String(a.contentType || "") })), worker: WORKER_BUILD });
+      const imid = String(m.internetMessageId || "").slice(0, 300);
+      const ex = imid ? (await mailExtraFor(env, box.id, [imid])).get(imid) : null;
+      return reply(env, 200, { ok: true, id: m.id, imid, note: ex && ex.note ? { text: String(ex.note), by: String(ex.note_by || ""), at: String(ex.note_at || "") } : null, urgentOff: !!(ex && ex.urgent_off), subject: String(m.subject || "(no subject)"), from: mailPart(m.from), to: (m.toRecipients || []).map(mailPart), cc: (m.ccRecipients || []).map(mailPart), at: m.receivedDateTime || m.sentDateTime || "", read: !!m.isRead, categories: (m.categories || []).slice(0, 6).map((c) => String(c).slice(0, 40)), flag: mailFlag(m.flag), html, body: shown, attachments: (m.attachments || []).filter((a) => !a.isInline).map((a) => ({ id: a.id, name: String(a.name || "attachment").slice(0, 160), size: Number(a.size || 0), type: String(a.contentType || "") })), worker: WORKER_BUILD });
     }
     if (url.pathname === "/api/mail/categories" && !post) {
       const r = await mailGraph(env, addr, "/outlook/masterCategories");
@@ -4536,6 +4558,20 @@ async function mailRoutes(request, env, user, url) {
         }
         const mv = await mailDo(env, addr, `/mailFolders/${encodeURIComponent(fid)}/move`, "POST", { destinationId: "deleteditems" });
         if (!mv.ok) return reply(env, 200, { ok: false, error: mailWhy(mv, true), worker: WORKER_BUILD });
+        return reply(env, 200, { ok: true, worker: WORKER_BUILD });
+      }
+      if (act === "setnote" || act === "urgentoff") {
+        const imid = String(body.imid || "").slice(0, 300);
+        if (!imid) return reply(env, 200, { ok: false, error: "That email cannot take a note.", worker: WORKER_BUILD });
+        await mailExtraTable(env);
+        await env.DB.prepare("INSERT OR IGNORE INTO mail_extra (box, imid) VALUES (?, ?)").bind(box.id, imid).run();
+        if (act === "setnote") {
+          const text = String(body.note || "").replace(/\r/g, "").trim().slice(0, 1000);
+          const by = String(user.name || user.email || "").trim().slice(0, 80);
+          await env.DB.prepare("UPDATE mail_extra SET note = ?, note_by = ?, note_at = ? WHERE box = ? AND imid = ?").bind(text, text ? by : "", text ? new Date().toISOString() : "", box.id, imid).run();
+          return reply(env, 200, { ok: true, note: text ? { text, by, at: new Date().toISOString() } : null, worker: WORKER_BUILD });
+        }
+        await env.DB.prepare("UPDATE mail_extra SET urgent_off = ? WHERE box = ? AND imid = ?").bind(body.off === false ? 0 : 1, box.id, imid).run();
         return reply(env, 200, { ok: true, worker: WORKER_BUILD });
       }
       if (act === "markall") {
