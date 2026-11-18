@@ -4306,6 +4306,21 @@ async function mailRoutes(request, env, user, url) {
       }
       return reply(env, 200, { ok: true, contacts: out.slice(0, 8), worker: WORKER_BUILD });
     }
+    if (url.pathname === "/api/mail/contactlist" && !post) {
+      const found = await Promise.all(mine.map(async (bx) => {
+        const ad = mailAddress(env, bx); let all = [];
+        for (let skip = 0; skip < 2000; skip += 200) {
+          const r = await mailGraph(env, ad, `/contacts?$top=200&$skip=${skip}&$orderby=displayName&$select=id,displayName,emailAddresses,companyName,mobilePhone,businessPhones`);
+          const v = (r.ok && r.json && r.json.value) || [];
+          all = all.concat(v); if (v.length < 200) break;
+        }
+        return all.map((c) => ({ id: bx.id + ":" + c.id, name: String(c.displayName || "").slice(0, 80), company: String(c.companyName || "").slice(0, 60), emails: (c.emailAddresses || []).map((e) => String(e.address || "")).filter(Boolean).slice(0, 4), phone: String(c.mobilePhone || (c.businessPhones || [])[0] || "").slice(0, 30) }));
+      }));
+      const seen = new Set(), out = [];
+      for (const c of found.flat()) { if (!c.emails.length) continue; const k = c.emails[0].toLowerCase(); if (seen.has(k)) continue; seen.add(k); out.push(c); }
+      out.sort((a, b) => (a.name || a.emails[0]).localeCompare(b.name || b.emails[0], "en", { sensitivity: "base" }));
+      return reply(env, 200, { ok: true, contacts: out, worker: WORKER_BUILD });
+    }
     if (url.pathname === "/api/mail/senderphoto" && !post) {
       const em = String(url.searchParams.get("email") || "").toLowerCase();
       if (!/^[^\s@'"<>]+@[^\s@'"<>]+$/.test(em)) return new Response(null, { status: 404, headers: cors(env) });
@@ -4386,6 +4401,28 @@ async function mailRoutes(request, env, user, url) {
         const gone = await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}/move`, "POST", { destinationId: "archive" });
         // newId is the original now in Archive and copyId is the copy in the other mailbox, so the move can be undone.
         return reply(env, 200, { ok: true, label: tb.label, archived: gone.ok, newId: String((gone.ok && gone.json && gone.json.id) || ""), copyId: String((created && created.id) || ""), worker: WORKER_BUILD });
+      }
+      if (act === "contactsave" || act === "contactdelete") {
+        let cAddr = addr, cid = "";
+        const ref = String(body.cid || "");
+        if (ref) {
+          const i = ref.indexOf(":"), ob = MAILBOXES.find((x) => x.id === ref.slice(0, i) && (!x.only || mailAllowed(x, user)));
+          if (i < 1 || !ob) return reply(env, 200, { ok: false, error: "That contact could not be found.", worker: WORKER_BUILD });
+          cAddr = mailAddress(env, ob); cid = ref.slice(i + 1);
+        }
+        if (act === "contactdelete") {
+          if (!cid) return reply(env, 200, { ok: false, error: "Choose a contact to delete.", worker: WORKER_BUILD });
+          const dl = await mailDo(env, cAddr, `/contacts/${encodeURIComponent(cid)}`, "DELETE");
+          return dl.ok || dl.status === 404 ? reply(env, 200, { ok: true, worker: WORKER_BUILD }) : done(dl);
+        }
+        const nm = String(body.name || "").replace(/\s+/g, " ").trim().slice(0, 80), em = String(body.email || "").trim().slice(0, 120);
+        if (!nm && !em) return reply(env, 200, { ok: false, error: "Give the contact a name or an email address.", worker: WORKER_BUILD });
+        if (em && !/^[^\s@'"<>]+@[^\s@'"<>]+$/.test(em)) return reply(env, 200, { ok: false, error: "That email address does not look right.", worker: WORKER_BUILD });
+        const ph = String(body.phone || "").trim().slice(0, 30);
+        const data = { displayName: nm || em, companyName: String(body.company || "").trim().slice(0, 60), emailAddresses: em ? [{ address: em, name: nm || em }] : [], mobilePhone: ph };
+        const sv = await mailDo(env, cAddr, cid ? `/contacts/${encodeURIComponent(cid)}` : "/contacts", cid ? "PATCH" : "POST", data);
+        if (!sv.ok) return reply(env, 200, { ok: false, error: mailWhy(sv, true), worker: WORKER_BUILD });
+        return reply(env, 200, { ok: true, contact: { id: (cid ? ref.slice(0, ref.indexOf(":")) : box.id) + ":" + String((sv.json && sv.json.id) || cid), name: data.displayName, company: data.companyName, emails: em ? [em] : [], phone: ph }, worker: WORKER_BUILD });
       }
       if (act === "newfolder") {
         const name = String(body.name || "").replace(/\s+/g, " ").trim().slice(0, 100);
