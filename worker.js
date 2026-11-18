@@ -329,7 +329,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
   await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
 }
 
-const WORKER_BUILD = "Reservoir-Worker-2026.11.19-w222";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.19-w223";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.izzyandloki.workers.dev/api/xero/callback";
@@ -4522,6 +4522,21 @@ async function mailRoutes(request, env, user, url) {
         const nf = await mailDo(env, addr, parent ? `/mailFolders/${encodeURIComponent(parent)}/childFolders` : "/mailFolders", "POST", { displayName: name });
         if (!nf.ok) return reply(env, 200, { ok: false, error: nf.status === 409 ? "A folder with that name is already there." : mailWhy(nf, true), worker: WORKER_BUILD });
         return reply(env, 200, { ok: true, folder: { id: String((nf.json && nf.json.id) || ""), name: String((nf.json && nf.json.displayName) || name) }, worker: WORKER_BUILD });
+      }
+      if (act === "renamefolder" || act === "deletefolder") {
+        // Outlook's own folders cannot be renamed or deleted. Deleting moves the folder, and what is in it, to Deleted Items.
+        const fid = String(body.folder || "");
+        if (!fid || /^(inbox|drafts|sentitems|deleteditems|archive|junkemail|outbox|msgfolderroot)$/i.test(fid)) return reply(env, 200, { ok: false, error: "That folder cannot be changed.", worker: WORKER_BUILD });
+        if (act === "renamefolder") {
+          const nm = String(body.name || "").replace(/\s+/g, " ").trim().slice(0, 100);
+          if (!nm) return reply(env, 200, { ok: false, error: "Give the folder a name.", worker: WORKER_BUILD });
+          const rn = await mailDo(env, addr, `/mailFolders/${encodeURIComponent(fid)}`, "PATCH", { displayName: nm });
+          if (!rn.ok) return reply(env, 200, { ok: false, error: rn.status === 409 ? "A folder with that name is already there." : mailWhy(rn, true), worker: WORKER_BUILD });
+          return reply(env, 200, { ok: true, worker: WORKER_BUILD });
+        }
+        const mv = await mailDo(env, addr, `/mailFolders/${encodeURIComponent(fid)}/move`, "POST", { destinationId: "deleteditems" });
+        if (!mv.ok) return reply(env, 200, { ok: false, error: mailWhy(mv, true), worker: WORKER_BUILD });
+        return reply(env, 200, { ok: true, worker: WORKER_BUILD });
       }
       if (act === "markall") {
         const fid = mailFolderId(body.folder), want = !!body.read;
