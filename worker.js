@@ -5617,6 +5617,13 @@ async function noticesTable(env) {
       await migMark(env, "tayler_notices_reset_v2", `${d && d.meta ? d.meta.changes : 0} notices removed`);
     } catch (e) { /* tried again on the next start */ }
   }
+  // One time, 18 November 2026: Tayler's notices are cleared again, as he asked.
+  if (!(await migDone(env, "tayler_notices_reset_v3"))) {
+    try {
+      const d = await env.DB.prepare("DELETE FROM notices WHERE lower(to_email) = 'tayler@directflow.com.au'").run();
+      await migMark(env, "tayler_notices_reset_v3", `${d && d.meta ? d.meta.changes : 0} notices removed`);
+    } catch (e) { /* tried again on the next start */ }
+  }
   // One time, 17 November 2026: Mitch's two reimbursements from 16 November go back to waiting so they can be processed again and sent to Xero.
   if (!(await migDone(env, "mitch_reimb_reopen_v1"))) {
     try {
