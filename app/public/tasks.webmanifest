@@ -1,7 +1,7 @@
 {
   "id": "/tasks",
-  "name": "Task List",
-  "short_name": "Task List",
+  "name": "DFP Tasks",
+  "short_name": "DFP Tasks",
   "start_url": "/tasks",
   "scope": "/",
   "display": "standalone",
