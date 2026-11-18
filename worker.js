@@ -4143,7 +4143,9 @@ async function mailDraftSend(env, addr, msg, op, text, to, extra) {
   if (!upd.ok) return upd;
   for (const a of mailAtts(x.attachments)) { const ar = await mailDo(env, addr, `/messages/${encodeURIComponent(id)}/attachments`, "POST", a); if (!ar.ok) return ar; }
   if (x.noSend) return { ok: true, status: 200, json: { id } };
-  return mailDo(env, addr, `/messages/${encodeURIComponent(id)}/send`, "POST");
+  const sent = await mailDo(env, addr, `/messages/${encodeURIComponent(id)}/send`, "POST");
+  if (sent && sent.ok) await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}`, "PATCH", { singleValueExtendedProperties: [{ id: "Integer 0x1081", value: op === "createForward" ? "104" : op === "createReplyAll" ? "103" : "102" }] }).catch(() => {});
+  return sent;
 }
 const MAIL_ALIAS = { "inbox": "inbox", "sent items": "sentitems", "drafts": "drafts", "deleted items": "deleteditems", "junk email": "junkemail", "archive": "archive" };
 // A mail search asks Graph for 250 results a page and keeps following its next page link, up to this many pages.
@@ -4152,6 +4154,8 @@ const MAIL_SEARCH_PAGES = 20;
 const MAIL_HIDE = /^(conversation history|sync issues|conflicts|local failures|server failures|outbox|rss feeds|rss subscriptions|clutter|scheduled|yammer|quick step settings|social activity notifications|personmetadata|externalcontacts)/i;
 const mailPart = (x) => ({ name: String((x && x.emailAddress && x.emailAddress.name) || "").slice(0, 80), address: String((x && x.emailAddress && x.emailAddress.address) || "").slice(0, 120) });
 const mailShow = (x) => { const a = mailPart(x); return a.name || a.address; };
+// What was last done with a message: Outlook keeps it in the last verb property (102 reply, 103 reply all, 104 forward).
+const mailAns = (m) => { const p = ((m && m.singleValueExtendedProperties) || []).find((x) => x && /1081/i.test(String(x.id))); const v = p ? Number(p.value) : 0; return v === 102 || v === 103 ? "reply" : v === 104 ? "forward" : ""; };
 const mailFlag = (f) => (f && (f.flagStatus === "flagged" || f.flagStatus === "complete")) ? f.flagStatus : "";
 const mailId = (v) => { const t = String(v || ""); return t && t.length < 600 ? t : ""; };
 const mailFolderId = (v) => { const t = String(v || "inbox"); return /^[A-Za-z0-9_\-=+\/.]{1,300}$/.test(t) ? t : "inbox"; };
@@ -4210,7 +4214,7 @@ async function mailRoutes(request, env, user, url) {
       const top = Math.max(1, Math.min(200, Number(url.searchParams.get("top")) || 40));
       const filter = url.searchParams.get("filter") || "";
       const q = String(url.searchParams.get("q") || "").replace(/["\\]/g, " ").trim().slice(0, 100);
-      const fields = "$select=subject,from,toRecipients,receivedDateTime,isRead,bodyPreview,hasAttachments,categories,flag,parentFolderId";
+      const fields = "$select=subject,from,toRecipients,receivedDateTime,isRead,bodyPreview,hasAttachments,categories,flag,parentFolderId&$expand=singleValueExtendedProperties($filter=id eq 'Integer 0x1081')";
       let rows = [];
       if (q) {
         // A search covers every folder in the mailbox and reads every page of results Graph offers, so older matches are never left out. Graph itself stops a message search at 1,000 results.
@@ -4243,7 +4247,7 @@ async function mailRoutes(request, env, user, url) {
           kids.forEach((k) => ((k && k.ok && k.json && k.json.value) || []).forEach((f) => where.set(f.id, String(f.displayName || ""))));
         } catch (e) {}
       }
-      const list = rows.map((m) => ({ id: m.id, pf: String(m.parentFolderId || ""), ...(q && where.get(m.parentFolderId) ? { folder: where.get(m.parentFolderId).slice(0, 40) } : null), from: mailShow(m.from).slice(0, 80), fromAddr: mailPart(m.from).address.toLowerCase(), to: ((m.toRecipients || []).map(mailShow).join(", ")).slice(0, 120), subject: String(m.subject || "(no subject)").slice(0, 160), at: m.receivedDateTime || "", read: !!m.isRead, attach: !!m.hasAttachments, categories: (m.categories || []).slice(0, 6).map((c) => String(c).slice(0, 40)), flag: mailFlag(m.flag), preview: String(m.bodyPreview || "").replace(/\s+/g, " ").slice(0, 140) }));
+      const list = rows.map((m) => ({ id: m.id, pf: String(m.parentFolderId || ""), ...(q && where.get(m.parentFolderId) ? { folder: where.get(m.parentFolderId).slice(0, 40) } : null), from: mailShow(m.from).slice(0, 80), fromAddr: mailPart(m.from).address.toLowerCase(), to: ((m.toRecipients || []).map(mailShow).join(", ")).slice(0, 120), subject: String(m.subject || "(no subject)").slice(0, 160), at: m.receivedDateTime || "", read: !!m.isRead, attach: !!m.hasAttachments, categories: (m.categories || []).slice(0, 6).map((c) => String(c).slice(0, 40)), flag: mailFlag(m.flag), ans: mailAns(m), preview: String(m.bodyPreview || "").replace(/\s+/g, " ").slice(0, 140) }));
       return reply(env, 200, { ok: true, label: box.label, messages: list, more: !q && list.length >= top, worker: WORKER_BUILD });
     }
     if (url.pathname === "/api/mail/message" && !post) {
