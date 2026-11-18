@@ -4243,7 +4243,7 @@ async function mailRoutes(request, env, user, url) {
           kids.forEach((k) => ((k && k.ok && k.json && k.json.value) || []).forEach((f) => where.set(f.id, String(f.displayName || ""))));
         } catch (e) {}
       }
-      const list = rows.map((m) => ({ id: m.id, ...(q && where.get(m.parentFolderId) ? { folder: where.get(m.parentFolderId).slice(0, 40) } : null), from: mailShow(m.from).slice(0, 80), fromAddr: mailPart(m.from).address.toLowerCase(), to: ((m.toRecipients || []).map(mailShow).join(", ")).slice(0, 120), subject: String(m.subject || "(no subject)").slice(0, 160), at: m.receivedDateTime || "", read: !!m.isRead, attach: !!m.hasAttachments, categories: (m.categories || []).slice(0, 6).map((c) => String(c).slice(0, 40)), flag: mailFlag(m.flag), preview: String(m.bodyPreview || "").replace(/\s+/g, " ").slice(0, 140) }));
+      const list = rows.map((m) => ({ id: m.id, pf: String(m.parentFolderId || ""), ...(q && where.get(m.parentFolderId) ? { folder: where.get(m.parentFolderId).slice(0, 40) } : null), from: mailShow(m.from).slice(0, 80), fromAddr: mailPart(m.from).address.toLowerCase(), to: ((m.toRecipients || []).map(mailShow).join(", ")).slice(0, 120), subject: String(m.subject || "(no subject)").slice(0, 160), at: m.receivedDateTime || "", read: !!m.isRead, attach: !!m.hasAttachments, categories: (m.categories || []).slice(0, 6).map((c) => String(c).slice(0, 40)), flag: mailFlag(m.flag), preview: String(m.bodyPreview || "").replace(/\s+/g, " ").slice(0, 140) }));
       return reply(env, 200, { ok: true, label: box.label, messages: list, more: !q && list.length >= top, worker: WORKER_BUILD });
     }
     if (url.pathname === "/api/mail/message" && !post) {
@@ -4380,7 +4380,8 @@ async function mailRoutes(request, env, user, url) {
         let created = null; try { created = await put.json(); } catch (e) { created = null; }
         if (created && created.id && created.isDraft) await mailDo(env, mailAddress(env, tb), `/messages/${encodeURIComponent(created.id)}`, "PATCH", { isRead: !!body.read });
         const gone = await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}/move`, "POST", { destinationId: "archive" });
-        return reply(env, 200, { ok: true, label: tb.label, archived: gone.ok, worker: WORKER_BUILD });
+        // newId is the original now in Archive and copyId is the copy in the other mailbox, so the move can be undone.
+        return reply(env, 200, { ok: true, label: tb.label, archived: gone.ok, newId: String((gone.ok && gone.json && gone.json.id) || ""), copyId: String((created && created.id) || ""), worker: WORKER_BUILD });
       }
       if (act === "newfolder") {
         const name = String(body.name || "").replace(/\s+/g, " ").trim().slice(0, 100);

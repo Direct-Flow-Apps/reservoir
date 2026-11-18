@@ -1,0 +1,24 @@
+{
+  "id": "/mail",
+  "name": "Weir Mail",
+  "short_name": "Weir Mail",
+  "start_url": "/mail",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#ffffff",
+  "icons": [
+    {
+      "src": "/weir-mail-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any"
+    },
+    {
+      "src": "/weir-mail-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any"
+    }
+  ]
+}
