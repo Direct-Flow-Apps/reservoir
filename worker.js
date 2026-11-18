@@ -4461,6 +4461,12 @@ async function mailRoutes(request, env, user, url) {
 async function mailWatch(env) {
   if (!env.GRAPH_CLIENT_SECRET) return;
   await settingsTable(env);
+  const cleaned = await env.DB.prepare("SELECT value FROM app_settings WHERE key = 'mail.clean.1'").first();
+  if (!cleaned) {
+    await noticesTable(env);
+    await env.DB.prepare("DELETE FROM notices WHERE kind = 'mail'").run();
+    await env.DB.prepare("INSERT INTO app_settings (key, value, detail, by_name, at) VALUES ('mail.clean.1', '1', 'mail notices cleared', 'Reservoir', datetime('now'))").run();
+  }
   const reset = await env.DB.prepare("SELECT value FROM app_settings WHERE key = 'mail.reset.2'").first();
   if (!reset) {
     const stamp = new Date().toISOString();
@@ -5721,6 +5727,7 @@ async function notify(env, n) {
   try {
     await noticesTable(env);
     const id = crypto.randomUUID();
+    if (String(n.kind || "") === "mail") { await pushForNotice(env, n, id); return id; }
     await env.DB.prepare("INSERT INTO notices (id, to_email, kind, title, body, todo, link, data, by_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)").bind(id, String(n.to || "").toLowerCase(), String(n.kind || "info").slice(0, 30), String(n.title || "").slice(0, 160), String(n.body || "").slice(0, 600), n.todo ? 1 : 0, n.link ? String(n.link).slice(0, 40) : null, n.data ? JSON.stringify(n.data).slice(0, 1500) : null, String(n.by || "").slice(0, 120)).run();
     await pushForNotice(env, n, id);
     return id;
