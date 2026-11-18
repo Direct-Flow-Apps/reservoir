@@ -5765,7 +5765,7 @@ async function pushForNotice(env, n, id) {
     const rows = to === "@office"
       ? ((await env.DB.prepare("SELECT * FROM push_subs WHERE tier IN ('T1', 'T2')").all()).results) || []
       : ((await env.DB.prepare("SELECT * FROM push_subs WHERE email = ?").bind(to).all()).results) || [];
-    const sendTo = String(n.kind || "") === "mail" ? rows.filter((r) => r.app === "mail" && r.mail_on !== 0) : rows;
+    const sendTo = String(n.kind || "") === "mail" ? rows.filter((r) => r.mail_on !== 0) : rows;
     if (!sendTo.length) return;
     const payload = { title: String(n.title || "Reservoir").slice(0, 120), body: n.kind === "request" ? String(n.body || "Open Reservoir to read it").slice(0, 160) : n.kind === "mail" ? "" : "Open Reservoir to read it", tag: `n-${id || Date.now()}`, open: /^[a-z]+$/.test(String(n.link || "")) ? String(n.link) : "notices" };
     await Promise.allSettled(sendTo.map(async (r) => {
