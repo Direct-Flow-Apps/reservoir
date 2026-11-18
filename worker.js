@@ -329,7 +329,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
   await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
 }
 
-const WORKER_BUILD = "Reservoir-Worker-2026.11.05-w220";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.19-w222";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.izzyandloki.workers.dev/api/xero/callback";
@@ -4258,11 +4258,21 @@ async function mailRoutes(request, env, user, url) {
         folders.push({ id: fid, name, unread: Number(f.unreadItemCount || 0), total: Number(f.totalItemCount || 0) });
         if (Number(f.childFolderCount || 0) > 0) parents.push({ fid, name, gid: f.id });
       });
-      const kidRes = await Promise.all(parents.map((p) => mailGraph(env, addr, `/mailFolders/${encodeURIComponent(p.gid)}/childFolders?$top=100&$select=displayName,unreadItemCount,totalItemCount`)));
-      parents.forEach((p, i) => {
-        const kids = kidRes[i];
-        ((kids && kids.ok && kids.json && kids.json.value) || []).forEach((f) => folders.push({ id: f.id, name: p.name + ": " + String(f.displayName || ""), unread: Number(f.unreadItemCount || 0), total: Number(f.totalItemCount || 0), parent: p.fid }));
-      });
+      // Every level of subfolders is listed, not just the first. Each folder points at its parent so the app can open and close any branch.
+      let level = parents;
+      for (let depth = 0; depth < 8 && level.length; depth++) {
+        const kidRes = await Promise.all(level.map((p) => mailGraph(env, addr, `/mailFolders/${encodeURIComponent(p.gid)}/childFolders?$top=100&$select=displayName,unreadItemCount,totalItemCount,childFolderCount`)));
+        const next = [];
+        level.forEach((p, i) => {
+          const kids = kidRes[i];
+          ((kids && kids.ok && kids.json && kids.json.value) || []).forEach((f) => {
+            const nm = String(f.displayName || "");
+            folders.push({ id: f.id, name: p.name + ": " + nm, unread: Number(f.unreadItemCount || 0), total: Number(f.totalItemCount || 0), parent: p.fid });
+            if (Number(f.childFolderCount || 0) > 0) next.push({ fid: f.id, name: nm, gid: f.id });
+          });
+        });
+        level = next;
+      }
       return reply(env, 200, { ok: true, folders, worker: WORKER_BUILD });
     }
     if (url.pathname === "/api/mail/box" && !post) {
@@ -4299,8 +4309,13 @@ async function mailRoutes(request, env, user, url) {
           const tf = await mailGraph(env, addr, "/mailFolders?$top=100&$select=displayName,childFolderCount");
           const tops = (tf.ok && tf.json && tf.json.value) || [];
           tops.forEach((f) => where.set(f.id, String(f.displayName || "")));
-          const kids = await Promise.all(tops.filter((f) => Number(f.childFolderCount || 0) > 0).map((f) => mailGraph(env, addr, `/mailFolders/${encodeURIComponent(f.id)}/childFolders?$top=100&$select=displayName`)));
-          kids.forEach((k) => ((k && k.ok && k.json && k.json.value) || []).forEach((f) => where.set(f.id, String(f.displayName || ""))));
+          let level = tops.filter((f) => Number(f.childFolderCount || 0) > 0);
+          for (let depth = 0; depth < 8 && level.length; depth++) {
+            const kids = await Promise.all(level.map((f) => mailGraph(env, addr, `/mailFolders/${encodeURIComponent(f.id)}/childFolders?$top=100&$select=displayName,childFolderCount`)));
+            const next = [];
+            kids.forEach((k) => ((k && k.ok && k.json && k.json.value) || []).forEach((f) => { where.set(f.id, String(f.displayName || "")); if (Number(f.childFolderCount || 0) > 0) next.push(f); }));
+            level = next;
+          }
         } catch (e) {}
       }
       const list = rows.map((m) => ({ id: m.id, pf: String(m.parentFolderId || ""), ...(q && where.get(m.parentFolderId) ? { folder: where.get(m.parentFolderId).slice(0, 40) } : null), from: mailShow(m.from).slice(0, 80), fromAddr: mailPart(m.from).address.toLowerCase(), to: ((m.toRecipients || []).map(mailShow).join(", ")).slice(0, 120), subject: String(m.subject || "(no subject)").slice(0, 160), at: m.receivedDateTime || "", read: !!m.isRead, attach: !!m.hasAttachments, categories: (m.categories || []).slice(0, 6).map((c) => String(c).slice(0, 40)), flag: mailFlag(m.flag), ans: mailAns(m), preview: String(m.bodyPreview || "").replace(/\s+/g, " ").slice(0, 140) }));
@@ -4614,7 +4629,7 @@ async function mailWatch(env) {
     await env.DB.prepare("INSERT INTO app_settings (key, value, detail, by_name, at) VALUES (?, ?, 'mail ids', 'Reservoir', datetime('now')) ON CONFLICT(key) DO UPDATE SET value = excluded.value, at = datetime('now')").bind(idKey, JSON.stringify(doneIds.concat(fresh.map((m) => m.id)).slice(-60))).run();
     if (!brandNew.length) continue;
     const to = Object.keys(tiers).filter((e) => mailAllowed(b, { email: e, tier: tiers[e] }));
-    for (const e of to) await notify(env, { to: e, kind: "mail", title: `New Email - ${b.label}`, body: "New email", link: "emailbox", by: "Reservoir" });
+    for (const e of to) await notify(env, { to: e, kind: "mail", title: `New Email - ${b.label}`, body: "New email", link: "emailbox", box: b.id, by: "Reservoir" });
   }
 }
 // Once a day: drafts with no subject, recipients or words are deleted after 7 days, and any draft older than 14 days is deleted after a day's warning to whoever started it (matched from the name in its signature, or everyone with that mailbox if there is no match).
@@ -5664,6 +5679,7 @@ async function pushTable(env) {
   try { await env.DB.prepare("ALTER TABLE push_subs ADD COLUMN app TEXT").run(); } catch (e) { /* already there */ }
   try { await env.DB.prepare("ALTER TABLE push_subs ADD COLUMN mail_on INTEGER NOT NULL DEFAULT 1").run(); } catch (e) { /* already there */ }
   try { await env.DB.prepare("ALTER TABLE push_subs ADD COLUMN mail_sound INTEGER NOT NULL DEFAULT 1").run(); } catch (e) { /* already there */ }
+  try { await env.DB.prepare("ALTER TABLE push_subs ADD COLUMN mail_off TEXT NOT NULL DEFAULT ''").run(); } catch (e) { /* already there */ }
   await env.DB.prepare("CREATE TABLE IF NOT EXISTS push_held (id INTEGER PRIMARY KEY AUTOINCREMENT, endpoint TEXT NOT NULL, created_at TEXT DEFAULT (datetime('now')))").run();
   pushReady = true;
 }
@@ -5768,7 +5784,9 @@ async function pushForNotice(env, n, id) {
     // Mail alerts go to the Weir Mail devices. A person with no Weir Mail device gets them on their Reservoir devices instead.
     // A person with any Weir Mail device never falls back to Reservoir devices, so turning mail notifications off in Weir stops the alerts.
     const hasWeir = rows.some((r) => r.app === "mail");
-    const sendTo = String(n.kind || "") === "mail" ? (hasWeir ? rows.filter((r) => r.app === "mail" && r.mail_on !== 0) : rows.filter((r) => r.mail_on !== 0)) : rows;
+    // A device can mute single mailboxes (mail_off holds their ids, comma separated). Only new mail alerts carry a mailbox id.
+    const muted = (r) => !!n.box && String(r.mail_off || "").split(",").includes(String(n.box));
+    const sendTo = String(n.kind || "") === "mail" ? (hasWeir ? rows.filter((r) => r.app === "mail" && r.mail_on !== 0 && !muted(r)) : rows.filter((r) => r.mail_on !== 0 && !muted(r))) : rows;
     if (!sendTo.length) return;
     const payload = { title: String(n.title || "Reservoir").slice(0, 120), body: n.kind === "request" ? String(n.body || "Open Reservoir to read it").slice(0, 160) : n.kind === "mail" ? "" : "Open Reservoir to read it", tag: `n-${id || Date.now()}`, open: /^[a-z]+$/.test(String(n.link || "")) ? String(n.link) : "notices" };
     await Promise.allSettled(sendTo.map(async (r) => {
@@ -5842,7 +5860,8 @@ async function pushRoutes(request, env, user, url) {
   }
   if (url.pathname === "/api/push/mailprefs") {
     // Weir Mail settings for this device: whether mail notifications show at all, and whether they make a sound. Both start on.
-    await env.DB.prepare("UPDATE push_subs SET mail_on = ?, mail_sound = ? WHERE endpoint = ? AND email = ?").bind(body.on === false ? 0 : 1, body.sound === false ? 0 : 1, String(body.endpoint || ""), email).run();
+    const off = Array.isArray(body.off) ? body.off.map((x) => String(x).replace(/[^a-z0-9_-]/gi, "")).filter(Boolean).join(",") : "";
+    await env.DB.prepare("UPDATE push_subs SET mail_on = ?, mail_sound = ?, mail_off = ? WHERE endpoint = ? AND email = ?").bind(body.on === false ? 0 : 1, body.sound === false ? 0 : 1, off, String(body.endpoint || ""), email).run();
     return reply(env, 200, { ok: true });
   }
   if (url.pathname === "/api/push/unsubscribe") {
