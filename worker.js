@@ -4475,7 +4475,8 @@ async function mailWatch(env) {
     const newest = fresh.map((m) => m.receivedDateTime).sort().pop();
     const who = (m) => String((m.from && m.from.emailAddress && (m.from.emailAddress.name || m.from.emailAddress.address)) || "Someone").slice(0, 60);
     const body = fresh.length === 1 ? `${who(fresh[0])}: ${String(fresh[0].subject || "(no subject)").slice(0, 100)}` : `${fresh.length} new emails, latest from ${who(fresh[0])}`;
-    await save(newest);
+    const claim = await env.DB.prepare("UPDATE app_settings SET value = ?, at = datetime('now') WHERE key = ? AND value = ?").bind(newest, key, row.value).run();
+    if (!claim || !claim.meta || claim.meta.changes !== 1) continue;
     const to = Object.keys(tiers).filter((e) => mailAllowed(b, { email: e, tier: tiers[e] }));
     for (const e of to) await notify(env, { to: e, kind: "mail", title: `New Email - ${b.label}`, body: "New email", link: "emailbox", by: "Reservoir" });
   }
