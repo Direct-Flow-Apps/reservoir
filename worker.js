@@ -5824,7 +5824,8 @@ async function pushRoutes(request, env, user, url) {
     if (!/^https:\/\//.test(ep) || ep.length > 600 || !p || !a) return reply(env, 400, { error: "That subscription is not valid" });
     const subMode = Object.prototype.hasOwnProperty.call(PUSH_MODES, String(body.mode)) ? String(body.mode) : null;
     await env.DB.prepare("INSERT INTO push_subs (endpoint, email, tier, p256dh, auth, ua, hours_mode, all_hours) VALUES (?, ?, ?, ?, ?, ?, COALESCE(?, 'default'), ?) ON CONFLICT(endpoint) DO UPDATE SET email = excluded.email, tier = excluded.tier, p256dh = excluded.p256dh, auth = excluded.auth, ua = excluded.ua, hours_mode = COALESCE(?, hours_mode), all_hours = CASE WHEN ? IS NULL THEN all_hours WHEN ? = '24' THEN 1 ELSE 0 END").bind(ep, email, String(user.tier || "T3"), p, a, String(body.ua || "").slice(0, 160), subMode, subMode === "24" ? 1 : 0, subMode, subMode, subMode).run();
-    await env.DB.prepare("UPDATE push_subs SET app = ? WHERE endpoint = ?").bind(["mail", "tasks"].includes(String(body.app)) ? String(body.app) : "main", ep).run();
+    // Reservoir and Weir Mail share one browser profile on a Mac, so they share one endpoint. Once Weir Mail has registered, Reservoir opening later must not take the tag back.
+    await env.DB.prepare("UPDATE push_subs SET app = CASE WHEN app = 'mail' AND ? != 'tasks' THEN 'mail' ELSE ? END WHERE endpoint = ?").bind(["mail", "tasks"].includes(String(body.app)) ? String(body.app) : "main", ["mail", "tasks"].includes(String(body.app)) ? String(body.app) : "main", ep).run();
     return reply(env, 200, { ok: true });
   }
   if (url.pathname === "/api/push/business") {
