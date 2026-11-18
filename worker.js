@@ -4468,7 +4468,7 @@ async function mailWatch(env) {
     const now = new Date().toISOString();
     const save = (v) => env.DB.prepare("INSERT INTO app_settings (key, value, detail, by_name, at) VALUES (?, ?, 'mail watch', 'Reservoir', datetime('now')) ON CONFLICT(key) DO UPDATE SET value = excluded.value, at = datetime('now')").bind(key, v).run();
     if (!row) { await save(now); continue; }
-    const r = await mailGraph(env, mailAddress(env, b), `/mailFolders/inbox/messages?$top=20&$select=subject,from,receivedDateTime&$orderby=receivedDateTime desc&$filter=${encodeURIComponent("receivedDateTime gt " + row.value)}`);
+    const r = await mailGraph(env, mailAddress(env, b), `/mailFolders/inbox/messages?$top=20&$select=id,receivedDateTime&$orderby=receivedDateTime desc&$filter=${encodeURIComponent("receivedDateTime gt " + row.value)}`);
     if (!r.ok) { console.log("mail watch", b.id, r.status); continue; }
     const fresh = ((r.json && r.json.value) || []);
     if (!fresh.length) continue;
@@ -4477,6 +4477,12 @@ async function mailWatch(env) {
     const body = fresh.length === 1 ? `${who(fresh[0])}: ${String(fresh[0].subject || "(no subject)").slice(0, 100)}` : `${fresh.length} new emails, latest from ${who(fresh[0])}`;
     const claim = await env.DB.prepare("UPDATE app_settings SET value = ?, at = datetime('now') WHERE key = ? AND value = ?").bind(newest, key, row.value).run();
     if (!claim || !claim.meta || claim.meta.changes !== 1) continue;
+    const idKey = "mail.ids." + b.id;
+    const idRow = await env.DB.prepare("SELECT value FROM app_settings WHERE key = ?").bind(idKey).first();
+    let doneIds = []; try { doneIds = JSON.parse((idRow && idRow.value) || "[]"); } catch (e) { doneIds = []; }
+    const brandNew = fresh.filter((m) => !doneIds.includes(m.id) && Date.now() - Date.parse(m.receivedDateTime) < 20 * 60000);
+    await env.DB.prepare("INSERT INTO app_settings (key, value, detail, by_name, at) VALUES (?, ?, 'mail ids', 'Reservoir', datetime('now')) ON CONFLICT(key) DO UPDATE SET value = excluded.value, at = datetime('now')").bind(idKey, JSON.stringify(doneIds.concat(fresh.map((m) => m.id)).slice(-60))).run();
+    if (!brandNew.length) continue;
     const to = Object.keys(tiers).filter((e) => mailAllowed(b, { email: e, tier: tiers[e] }));
     for (const e of to) await notify(env, { to: e, kind: "mail", title: `New Email - ${b.label}`, body: "New email", link: "emailbox", by: "Reservoir" });
   }
