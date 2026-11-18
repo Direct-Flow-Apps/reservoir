@@ -3824,6 +3824,7 @@ const MAILBOXES = [
 ];
 const mailAddress = (env, b) => String((env && env["MAILBOX_" + b.id.toUpperCase()]) || b.address).toLowerCase();
 const mailAllowed = (b, user) => b.only ? (b.only.includes(String(user.email || "").toLowerCase()) || (b.id === "tayler" && user.tier === "T1" && (/^tayler/i.test(String(user.email || "")) || /^tayler\b/i.test(String(user.name || ""))))) : b.tiers.includes(user.tier);
+const mxAddr = (a) => a ? [a.street, a.city, a.state, a.postalCode].filter(Boolean).join(", ").slice(0, 160) : "";
 async function mailGraph(env, address, qs) {
   // qs is a path inside the mailbox, or the full next page link Graph handed back.
   const target = qs.startsWith(GRAPH + "/") ? qs : `/users/${encodeURIComponent(address)}${qs}`;
@@ -4307,14 +4308,14 @@ async function mailRoutes(request, env, user, url) {
       return reply(env, 200, { ok: true, contacts: out.slice(0, 8), worker: WORKER_BUILD });
     }
     if (url.pathname === "/api/mail/contactlist" && !post) {
-      const found = await Promise.all(mine.map(async (bx) => {
+      const found = await Promise.all(mine.filter((x) => !x.only).map(async (bx) => {
         const ad = mailAddress(env, bx); let all = [];
         for (let skip = 0; skip < 2000; skip += 200) {
-          const r = await mailGraph(env, ad, `/contacts?$top=200&$skip=${skip}&$orderby=displayName&$select=id,displayName,emailAddresses,companyName,mobilePhone,businessPhones`);
+          const r = await mailGraph(env, ad, `/contacts?$top=200&$skip=${skip}&$orderby=displayName&$select=id,displayName,emailAddresses,companyName,mobilePhone,businessPhones,businessAddress,homeAddress`);
           const v = (r.ok && r.json && r.json.value) || [];
           all = all.concat(v); if (v.length < 200) break;
         }
-        return all.map((c) => ({ id: bx.id + ":" + c.id, name: String(c.displayName || "").slice(0, 80), company: String(c.companyName || "").slice(0, 60), emails: (c.emailAddresses || []).map((e) => String(e.address || "")).filter(Boolean).slice(0, 4), phone: String(c.mobilePhone || (c.businessPhones || [])[0] || "").slice(0, 30) }));
+        return all.map((c) => ({ id: bx.id + ":" + c.id, name: String(c.displayName || "").slice(0, 80), company: String(c.companyName || "").slice(0, 60), emails: (c.emailAddresses || []).map((e) => String(e.address || "")).filter(Boolean).slice(0, 4), phone: String(c.mobilePhone || (c.businessPhones || [])[0] || "").slice(0, 30), address: mxAddr(c.businessAddress && Object.keys(c.businessAddress).length ? c.businessAddress : c.homeAddress) }));
       }));
       const seen = new Set(), out = [];
       for (const c of found.flat()) { if (!c.emails.length) continue; const k = c.emails[0].toLowerCase(); if (seen.has(k)) continue; seen.add(k); out.push(c); }
@@ -4403,7 +4404,7 @@ async function mailRoutes(request, env, user, url) {
         return reply(env, 200, { ok: true, label: tb.label, archived: gone.ok, newId: String((gone.ok && gone.json && gone.json.id) || ""), copyId: String((created && created.id) || ""), worker: WORKER_BUILD });
       }
       if (act === "contactsave" || act === "contactdelete") {
-        let cAddr = addr, cid = "";
+        let cAddr = box.only ? mailAddress(env, MAILBOXES.find((x) => !x.only && mailAllowed(x, user)) || box) : addr, cid = "";
         const ref = String(body.cid || "");
         if (ref) {
           const i = ref.indexOf(":"), ob = MAILBOXES.find((x) => x.id === ref.slice(0, i) && (!x.only || mailAllowed(x, user)));
@@ -4419,10 +4420,20 @@ async function mailRoutes(request, env, user, url) {
         if (!nm && !em) return reply(env, 200, { ok: false, error: "Give the contact a name or an email address.", worker: WORKER_BUILD });
         if (em && !/^[^\s@'"<>]+@[^\s@'"<>]+$/.test(em)) return reply(env, 200, { ok: false, error: "That email address does not look right.", worker: WORKER_BUILD });
         const ph = String(body.phone || "").trim().slice(0, 30);
-        const data = { displayName: nm || em, companyName: String(body.company || "").trim().slice(0, 60), emailAddresses: em ? [{ address: em, name: nm || em }] : [], mobilePhone: ph };
+        const data = { displayName: nm || em, companyName: String(body.company || "").trim().slice(0, 60), emailAddresses: em ? [{ address: em, name: nm || em }] : [], mobilePhone: ph, businessAddress: { street: String(body.address || "").trim().slice(0, 160) } };
         const sv = await mailDo(env, cAddr, cid ? `/contacts/${encodeURIComponent(cid)}` : "/contacts", cid ? "PATCH" : "POST", data);
         if (!sv.ok) return reply(env, 200, { ok: false, error: mailWhy(sv, true), worker: WORKER_BUILD });
-        return reply(env, 200, { ok: true, contact: { id: (cid ? ref.slice(0, ref.indexOf(":")) : box.id) + ":" + String((sv.json && sv.json.id) || cid), name: data.displayName, company: data.companyName, emails: em ? [em] : [], phone: ph }, worker: WORKER_BUILD });
+        return reply(env, 200, { ok: true, contact: { id: (cid ? ref.slice(0, ref.indexOf(":")) : (box.only ? (MAILBOXES.find((x) => !x.only && mailAllowed(x, user)) || box).id : box.id)) + ":" + String((sv.json && sv.json.id) || cid), name: data.displayName, company: data.companyName, emails: em ? [em] : [], phone: ph, address: String(body.address || "").trim().slice(0, 160) }, worker: WORKER_BUILD });
+      }
+      if (act === "contactphoto") {
+        const ref = String(body.cid || ""), i = ref.indexOf(":"), ob = MAILBOXES.find((x) => x.id === ref.slice(0, i) && (!x.only || mailAllowed(x, user)));
+        if (i < 1 || !ob) return reply(env, 200, { ok: false, error: "That contact could not be found.", worker: WORKER_BUILD });
+        const b64 = String(body.data || "").replace(/^data:[^,]*,/, "");
+        if (!b64 || b64.length > 700000) return reply(env, 200, { ok: false, error: "That photo is too big.", worker: WORKER_BUILD });
+        const bin = atob(b64), bytes = new Uint8Array(bin.length);
+        for (let k = 0; k < bin.length; k++) bytes[k] = bin.charCodeAt(k);
+        const up = await graphFetch(env, `/users/${encodeURIComponent(mailAddress(env, ob))}/contacts/${encodeURIComponent(ref.slice(i + 1))}/photo/$value`, { method: "PUT", headers: { "Content-Type": "image/jpeg" }, body: bytes });
+        return up.ok ? reply(env, 200, { ok: true, worker: WORKER_BUILD }) : reply(env, 200, { ok: false, error: "Microsoft did not take the photo. It answered " + up.status + ".", worker: WORKER_BUILD });
       }
       if (act === "newfolder") {
         const name = String(body.name || "").replace(/\s+/g, " ").trim().slice(0, 100);
