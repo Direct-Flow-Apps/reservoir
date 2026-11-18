@@ -3825,6 +3825,37 @@ const MAILBOXES = [
 const mailAddress = (env, b) => String((env && env["MAILBOX_" + b.id.toUpperCase()]) || b.address).toLowerCase();
 const mailAllowed = (b, user) => b.only ? (b.only.includes(String(user.email || "").toLowerCase()) || (b.id === "tayler" && user.tier === "T1" && (/^tayler/i.test(String(user.email || "")) || /^tayler\b/i.test(String(user.name || ""))))) : b.tiers.includes(user.tier);
 const mxAddr = (a) => a ? [a.street, a.city, a.state, a.postalCode].filter(Boolean).join(", ").slice(0, 160) : "";
+// Client logos: a SharePoint folder (Reservoir site, beside Workplace Culture and Fleet Management) where each file is named for the web address it stands for, such as vestbuild.com.au.png.
+const LOGO_HOMES = [["Branding & Marketing", "Client Logos"], ["Reservoir", "Branding & Marketing", "Client Logos"]];
+let logoIndex = { at: 0, map: null };
+async function logoLookup(env, email) {
+  const dom = String(email || "").split("@")[1] || "";
+  if (!dom) return null;
+  const ext = /\.(png|jpe?g|svg|webp|gif)$/i;
+  if (!logoIndex.map || Date.now() - logoIndex.at > 600000) {
+    const map = new Map();
+    for (const segs of LOGO_HOMES) {
+      let next = `/sites/${siteId(env)}/drive/root:/${pathOf(segs)}:/children?$top=999&$select=id,name,file`, found = false;
+      for (let n = 0; next && n < 10; n++) {
+        const r = await graphFetch(env, next);
+        if (!r.ok) break;
+        found = true;
+        const j = await r.json();
+        for (const it of j.value || []) if (it.file && ext.test(it.name || "")) map.set(String(it.name).toLowerCase().replace(ext, ""), it.id);
+        next = j["@odata.nextLink"] || "";
+      }
+      if (found) break;
+    }
+    logoIndex = { at: Date.now(), map };
+  }
+  const parts = dom.toLowerCase().split(".");
+  let id = "";
+  for (let i = 0; i < parts.length - 1 && !id; i++) { const k = parts.slice(i).join("."); if (logoIndex.map.has(k)) id = logoIndex.map.get(k); }
+  if (!id) { const stem = parts.length > 2 && /^(com|net|org|co|gov|edu)$/.test(parts[parts.length - 2]) ? parts[parts.length - 3] : parts[parts.length - 2]; for (const [name, v] of logoIndex.map) if (name.split(".")[0] === stem) { id = v; break; } }
+  if (!id) return null;
+  const res = await graphFetch(env, `/sites/${siteId(env)}/drive/items/${encodeURIComponent(id)}/content`);
+  return res.ok ? res : null;
+}
 async function mailGraph(env, address, qs) {
   // qs is a path inside the mailbox, or the full next page link Graph handed back.
   const target = qs.startsWith(GRAPH + "/") ? qs : `/users/${encodeURIComponent(address)}${qs}`;
@@ -4333,6 +4364,7 @@ async function mailRoutes(request, env, user, url) {
         const res = await graphFetch(env, `/users/${owner}/contacts/${encodeURIComponent(cid)}/photo/$value`);
         if (res.ok) return new Response(res.body, { status: 200, headers: { ...cors(env), "Content-Type": res.headers.get("Content-Type") || "image/jpeg", "Cache-Control": "private, max-age=3600" } });
       }
+      try { const lg = await logoLookup(env, em); if (lg) return new Response(lg.body, { status: 200, headers: { ...cors(env), "Content-Type": lg.headers.get("Content-Type") || "image/png", "Cache-Control": "private, max-age=3600" } }); } catch (e) {}
       return new Response(null, { status: 404, headers: cors(env) });
     }
     if (url.pathname === "/api/mail/contactphoto" && !post) {
