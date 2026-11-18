@@ -4475,12 +4475,34 @@ async function mailWatch(env) {
     const newest = fresh.map((m) => m.receivedDateTime).sort().pop();
     const who = (m) => String((m.from && m.from.emailAddress && (m.from.emailAddress.name || m.from.emailAddress.address)) || "Someone").slice(0, 60);
     const body = fresh.length === 1 ? `${who(fresh[0])}: ${String(fresh[0].subject || "(no subject)").slice(0, 100)}` : `${fresh.length} new emails, latest from ${who(fresh[0])}`;
+    await save(newest);
     const to = Object.keys(tiers).filter((e) => mailAllowed(b, { email: e, tier: tiers[e] }));
     for (const e of to) await notify(env, { to: e, kind: "mail", title: `New Email - ${b.label}`, body: "New email", link: "emailbox", by: "Reservoir" });
-    await save(newest);
   }
 }
 // Once a day: drafts with no subject, recipients or words are deleted after 7 days, and any draft older than 14 days is deleted after a day's warning to whoever started it (matched from the name in its signature, or everyone with that mailbox if there is no match).
+// Microsoft pings the worker the moment mail lands in any of the four inboxes, so the notification is sent straight away. The subscriptions are renewed on the schedule.
+async function mailSubscribe(env) {
+  if (!env.GRAPH_CLIENT_SECRET) return;
+  await settingsTable(env);
+  const want = await invClientState(env);
+  for (const b of MAILBOXES) {
+    const key = "mail.sub." + b.id;
+    const row = await env.DB.prepare("SELECT value, detail FROM app_settings WHERE key = ?").bind(key).first();
+    const left = row && row.detail ? Date.parse(row.detail) - Date.now() : 0;
+    if (row && row.value && left > 24 * 3600 * 1000) continue;
+    const expires = new Date(Date.now() + 4200 * 60000).toISOString();
+    const save = (id) => env.DB.prepare("INSERT OR REPLACE INTO app_settings (key, value, detail, by_name, at) VALUES (?, ?, ?, 'Reservoir', datetime('now'))").bind(key, id, expires).run();
+    if (row && row.value) {
+      const r = await graphFetch(env, `/subscriptions/${encodeURIComponent(row.value)}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ expirationDateTime: expires }) });
+      if (r.ok) { await save(row.value); continue; }
+    }
+    const r = await graphFetch(env, "/subscriptions", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ changeType: "created", notificationUrl: `${env.API_ORIGIN || "https://reservoir-api.directflow.workers.dev"}/api/mail/notify`, resource: `users/${mailAddress(env, b)}/mailFolders/inbox/messages`, expirationDateTime: expires, clientState: want }) });
+    const j = await r.json().catch(() => ({}));
+    if (r.ok && j.id) await save(j.id);
+    else console.log("mail subscription failed", b.id, r.status, JSON.stringify(j).slice(0, 300));
+  }
+}
 async function mailDraftsSweep(env) {
   if (!env.GRAPH_CLIENT_SECRET) return;
   await settingsTable(env);
@@ -7056,6 +7078,7 @@ export default {
     ctx.waitUntil(tsResendSalaried(env).catch((e) => console.log("resend salaried failed", String(e && e.message || e))));
     ctx.waitUntil(tsXeroPullSchedule(env).catch((e) => console.log("timesheet pull failed", String(e && e.message || e))));
     ctx.waitUntil(pushOneOffAndrey(env).catch((e) => console.log("one off failed", String(e && e.message || e))));
+    ctx.waitUntil(mailSubscribe(env).catch((e) => console.log("mail subscribe failed", String(e && e.message || e))));
     ctx.waitUntil(mailWatch(env).catch((e) => console.log("mail watch failed", String(e && e.message || e))));
     ctx.waitUntil(mailDraftsSweep(env).catch((e) => console.log("drafts sweep failed", String(e && e.message || e))));
     ctx.waitUntil(invMailCron(env).catch((e) => console.log("invoice mail cron failed", String(e && e.message || e))));
@@ -7091,6 +7114,17 @@ export default {
         const want = await invClientState(env);
         const real = ((body && body.value) || []).filter((n) => n && n.clientState === want);
         if (real.length && ctx) ctx.waitUntil(invMailSweep(env, 1).catch((e) => console.log("invoice ping failed", String(e && e.message || e))));
+      } catch (e) { /* a bad ping is ignored */ }
+      return new Response(null, { status: 202 });
+    }
+    if (earlyUrl.pathname === "/api/mail/notify" && request.method === "POST") {
+      const vt = earlyUrl.searchParams.get("validationToken");
+      if (vt) return new Response(vt, { status: 200, headers: { "Content-Type": "text/plain" } });
+      try {
+        const body = await request.json();
+        const want = await invClientState(env);
+        const real = ((body && body.value) || []).filter((n) => n && n.clientState === want);
+        if (real.length && ctx) ctx.waitUntil(mailWatch(env).catch((e) => console.log("mail ping failed", String(e && e.message || e))));
       } catch (e) { /* a bad ping is ignored */ }
       return new Response(null, { status: 202 });
     }
