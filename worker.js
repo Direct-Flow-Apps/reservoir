@@ -4461,6 +4461,13 @@ async function mailRoutes(request, env, user, url) {
 async function mailWatch(env) {
   if (!env.GRAPH_CLIENT_SECRET) return;
   await settingsTable(env);
+  const reset = await env.DB.prepare("SELECT value FROM app_settings WHERE key = 'mail.reset.2'").first();
+  if (!reset) {
+    const stamp = new Date().toISOString();
+    for (const b of MAILBOXES) await env.DB.prepare("INSERT INTO app_settings (key, value, detail, by_name, at) VALUES (?, ?, 'mail watch', 'Reservoir', datetime('now')) ON CONFLICT(key) DO UPDATE SET value = excluded.value, at = datetime('now')").bind("mail.seen." + b.id, stamp).run();
+    await env.DB.prepare("INSERT INTO app_settings (key, value, detail, by_name, at) VALUES ('mail.reset.2', ?, 'mail watch reset', 'Reservoir', datetime('now'))").bind(stamp).run();
+    return;
+  }
   const tiers = await accessTiers(env);
   for (const b of MAILBOXES) {
     const key = "mail.seen." + b.id;
@@ -4480,7 +4487,7 @@ async function mailWatch(env) {
     const idKey = "mail.ids." + b.id;
     const idRow = await env.DB.prepare("SELECT value FROM app_settings WHERE key = ?").bind(idKey).first();
     let doneIds = []; try { doneIds = JSON.parse((idRow && idRow.value) || "[]"); } catch (e) { doneIds = []; }
-    const brandNew = fresh.filter((m) => !doneIds.includes(m.id) && Date.now() - Date.parse(m.receivedDateTime) < 20 * 60000);
+    const brandNew = fresh.filter((m) => !doneIds.includes(m.id) && Date.now() - Date.parse(m.receivedDateTime) < 5 * 60000);
     await env.DB.prepare("INSERT INTO app_settings (key, value, detail, by_name, at) VALUES (?, ?, 'mail ids', 'Reservoir', datetime('now')) ON CONFLICT(key) DO UPDATE SET value = excluded.value, at = datetime('now')").bind(idKey, JSON.stringify(doneIds.concat(fresh.map((m) => m.id)).slice(-60))).run();
     if (!brandNew.length) continue;
     const to = Object.keys(tiers).filter((e) => mailAllowed(b, { email: e, tier: tiers[e] }));
