@@ -5765,11 +5765,13 @@ async function pushForNotice(env, n, id) {
     const rows = to === "@office"
       ? ((await env.DB.prepare("SELECT * FROM push_subs WHERE tier IN ('T1', 'T2')").all()).results) || []
       : ((await env.DB.prepare("SELECT * FROM push_subs WHERE email = ?").bind(to).all()).results) || [];
-    const sendTo = String(n.kind || "") === "mail" ? rows.filter((r) => r.mail_on !== 0) : rows;
+    // Mail alerts go to the Weir Mail devices. A person with no Weir Mail device gets them on their Reservoir devices instead.
+    const mailRows = String(n.kind || "") === "mail" ? rows.filter((r) => r.mail_on !== 0) : [];
+    const sendTo = String(n.kind || "") === "mail" ? (mailRows.some((r) => r.app === "mail") ? mailRows.filter((r) => r.app === "mail") : mailRows) : rows;
     if (!sendTo.length) return;
     const payload = { title: String(n.title || "Reservoir").slice(0, 120), body: n.kind === "request" ? String(n.body || "Open Reservoir to read it").slice(0, 160) : n.kind === "mail" ? "" : "Open Reservoir to read it", tag: `n-${id || Date.now()}`, open: /^[a-z]+$/.test(String(n.link || "")) ? String(n.link) : "notices" };
     await Promise.allSettled(sendTo.map(async (r) => {
-      const pl = String(n.kind || "") === "mail" && r.mail_sound === 0 ? { ...payload, silent: true } : payload;
+      const pl = String(n.kind || "") === "mail" ? { ...payload, ...(r.app === "mail" ? { url: "/mail" } : {}), ...(r.mail_sound === 0 ? { silent: true } : {}) } : payload;
       if (pushInHours(pushModeOf(r))) return pushSendOne(env, r, pl);
       await env.DB.prepare("INSERT INTO push_held (endpoint) VALUES (?)").bind(r.endpoint).run();
     }));

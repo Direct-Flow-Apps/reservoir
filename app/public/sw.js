@@ -20,7 +20,7 @@ self.addEventListener("push", (e) => {
     silent: d.silent === true,
     icon: "icon-192.png",
     badge: "icon-192.png",
-    data: { open: d.open || "notices" }
+    data: { open: d.open || "notices", url: typeof d.url === "string" && d.url.charAt(0) === "/" ? d.url : "" }
   }));
 });
 self.addEventListener("notificationclick", (e) => {
@@ -31,6 +31,7 @@ self.addEventListener("notificationclick", (e) => {
     for (const c of all) {
       try { await c.focus(); c.postMessage({ type: "push-open", open }); return; } catch (err) {}
     }
-    await self.clients.openWindow("./?open=" + open);
+    const go = e.notification.data && e.notification.data.url;
+    await self.clients.openWindow(go || "./?open=" + open);
   })());
 });
