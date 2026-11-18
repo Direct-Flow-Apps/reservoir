@@ -4412,6 +4412,15 @@ async function mailRoutes(request, env, user, url) {
         return done(await mailDo(env, addr, `/outlook/masterCategories/${encodeURIComponent(cid)}`, "DELETE"));
       }
       if (act === "read" && msg) return done(await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}`, "PATCH", { isRead: !!body.read }));
+      if (act === "xerobill" && msg) {
+        if (box.id !== "accounts") return reply(env, 200, { ok: false, error: "Only the Accounts mailbox can send to Xero.", worker: WORKER_BUILD });
+        if (!env.XERO_BILLS_EMAIL) return reply(env, 200, { ok: false, error: "The Xero bills address is not set up.", worker: WORKER_BUILD });
+        // Forward with the body taken out (the attachments go), then file the original in the archive.
+        const fw = await mailDraftSend(env, addr, msg, "createForward", "", [{ emailAddress: { address: env.XERO_BILLS_EMAIL } }], { trail: "none" });
+        if (!fw.ok) return done(fw);
+        const ar = await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}/move`, "POST", { destinationId: "archive" });
+        return ar.ok ? reply(env, 200, { ok: true, newId: String((ar.json && ar.json.id) || ""), worker: WORKER_BUILD }) : reply(env, 200, { ok: false, error: "Sent to Xero, but the email could not be archived.", worker: WORKER_BUILD });
+      }
       if (act === "archive" && msg) { const ar = await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}/move`, "POST", { destinationId: "archive" }); return ar.ok ? reply(env, 200, { ok: true, newId: String((ar.json && ar.json.id) || ""), worker: WORKER_BUILD }) : done(ar); }
       if (act === "movefolder" && msg) {
         const dest = mailFolderId(body.folder);
