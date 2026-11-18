@@ -3817,10 +3817,10 @@ const INVOICE_MAIL_RULES = [
   { name: "Teleca", from: "cs@teleca.com.au", subject: "telephone billing", contact: "teleca", account: "", xeroOnly: true, parse: (b) => telecaParse(b) }
 ];
 const MAILBOXES = [
-  { id: "tayler", label: "Tayler", address: "tayler@directflow.com.au", only: ["tayler@directflow.com.au"] },
   { id: "jobs", label: "DFP Jobs", address: "dfpjobs@directflow.com.au", tiers: ["T1", "T2"] },
   { id: "maintenance", label: "Maintenance", address: "maintenance@directflow.com.au", tiers: ["T1", "T2"] },
-  { id: "accounts", label: "Accounts", address: "accounts@directflow.com.au", tiers: ["T1"] }
+  { id: "accounts", label: "Accounts", address: "accounts@directflow.com.au", tiers: ["T1"] },
+  { id: "tayler", label: "Tayler", address: "tayler@directflow.com.au", only: ["tayler@directflow.com.au"] }
 ];
 const mailAddress = (env, b) => String((env && env["MAILBOX_" + b.id.toUpperCase()]) || b.address).toLowerCase();
 const mailAllowed = (b, user) => b.only ? b.only.includes(String(user.email || "").toLowerCase()) : b.tiers.includes(user.tier);
@@ -4172,7 +4172,7 @@ async function mailRoutes(request, env, user, url) {
   if (!url.pathname.startsWith("/api/mail")) return null;
   const mine = MAILBOXES.filter((b) => mailAllowed(b, user));
   const ownEmail = String(user.email || "").toLowerCase();
-  if (/@directflow\.com\.au$/.test(ownEmail) && !mine.some((b) => b.only)) mine.push({ id: "me", label: "My Email", address: ownEmail, only: [ownEmail] });
+  if (/@directflow\.com\.au$/.test(ownEmail) && !mine.some((b) => b.only)) mine.push({ id: "me", label: String(user.name || "").trim().split(/\s+/)[0] || "My Email", address: ownEmail, only: [ownEmail] });
   const post = request.method === "POST";
   if (request.method !== "GET" && !post) return reply(env, 404, { error: "not found" });
   if (post && user.viewAs && !VIEW_AS_WRITES) return reply(env, 403, { error: "Viewing as someone else is read only." });
@@ -5541,6 +5541,7 @@ async function pushTable(env) {
   await env.DB.prepare("CREATE INDEX IF NOT EXISTS push_subs_email ON push_subs (email)").run();
   try { await env.DB.prepare("ALTER TABLE push_subs ADD COLUMN all_hours INTEGER NOT NULL DEFAULT 0").run(); } catch (e) { /* already there */ }
   try { await env.DB.prepare("ALTER TABLE push_subs ADD COLUMN hours_mode TEXT").run(); } catch (e) { /* already there */ }
+  try { await env.DB.prepare("ALTER TABLE push_subs ADD COLUMN app TEXT").run(); } catch (e) { /* already there */ }
   await env.DB.prepare("CREATE TABLE IF NOT EXISTS push_held (id INTEGER PRIMARY KEY AUTOINCREMENT, endpoint TEXT NOT NULL, created_at TEXT DEFAULT (datetime('now')))").run();
   pushReady = true;
 }
@@ -5642,9 +5643,10 @@ async function pushForNotice(env, n, id) {
     const rows = to === "@office"
       ? ((await env.DB.prepare("SELECT * FROM push_subs WHERE tier IN ('T1', 'T2')").all()).results) || []
       : ((await env.DB.prepare("SELECT * FROM push_subs WHERE email = ?").bind(to).all()).results) || [];
-    if (!rows.length) return;
+    const sendTo = String(n.kind || "") === "mail" ? rows.filter((r) => r.app === "mail") : rows;
+    if (!sendTo.length) return;
     const payload = { title: String(n.title || "Reservoir").slice(0, 120), body: n.kind === "request" ? String(n.body || "Open Reservoir to read it").slice(0, 160) : n.kind === "mail" ? "" : "Open Reservoir to read it", tag: `n-${id || Date.now()}`, open: /^[a-z]+$/.test(String(n.link || "")) ? String(n.link) : "notices" };
-    await Promise.allSettled(rows.map(async (r) => {
+    await Promise.allSettled(sendTo.map(async (r) => {
       if (pushInHours(pushModeOf(r))) return pushSendOne(env, r, payload);
       await env.DB.prepare("INSERT INTO push_held (endpoint) VALUES (?)").bind(r.endpoint).run();
     }));
@@ -5696,6 +5698,7 @@ async function pushRoutes(request, env, user, url) {
     if (!/^https:\/\//.test(ep) || ep.length > 600 || !p || !a) return reply(env, 400, { error: "That subscription is not valid" });
     const subMode = Object.prototype.hasOwnProperty.call(PUSH_MODES, String(body.mode)) ? String(body.mode) : null;
     await env.DB.prepare("INSERT INTO push_subs (endpoint, email, tier, p256dh, auth, ua, hours_mode, all_hours) VALUES (?, ?, ?, ?, ?, ?, COALESCE(?, 'default'), ?) ON CONFLICT(endpoint) DO UPDATE SET email = excluded.email, tier = excluded.tier, p256dh = excluded.p256dh, auth = excluded.auth, ua = excluded.ua, hours_mode = COALESCE(?, hours_mode), all_hours = CASE WHEN ? IS NULL THEN all_hours WHEN ? = '24' THEN 1 ELSE 0 END").bind(ep, email, String(user.tier || "T3"), p, a, String(body.ua || "").slice(0, 160), subMode, subMode === "24" ? 1 : 0, subMode, subMode, subMode).run();
+    await env.DB.prepare("UPDATE push_subs SET app = ? WHERE endpoint = ?").bind(["mail", "tasks"].includes(String(body.app)) ? String(body.app) : "main", ep).run();
     return reply(env, 200, { ok: true });
   }
   if (url.pathname === "/api/push/business") {
