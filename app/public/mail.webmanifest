@@ -1,7 +1,7 @@
 {
   "id": "/mail",
-  "name": "DFP Email",
-  "short_name": "DFP Email",
+  "name": "Weir Mail",
+  "short_name": "Weir Mail",
   "start_url": "/mail",
   "scope": "/",
   "display": "standalone",
