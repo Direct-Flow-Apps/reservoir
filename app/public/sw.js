@@ -15,7 +15,7 @@ self.addEventListener("push", (e) => {
     return;
   }
   e.waitUntil(self.registration.showNotification(d.title || "Reservoir", {
-    body: d.body || "Open Reservoir",
+    body: typeof d.body === "string" ? d.body : "Open Reservoir",
     tag: d.tag || undefined,
     icon: "icon-192.png",
     badge: "icon-192.png",

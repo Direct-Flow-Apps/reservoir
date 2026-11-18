@@ -5619,7 +5619,7 @@ async function pushForNotice(env, n, id) {
       ? ((await env.DB.prepare("SELECT * FROM push_subs WHERE tier IN ('T1', 'T2')").all()).results) || []
       : ((await env.DB.prepare("SELECT * FROM push_subs WHERE email = ?").bind(to).all()).results) || [];
     if (!rows.length) return;
-    const payload = { title: String(n.title || "Reservoir").slice(0, 120), body: n.kind === "request" ? String(n.body || "Open Reservoir to read it").slice(0, 160) : "Open Reservoir to read it", tag: `n-${id || Date.now()}`, open: /^[a-z]+$/.test(String(n.link || "")) ? String(n.link) : "notices" };
+    const payload = { title: String(n.title || "Reservoir").slice(0, 120), body: n.kind === "request" ? String(n.body || "Open Reservoir to read it").slice(0, 160) : n.kind === "mail" ? "" : "Open Reservoir to read it", tag: `n-${id || Date.now()}`, open: /^[a-z]+$/.test(String(n.link || "")) ? String(n.link) : "notices" };
     await Promise.allSettled(rows.map(async (r) => {
       if (pushInHours(pushModeOf(r))) return pushSendOne(env, r, payload);
       await env.DB.prepare("INSERT INTO push_held (endpoint) VALUES (?)").bind(r.endpoint).run();
