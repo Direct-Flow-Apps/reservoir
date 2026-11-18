@@ -5662,6 +5662,8 @@ async function pushTable(env) {
   try { await env.DB.prepare("ALTER TABLE push_subs ADD COLUMN all_hours INTEGER NOT NULL DEFAULT 0").run(); } catch (e) { /* already there */ }
   try { await env.DB.prepare("ALTER TABLE push_subs ADD COLUMN hours_mode TEXT").run(); } catch (e) { /* already there */ }
   try { await env.DB.prepare("ALTER TABLE push_subs ADD COLUMN app TEXT").run(); } catch (e) { /* already there */ }
+  try { await env.DB.prepare("ALTER TABLE push_subs ADD COLUMN mail_on INTEGER NOT NULL DEFAULT 1").run(); } catch (e) { /* already there */ }
+  try { await env.DB.prepare("ALTER TABLE push_subs ADD COLUMN mail_sound INTEGER NOT NULL DEFAULT 1").run(); } catch (e) { /* already there */ }
   await env.DB.prepare("CREATE TABLE IF NOT EXISTS push_held (id INTEGER PRIMARY KEY AUTOINCREMENT, endpoint TEXT NOT NULL, created_at TEXT DEFAULT (datetime('now')))").run();
   pushReady = true;
 }
@@ -5763,11 +5765,12 @@ async function pushForNotice(env, n, id) {
     const rows = to === "@office"
       ? ((await env.DB.prepare("SELECT * FROM push_subs WHERE tier IN ('T1', 'T2')").all()).results) || []
       : ((await env.DB.prepare("SELECT * FROM push_subs WHERE email = ?").bind(to).all()).results) || [];
-    const sendTo = String(n.kind || "") === "mail" ? rows.filter((r) => r.app === "mail") : rows;
+    const sendTo = String(n.kind || "") === "mail" ? rows.filter((r) => r.app === "mail" && r.mail_on !== 0) : rows;
     if (!sendTo.length) return;
     const payload = { title: String(n.title || "Reservoir").slice(0, 120), body: n.kind === "request" ? String(n.body || "Open Reservoir to read it").slice(0, 160) : n.kind === "mail" ? "" : "Open Reservoir to read it", tag: `n-${id || Date.now()}`, open: /^[a-z]+$/.test(String(n.link || "")) ? String(n.link) : "notices" };
     await Promise.allSettled(sendTo.map(async (r) => {
-      if (pushInHours(pushModeOf(r))) return pushSendOne(env, r, payload);
+      const pl = String(n.kind || "") === "mail" && r.mail_sound === 0 ? { ...payload, silent: true } : payload;
+      if (pushInHours(pushModeOf(r))) return pushSendOne(env, r, pl);
       await env.DB.prepare("INSERT INTO push_held (endpoint) VALUES (?)").bind(r.endpoint).run();
     }));
   } catch (e) { console.log("push for notice failed", String(e && e.message || e).slice(0, 160)); }
@@ -5831,6 +5834,11 @@ async function pushRoutes(request, env, user, url) {
   if (url.pathname === "/api/push/hours") {
     const mode = Object.prototype.hasOwnProperty.call(PUSH_MODES, String(body.mode)) ? String(body.mode) : "default";
     await env.DB.prepare("UPDATE push_subs SET hours_mode = ?, all_hours = ? WHERE endpoint = ? AND email = ?").bind(mode, mode === "24" ? 1 : 0, String(body.endpoint || ""), email).run();
+    return reply(env, 200, { ok: true });
+  }
+  if (url.pathname === "/api/push/mailprefs") {
+    // Weir Mail settings for this device: whether mail notifications show at all, and whether they make a sound. Both start on.
+    await env.DB.prepare("UPDATE push_subs SET mail_on = ?, mail_sound = ? WHERE endpoint = ? AND email = ?").bind(body.on === false ? 0 : 1, body.sound === false ? 0 : 1, String(body.endpoint || ""), email).run();
     return reply(env, 200, { ok: true });
   }
   if (url.pathname === "/api/push/unsubscribe") {
