@@ -4459,7 +4459,6 @@ async function mailRoutes(request, env, user, url) {
 }
 // Looks for mail that arrived since the last look and tells everyone who has access. The first look only marks the time, so nothing floods in.
 async function mailWatch(env) {
-  return; // New mail notifications are switched off. Remove this line to turn them back on.
   if (!env.GRAPH_CLIENT_SECRET) return;
   await settingsTable(env);
   const tiers = await accessTiers(env);
@@ -4477,7 +4476,7 @@ async function mailWatch(env) {
     const who = (m) => String((m.from && m.from.emailAddress && (m.from.emailAddress.name || m.from.emailAddress.address)) || "Someone").slice(0, 60);
     const body = fresh.length === 1 ? `${who(fresh[0])}: ${String(fresh[0].subject || "(no subject)").slice(0, 100)}` : `${fresh.length} new emails, latest from ${who(fresh[0])}`;
     const to = Object.keys(tiers).filter((e) => mailAllowed(b, { email: e, tier: tiers[e] }));
-    for (const e of to) await notify(env, { to: e, kind: "mail", title: `New email, ${b.label}`, body, link: "emailbox", by: "Reservoir" });
+    for (const e of to) await notify(env, { to: e, kind: "mail", title: `New Email - ${b.label}`, body: "New email", link: "emailbox", by: "Reservoir" });
     await save(newest);
   }
 }
