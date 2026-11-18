@@ -5766,8 +5766,9 @@ async function pushForNotice(env, n, id) {
       ? ((await env.DB.prepare("SELECT * FROM push_subs WHERE tier IN ('T1', 'T2')").all()).results) || []
       : ((await env.DB.prepare("SELECT * FROM push_subs WHERE email = ?").bind(to).all()).results) || [];
     // Mail alerts go to the Weir Mail devices. A person with no Weir Mail device gets them on their Reservoir devices instead.
-    const mailRows = String(n.kind || "") === "mail" ? rows.filter((r) => r.mail_on !== 0) : [];
-    const sendTo = String(n.kind || "") === "mail" ? (mailRows.some((r) => r.app === "mail") ? mailRows.filter((r) => r.app === "mail") : mailRows) : rows;
+    // A person with any Weir Mail device never falls back to Reservoir devices, so turning mail notifications off in Weir stops the alerts.
+    const hasWeir = rows.some((r) => r.app === "mail");
+    const sendTo = String(n.kind || "") === "mail" ? (hasWeir ? rows.filter((r) => r.app === "mail" && r.mail_on !== 0) : rows.filter((r) => r.mail_on !== 0)) : rows;
     if (!sendTo.length) return;
     const payload = { title: String(n.title || "Reservoir").slice(0, 120), body: n.kind === "request" ? String(n.body || "Open Reservoir to read it").slice(0, 160) : n.kind === "mail" ? "" : "Open Reservoir to read it", tag: `n-${id || Date.now()}`, open: /^[a-z]+$/.test(String(n.link || "")) ? String(n.link) : "notices" };
     await Promise.allSettled(sendTo.map(async (r) => {
