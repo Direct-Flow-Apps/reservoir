@@ -3587,6 +3587,29 @@ async function apexParse(bytes) {
   if (!/^\d{5,}$/.test(number) || !date || !(ex > 0) || !(inc > 0) || Math.abs(ex + gst - inc) > 0.02) return null;
   return { number, date, due: due || date, ex, gst, inc, order: side("Order No:") };
 }
+async function geelongAccessParse(bytes) {
+  const items = await pdfTextRuns(bytes);
+  if (!items.length) return null;
+  // The totals box on these PDFs is drawn in a font that cannot be read as text, so the total comes from adding up the Line Total column (GST is 10% of that).
+  const money = (t) => { const neg = /^\(|-/.test(String(t).trim()); const n = Number(String(t).replace(/[^0-9.]/g, "")); return neg ? -n : n; };
+  const lab = (name) => items.filter((i) => i.t.trim().toLowerCase() === name.toLowerCase()).sort((a, b) => a.y - b.y)[0];
+  const side = (name) => { const l = lab(name); if (!l) return ""; const v = items.filter((i) => i.page === l.page && Math.abs(i.y - l.y) < 4 && i.x > l.x + 20 && i.t.trim()).sort((a, b) => a.x - b.x)[0]; return v ? v.t.trim() : ""; };
+  const dateOf = (t) => { const m = String(t).trim().match(/(\d{1,2})\/(\d{1,2})\/(\d{4})/); return m ? `${m[3]}-${String(m[2]).padStart(2, "0")}-${String(m[1]).padStart(2, "0")}` : ""; };
+  if (items.some((i) => /credit note/i.test(i.t))) return { credit: true };
+  const lt = lab("Line Total");
+  if (!lt) return null;
+  const lines = items.filter((i) => i.page === lt.page && i.y > lt.y + 4 && i.x > lt.x - 30 && /^-?\(?\$[\d,]+\.\d\d\)?$/.test(i.t.trim()));
+  if (!lines.length) return null;
+  const sum = Math.round(lines.reduce((a, i) => a + money(i.t), 0) * 100) / 100;
+  if (sum < 0) return { credit: true };
+  const ex = sum, gst = Math.round(ex * 10) / 100, inc = Math.round((ex + gst) * 100) / 100;
+  const head = lab("Tax Invoice");
+  const near = head ? items.filter((i) => i.page === head.page && /^\d{4,}$/.test(i.t.trim()) && i.x > head.x - 40 && i.y > head.y && i.y < head.y + 90).sort((a, b) => a.y - b.y)[0] : null;
+  const number = near ? near.t.trim() : "";
+  const date = dateOf(side("Invoice Date:")), due = dateOf(side("Due Date:"));
+  if (!/^\d{4,}$/.test(number) || !date || !(ex > 0)) return null;
+  return { number, date, due: due || date, ex, gst, inc, order: /^\d{3,}$/.test(side("Purchase Order:")) ? side("Purchase Order:") : "" };
+}
 async function melbourneDrainParse(bytes) {
   const items = await pdfTextRuns(bytes);
   if (!items.length) return null;
@@ -3813,6 +3836,7 @@ const INVOICE_MAIL_RULES = [
   { name: "Estimate One", from: "accounts@estimateone.com", subject: "your e1 invoice", contact: "estimate one", account: "", xeroOnly: true, parse: (b) => estimateOneParse(b) },
   { name: "Geelong Commercial", from: "emaildelivery@console.com.au", subject: "invoice for 41 seaside pde", contact: "geelong commercial", account: "", xeroOnly: true, parse: (b) => geelongCommercialParse(b) },
   { name: "Apex", fromDomain: "apexsteel.com.au", subject: "invoice", contact: "apex", account: "", parse: (b) => apexParse(b) },
+  { name: "Geelong Access Hire", from: "no-reply@latner.app", subject: "from geelong access hire", contact: "geelong access", account: "", parse: (b) => geelongAccessParse(b) },
   { name: "Melbourne Drain Relining", fromDomain: "inboundemail.aroflo.com", subject: "from melbourne drain relining", contact: "melbourne drain", account: "", forwardBack: "Invoice sent to Xero and AroFlo. Download the links in this email and upload them to AroFlo.", parse: (b) => melbourneDrainParse(b) },
   { name: "Teleca", from: "cs@teleca.com.au", subject: "telephone billing", contact: "teleca", account: "", xeroOnly: true, parse: (b) => telecaParse(b) }
 ];
