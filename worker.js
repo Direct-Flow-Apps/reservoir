@@ -329,7 +329,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
   await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
 }
 
-const WORKER_BUILD = "Reservoir-Worker-2026.11.19-w227";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.19-w228";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.izzyandloki.workers.dev/api/xero/callback";
@@ -4566,6 +4566,16 @@ async function mailRoutes(request, env, user, url) {
         const mv = await mailDo(env, addr, `/mailFolders/${encodeURIComponent(fid)}/move`, "POST", { destinationId: "deleteditems" });
         if (!mv.ok) return reply(env, 200, { ok: false, error: mailWhy(mv, true), worker: WORKER_BUILD });
         return reply(env, 200, { ok: true, worker: WORKER_BUILD });
+      }
+      if (act === "foldermove") {
+        // A folder of your own (and what is in it) moves into another folder, into Archive, or back to the top level. Outlook's own folders stay where they are.
+        const fid = String(body.folder || "");
+        const dest = String(body.dest || "");
+        if (!fid || !dest || /^(inbox|drafts|sentitems|deleteditems|archive|junkemail|outbox|msgfolderroot)$/i.test(fid)) return reply(env, 200, { ok: false, error: "That folder cannot be moved.", worker: WORKER_BUILD });
+        if (fid === dest) return reply(env, 200, { ok: false, error: "A folder cannot go into itself.", worker: WORKER_BUILD });
+        const mv = await mailDo(env, addr, `/mailFolders/${encodeURIComponent(fid)}/move`, "POST", { destinationId: mailFolderId(dest) });
+        if (!mv.ok) return reply(env, 200, { ok: false, error: mv.status === 409 ? "A folder with that name is already there." : mailWhy(mv, true), worker: WORKER_BUILD });
+        return reply(env, 200, { ok: true, newId: String((mv.json && mv.json.id) || ""), worker: WORKER_BUILD });
       }
       if (act === "setnote" || act === "urgentoff") {
         const imid = String(body.imid || "").slice(0, 300);
