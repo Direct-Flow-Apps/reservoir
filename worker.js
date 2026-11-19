@@ -337,7 +337,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
   await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
 }
 
-const WORKER_BUILD = "Reservoir-Worker-2026.11.20-w240";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.20-w241";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -6901,6 +6901,39 @@ async function passkeyVerify(env, email, body) {
 }
 
 // One off test: Saturday 24 Oct 2026, first half hour tick at or after 3:30pm Melbourne sends Andrey a timesheet reminder push. Sends once only.
+// 7am every day: one notification to everyone, counting the emails in the shared mailboxes' inboxes that carry a category. Sent once a day, between 7:00 and 9:00 Melbourne time. Devices still follow their own notification hours.
+async function morningCountPush(env) {
+  const now = tsMelbourne(new Date());
+  if (now.mins < 7 * 60 || now.mins >= 9 * 60) return;
+  await settingsTable(env);
+  const key = "morningcount.sent";
+  const sent = await env.DB.prepare("SELECT value FROM app_settings WHERE key = ?").bind(key).first();
+  if (sent && sent.value === now.date) return;
+  let n = 0;
+  for (const bx of MAILBOXES.filter((x) => !x.only)) {
+    let next = `/mailFolders/inbox/messages?$top=100&$select=categories`;
+    for (let page = 0; next && page < 10; page++) {
+      const r = await mailGraph(env, mailAddress(env, bx), next);
+      if (!r.ok) { console.log("morning count failed", bx.id, r.status); break; }
+      n += ((r.json && r.json.value) || []).filter((m) => (m.categories || []).length > 0).length;
+      const link = r.json && r.json["@odata.nextLink"];
+      next = typeof link === "string" && link.startsWith(GRAPH + "/") ? link : "";
+    }
+  }
+  await env.DB.prepare("INSERT OR REPLACE INTO app_settings (key, value, detail, by_name, at) VALUES (?, ?, ?, 'Reservoir', datetime('now'))").bind(key, now.date, String(n) + " counted").run();
+  if (n < 1) return;
+  await pushTable(env);
+  await pushLoadBiz(env);
+  const rows = ((await env.DB.prepare("SELECT * FROM push_subs").all()).results) || [];
+  const by = new Map();
+  for (const r of rows) { const e = String(r.email || "").toLowerCase(); if (!by.has(e) || (r.app === "mail" && by.get(e).app !== "mail")) by.set(e, r); }
+  const payload = { title: `You have ${n} email${n === 1 ? "" : "s"} waiting for your attention.`, body: "Open Reservoir to read it", tag: "morning-count-" + now.date, open: "notices" };
+  await Promise.allSettled([...by.values()].map(async (r) => {
+    const pl = r.app === "mail" ? { ...payload, url: "/weir" } : payload;
+    if (pushInHours(pushModeOf(r))) return pushSendOne(env, r, pl);
+    await env.DB.prepare("INSERT INTO push_held (endpoint) VALUES (?)").bind(r.endpoint).run();
+  }));
+}
 async function pushOneOffAndrey(env) {
   const now = tsMelbourne(new Date());
   if (now.date !== "2026-10-24" || now.mins < 15 * 60 + 30 || now.mins > 18 * 60) return;
@@ -7472,6 +7505,7 @@ export default {
     ctx.waitUntil(dailyOpsAlert(env).catch((e) => console.log("daily ops alert failed", String(e && e.message || e))));
     ctx.waitUntil(tsResendSalaried(env).catch((e) => console.log("resend salaried failed", String(e && e.message || e))));
     ctx.waitUntil(tsXeroPullSchedule(env).catch((e) => console.log("timesheet pull failed", String(e && e.message || e))));
+    ctx.waitUntil(morningCountPush(env).catch((e) => console.log("morning count failed", String(e && e.message || e))));
     ctx.waitUntil(pushOneOffAndrey(env).catch((e) => console.log("one off failed", String(e && e.message || e))));
     ctx.waitUntil(mailSubscribe(env).catch((e) => console.log("mail subscribe failed", String(e && e.message || e))));
     ctx.waitUntil(mailWatch(env).catch((e) => console.log("mail watch failed", String(e && e.message || e))));
