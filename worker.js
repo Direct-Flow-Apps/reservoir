@@ -337,7 +337,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
   await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
 }
 
-const WORKER_BUILD = "Reservoir-Worker-2026.11.20-w239";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.20-w240";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -4415,6 +4415,33 @@ async function mailRoutes(request, env, user, url) {
       const imid = String(m.internetMessageId || "").slice(0, 300);
       const ex = imid ? (await mailExtraFor(env, box.id, [imid])).get(imid) : null;
       return reply(env, 200, { ok: true, id: m.id, imid, note: ex && ex.note ? { text: String(ex.note), by: String(ex.note_by || ""), at: String(ex.note_at || "") } : null, urgentOff: !!(ex && ex.urgent_off), subject: String(m.subject || "(no subject)"), from: mailPart(m.from), to: (m.toRecipients || []).map(mailPart), cc: (m.ccRecipients || []).map(mailPart), at: m.receivedDateTime || m.sentDateTime || "", read: !!m.isRead, categories: (m.categories || []).slice(0, 6).map((c) => String(c).slice(0, 40)), flag: mailFlag(m.flag), html, body: shown, attachments: (m.attachments || []).filter((a) => !a.isInline).map((a) => ({ id: a.id, name: String(a.name || "attachment").slice(0, 160), size: Number(a.size || 0), type: String(a.contentType || "") })), worker: WORKER_BUILD });
+    }
+    if (url.pathname === "/api/mail/replies" && !post) {
+      // Everything our side sent in the same conversation as this email: replies and forwards, with the folder each one sits in.
+      const msg = mailId(url.searchParams.get("msg"));
+      if (!msg) return reply(env, 400, { error: "bad request" });
+      const o = await mailGraph(env, addr, `/messages/${encodeURIComponent(msg)}?$select=conversationId,receivedDateTime,sentDateTime`);
+      if (!o.ok || !o.json || !o.json.conversationId) return reply(env, 200, { ok: true, replies: [], worker: WORKER_BUILD });
+      const since = String(o.json.receivedDateTime || o.json.sentDateTime || "");
+      const cid = String(o.json.conversationId).replace(/'/g, "''");
+      const r = await mailGraph(env, addr, `/messages?$top=50&$select=id,subject,from,toRecipients,sentDateTime,receivedDateTime,parentFolderId,isDraft&$filter=${encodeURIComponent("conversationId eq '" + cid + "'")}`);
+      if (!r.ok) return reply(env, 200, { ok: false, error: mailWhy(r), worker: WORKER_BUILD });
+      const found = ((r.json && r.json.value) || []).filter((m) => m.id !== msg && !m.isDraft && /@directflow\.com\.au$/i.test(mailPart(m.from).address || "") && String(m.sentDateTime || m.receivedDateTime || "") > since);
+      const names = new Map();
+      try {
+        const tf = await mailGraph(env, addr, "/mailFolders?$top=100&$select=displayName,childFolderCount");
+        const tops = (tf.ok && tf.json && tf.json.value) || [];
+        tops.forEach((f) => names.set(f.id, String(f.displayName || "")));
+        let level = tops.filter((f) => Number(f.childFolderCount || 0) > 0);
+        for (let depth = 0; depth < 8 && level.length; depth++) {
+          const kids = await Promise.all(level.map((f) => mailGraph(env, addr, `/mailFolders/${encodeURIComponent(f.id)}/childFolders?$top=100&$select=displayName,childFolderCount`)));
+          const next = [];
+          kids.forEach((k) => ((k && k.ok && k.json && k.json.value) || []).forEach((f) => { names.set(f.id, String(f.displayName || "")); if (Number(f.childFolderCount || 0) > 0) next.push(f); }));
+          level = next;
+        }
+      } catch (e) {}
+      found.sort((x, y) => String(x.sentDateTime || x.receivedDateTime || "").localeCompare(String(y.sentDateTime || y.receivedDateTime || "")));
+      return reply(env, 200, { ok: true, replies: found.map((m) => ({ id: m.id, folder: (names.get(m.parentFolderId) || "Folder").slice(0, 40), pf: String(m.parentFolderId || ""), by: mailShow(m.from).slice(0, 60), at: m.sentDateTime || m.receivedDateTime || "", kind: /^\s*(fw|fwd)\s*:/i.test(String(m.subject || "")) ? "forward" : "reply", subject: String(m.subject || "").slice(0, 100) })), worker: WORKER_BUILD });
     }
     if (url.pathname === "/api/mail/categories" && !post) {
       const r = await mailGraph(env, addr, "/outlook/masterCategories");
