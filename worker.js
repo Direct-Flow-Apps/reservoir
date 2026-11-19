@@ -168,7 +168,15 @@ const pathOf = (segs) => segs.map((x) => encodeURIComponent(x)).join("/");
 
 async function graphFetch(env, url, init = {}) {
   const token = await getGraphToken(env);
-  return fetch(url.startsWith("http") ? url : GRAPH + url, { ...init, headers: { Authorization: `Bearer ${token}`, ...(init.headers || {}) } });
+  // Microsoft answers 429 (throttled) or 503 when it is asked for too much at once. Wait the time it names and ask again, up to three times.
+  let res;
+  for (let attempt = 0; attempt < 4; attempt++) {
+    res = await fetch(url.startsWith("http") ? url : GRAPH + url, { ...init, headers: { Authorization: `Bearer ${token}`, ...(init.headers || {}) } });
+    if ((res.status !== 429 && res.status !== 503) || attempt === 3) break;
+    const wait = Math.min(10, Math.max(1, Number(res.headers.get("Retry-After")) || 2 * (attempt + 1)));
+    await new Promise((r) => setTimeout(r, wait * 1000));
+  }
+  return res;
 }
 
 async function uploadToSharePoint(env, segs, fileName, bytes, contentType, replace) {
@@ -329,7 +337,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
   await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
 }
 
-const WORKER_BUILD = "Reservoir-Worker-2026.11.19-w228";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.19-w229";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.izzyandloki.workers.dev/api/xero/callback";
@@ -4566,6 +4574,30 @@ async function mailRoutes(request, env, user, url) {
         const mv = await mailDo(env, addr, `/mailFolders/${encodeURIComponent(fid)}/move`, "POST", { destinationId: "deleteditems" });
         if (!mv.ok) return reply(env, 200, { ok: false, error: mailWhy(mv, true), worker: WORKER_BUILD });
         return reply(env, 200, { ok: true, worker: WORKER_BUILD });
+      }
+      if (act === "bulkmove") {
+        // Many emails moved in one go, twenty to a request, so Microsoft is not asked hundreds of times at once. Moves into Archive are marked read first.
+        const ids = (Array.isArray(body.ids) ? body.ids : []).map((x) => String(x || "")).filter(Boolean).slice(0, 500);
+        const dest = mailFolderId(body.dest);
+        if (!ids.length) return reply(env, 200, { ok: false, error: "Nothing was selected.", worker: WORKER_BUILD });
+        const toArchive = String(dest).toLowerCase() === "archive";
+        const run = async (chunk, mk) => {
+          const br = await graphFetch(env, "/$batch", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ requests: chunk.map((id, k) => mk(id, String(k))) }) });
+          if (!br.ok) return chunk.map(() => ({ status: br.status }));
+          let bj = null; try { bj = await br.json(); } catch (e) { bj = null; }
+          const out = chunk.map(() => ({ status: 500 }));
+          ((bj && bj.responses) || []).forEach((r) => { const k = Number(r.id); if (out[k]) out[k] = { status: r.status, id: r.body && r.body.id ? String(r.body.id) : "" }; });
+          return out;
+        };
+        let moved = 0, failed = 0;
+        const newIds = {};
+        for (let i = 0; i < ids.length; i += 20) {
+          const chunk = ids.slice(i, i + 20);
+          if (toArchive) await run(chunk, (id, k) => ({ id: k, method: "PATCH", url: `/users/${encodeURIComponent(addr)}/messages/${encodeURIComponent(id)}`, headers: { "Content-Type": "application/json" }, body: { isRead: true } }));
+          const res = await run(chunk, (id, k) => ({ id: k, method: "POST", url: `/users/${encodeURIComponent(addr)}/messages/${encodeURIComponent(id)}/move`, headers: { "Content-Type": "application/json" }, body: { destinationId: dest } }));
+          res.forEach((r, k) => { if (r.status >= 200 && r.status < 300) { moved++; if (r.id) newIds[chunk[k]] = r.id; } else failed++; });
+        }
+        return reply(env, 200, { ok: true, moved, failed, newIds, worker: WORKER_BUILD });
       }
       if (act === "foldermove") {
         // A folder of your own (and what is in it) moves into another folder, into Archive, or back to the top level. Outlook's own folders stay where they are.
