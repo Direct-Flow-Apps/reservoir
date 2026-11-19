@@ -337,7 +337,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
   await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
 }
 
-const WORKER_BUILD = "Reservoir-Worker-2026.11.19-w237";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.20-w239";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -7328,7 +7328,7 @@ async function jobsReadSweep(env) {
 }
 // Emails addressed to Accounts and another Direct Flow mailbox: the sender gets one polite reminder from no-reply that one mailbox is enough. Only outside senders are told, once per email.
 const MULTIBOX_FROM = "no-reply@directflow.com.au";
-async function multiBoxSend(env, to, subject) {
+async function multiBoxSend(env, to, subject, label) {
   const hour = Number(new Intl.DateTimeFormat("en-AU", { timeZone: "Australia/Melbourne", hour: "numeric", hour12: false }).format(new Date())) % 24;
   const greet = hour < 12 ? "Good morning" : hour < 17 ? "Good afternoon" : "Good evening";
   const subj = String(subject || "your email").replace(/[\r\n]+/g, " ").replace(/[<>&]/g, "").slice(0, 150);
@@ -7337,8 +7337,8 @@ async function multiBoxSend(env, to, subject) {
     const origin = String(env.ALLOWED_ORIGIN || "").split(",").map((x) => x.trim().replace(/\/$/, "")).filter(Boolean)[0];
     if (origin) { if (!mailLogoCache) { const lr = await fetch(origin + "/dfp-signature-logo.png"); if (lr.ok) mailLogoCache = toB64(await lr.arrayBuffer()); } logo = mailLogoCache; }
   } catch (e) { console.log("multibox logo failed", String(e && e.message || e)); }
-  const html = `<div style="font-family:Calibri,Arial,sans-serif;font-size:11pt">${greet},<br><br>Please be reminded that your email only needs to be addressed to one Direct Flow mailbox. Your email "${subj}" was sent to more than one of our mailboxes, so it has been delivered to Accounts only.<br><br>If it needs someone else's attention, Accounts will pass it on.<br><br>${logo ? '<img src="cid:dfplogo" width="190" alt="Direct Flow Plumbing" style="display:block;border:0">' : "Direct Flow Plumbing"}</div>`;
-  const message = { subject: "Please address your email to one Direct Flow mailbox only", body: { contentType: "HTML", content: html }, toRecipients: [{ emailAddress: { address: to } }] };
+  const html = `<div style="font-family:Calibri,Arial,sans-serif;font-size:11pt">${greet},<br><br>Please be reminded that your email only needs to be addressed to one Direct Flow mailbox. Your email "${subj}" was sent to more than one of our mailboxes.<br><br>It has been automatically delivered to ${label || "Accounts"} only.<br><br>If it needs someone else's attention, ${label || "Accounts"} will pass it on.<br><br>${logo ? '<img src="cid:dfplogo" width="190" alt="Direct Flow Plumbing" style="display:block;border:0">' : "Direct Flow Plumbing"}</div>`;
+  const message = { subject: "DFP reminder: " + String(subject || "").replace(/[\r\n]+/g, " ").slice(0, 200), body: { contentType: "HTML", content: html }, toRecipients: [{ emailAddress: { address: to } }] };
   if (logo) message.attachments = [{ "@odata.type": "#microsoft.graph.fileAttachment", name: "dfp-signature-logo.png", contentType: "image/png", contentBytes: logo, isInline: true, contentId: "dfplogo" }];
   const res = await graphFetch(env, `/users/${encodeURIComponent(MULTIBOX_FROM)}/sendMail`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ message, saveToSentItems: false }) });
   if (!res.ok) console.log("multibox reminder failed", res.status);
@@ -7350,21 +7350,26 @@ async function multiBoxWatch(env) {
     await env.DB.prepare("INSERT OR REPLACE INTO app_settings (key, value, detail, by_name, at) VALUES ('multibox.test.2', '1', 'one mailbox reminder test sent', 'Reservoir', datetime('now'))").run();
     await multiBoxSend(env, "tayler@directflow.com.au", "Invoice query for the Apollo Bay job");
   }
-  const acc = MAILBOXES.find((x) => x.id === "accounts");
-  const addr = mailAddress(env, acc);
-  const since = new Date(Date.now() - 40 * 60000).toISOString();
-  const r = await mailGraph(env, addr, `/mailFolders/inbox/messages?$top=25&$select=id,subject,from,toRecipients,ccRecipients,receivedDateTime&$orderby=receivedDateTime desc&$filter=${encodeURIComponent("receivedDateTime ge " + since)}`);
-  if (!r.ok) { console.log("multibox watch", r.status); return; }
-  for (const m of ((r.json && r.json.value) || [])) {
-    const from = String((m.from && m.from.emailAddress && m.from.emailAddress.address) || "").toLowerCase();
-    if (!from || /@directflow\.com\.au$/.test(from) || /^(no-?reply|noreply|do-?not-?reply|mailer-daemon|postmaster)/.test(from)) continue;
-    const all = [...(m.toRecipients || []), ...(m.ccRecipients || [])].map((x) => String((x.emailAddress && x.emailAddress.address) || "").toLowerCase()).filter((a) => /@directflow\.com\.au$/.test(a));
-    if (!all.includes(addr) || !all.some((a) => a !== addr)) continue;
-    const key = "multibox.done." + String(m.id).slice(-60);
-    const seen = await env.DB.prepare("SELECT 1 AS x FROM app_settings WHERE key = ?").bind(key).first();
-    if (seen) continue;
-    await env.DB.prepare("INSERT OR REPLACE INTO app_settings (key, value, detail, by_name, at) VALUES (?, '1', 'one mailbox reminder sent', 'Reservoir', datetime('now'))").bind(key).run();
-    await multiBoxSend(env, from, m.subject);
+  // Accounts always wins. Without Accounts, DFP Jobs wins.
+  for (const bid of ["accounts", "jobs"]) {
+    const bx = MAILBOXES.find((x) => x.id === bid);
+    const addr = mailAddress(env, bx);
+    const accAddr = mailAddress(env, MAILBOXES.find((x) => x.id === "accounts"));
+    const since = new Date(Date.now() - 40 * 60000).toISOString();
+    const r = await mailGraph(env, addr, `/mailFolders/inbox/messages?$top=25&$select=id,subject,from,toRecipients,ccRecipients,receivedDateTime&$orderby=receivedDateTime desc&$filter=${encodeURIComponent("receivedDateTime ge " + since)}`);
+    if (!r.ok) { console.log("multibox watch", bid, r.status); continue; }
+    for (const m of ((r.json && r.json.value) || [])) {
+      const from = String((m.from && m.from.emailAddress && m.from.emailAddress.address) || "").toLowerCase();
+      if (!from || /@directflow\.com\.au$/.test(from) || /^(no-?reply|noreply|do-?not-?reply|mailer-daemon|postmaster)/.test(from)) continue;
+      const all = [...(m.toRecipients || []), ...(m.ccRecipients || [])].map((x) => String((x.emailAddress && x.emailAddress.address) || "").toLowerCase()).filter((a) => /@directflow\.com\.au$/.test(a));
+      if (!all.includes(addr) || !all.some((a) => a !== addr)) continue;
+      if (bid === "jobs" && all.includes(accAddr)) continue;
+      const key = "multibox.done." + String(m.id).slice(-60);
+      const seen = await env.DB.prepare("SELECT 1 AS x FROM app_settings WHERE key = ?").bind(key).first();
+      if (seen) continue;
+      await env.DB.prepare("INSERT OR REPLACE INTO app_settings (key, value, detail, by_name, at) VALUES (?, '1', 'one mailbox reminder sent', 'Reservoir', datetime('now'))").bind(key).run();
+      await multiBoxSend(env, from, m.subject, bx.label);
+    }
   }
 }
 async function vbaWatch(env) {
