@@ -16,3 +16,5 @@
   Cache-Control: no-cache, must-revalidate
 /Full-Reservoir-*.js
   Cache-Control: public, max-age=31536000, immutable
+/current.js
+  Cache-Control: no-cache, must-revalidate
