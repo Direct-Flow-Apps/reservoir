@@ -329,7 +329,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
   await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
 }
 
-const WORKER_BUILD = "Reservoir-Worker-2026.11.19-w226";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.19-w227";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.izzyandloki.workers.dev/api/xero/callback";
@@ -4319,6 +4319,7 @@ async function mailRoutes(request, env, user, url) {
         }
         rows.sort((x, y) => String(y.receivedDateTime || "").localeCompare(String(x.receivedDateTime || "")));
       } else {
+        if (/^archive$/i.test(String(folder))) await archiveReadSweep(env, addr);
         const f = ["receivedDateTime ge 1900-01-01T00:00:00Z"];
         if (filter === "unread") f.push("isRead eq false");
         if (filter === "attachments") f.push("hasAttachments eq true");
@@ -4711,6 +4712,31 @@ async function mailSubscribe(env) {
     if (r.ok && j.id) await save(j.id);
     else console.log("mail subscription failed", b.id, r.status, JSON.stringify(j).slice(0, 300));
   }
+}
+// Everything in an Archive folder is read. Mail that reaches Archive without passing through Reservoir (an Outlook rule, or a move made in Outlook itself) is marked read here, on every scheduled run and whenever an Archive folder is opened.
+async function archiveReadSweep(env, only) {
+  if (!env.GRAPH_CLIENT_SECRET) return 0;
+  let total = 0;
+  for (const b of MAILBOXES) {
+    const addr = mailAddress(env, b);
+    if (only && String(only).toLowerCase() !== addr) continue;
+    try {
+      let next = `/mailFolders/archive/messages?$top=100&$select=id&$filter=${encodeURIComponent("isRead eq false")}`;
+      const ids = [];
+      for (let pg = 0; pg < 5 && next; pg++) {
+        const lr = await mailGraph(env, addr, next);
+        if (!lr.ok) { console.log("archive sweep list", b.id, lr.status); break; }
+        ((lr.json && lr.json.value) || []).forEach((m) => { if (m.id) ids.push(m.id); });
+        next = lr.json && lr.json["@odata.nextLink"] ? lr.json["@odata.nextLink"] : "";
+      }
+      for (let i = 0; i < ids.length; i += 20) {
+        const chunk = ids.slice(i, i + 20);
+        const br = await graphFetch(env, "/$batch", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ requests: chunk.map((id, k) => ({ id: String(k), method: "PATCH", url: `/users/${encodeURIComponent(addr)}/messages/${encodeURIComponent(id)}`, headers: { "Content-Type": "application/json" }, body: { isRead: true } })) }) });
+        if (br.ok) total += chunk.length; else console.log("archive sweep batch", b.id, br.status);
+      }
+    } catch (e) { console.log("archive sweep failed", b.id, String(e && e.message || e)); }
+  }
+  return total;
 }
 async function mailDraftsSweep(env) {
   if (!env.GRAPH_CLIENT_SECRET) return;
@@ -7316,6 +7342,7 @@ export default {
     ctx.waitUntil(pushOneOffAndrey(env).catch((e) => console.log("one off failed", String(e && e.message || e))));
     ctx.waitUntil(mailSubscribe(env).catch((e) => console.log("mail subscribe failed", String(e && e.message || e))));
     ctx.waitUntil(mailWatch(env).catch((e) => console.log("mail watch failed", String(e && e.message || e))));
+    ctx.waitUntil(archiveReadSweep(env).catch((e) => console.log("archive sweep failed", String(e && e.message || e))));
     ctx.waitUntil(mailDraftsSweep(env).catch((e) => console.log("drafts sweep failed", String(e && e.message || e))));
     ctx.waitUntil(invMailCron(env).catch((e) => console.log("invoice mail cron failed", String(e && e.message || e))));
     ctx.waitUntil(vbaSubscribe(env).then(() => vbaWatch(env)).catch((e) => console.log("vba watch failed", String(e && e.message || e))));
