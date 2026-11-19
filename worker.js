@@ -337,7 +337,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
   await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
 }
 
-const WORKER_BUILD = "Reservoir-Worker-2026.11.19-w230";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.19-w231";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.izzyandloki.workers.dev/api/xero/callback";
@@ -4207,21 +4207,44 @@ async function mailDraftSend(env, addr, msg, op, text, to, extra) {
   else if (x.bcc) patch.bccRecipients = mailRecipients(x.bcc);
   if (x.importance === "high") patch.importance = "high";
   if (typeof x.subject === "string" && x.subject.trim()) patch.subject = x.subject.trim().slice(0, 255);
-  const at = mailWhenOk(x.sendAt);
+  const holdAt = x.hold ? mailWhenOk(x.sendAt) : "";
+  const at = holdAt ? "" : mailWhenOk(x.sendAt);
   if (at) patch.singleValueExtendedProperties = [{ id: "SystemTime 0x3FEF", value: at }];
   const upd = await mailDo(env, addr, `/messages/${encodeURIComponent(id)}`, "PATCH", patch);
   if (!upd.ok) return upd;
   for (const a of mailAtts(x.attachments)) { const ar = await mailDo(env, addr, `/messages/${encodeURIComponent(id)}/attachments`, "POST", a); if (!ar.ok) return ar; }
   if (x.noSend) return { ok: true, status: 200, json: { id } };
+  if (holdAt) { await mailHoldAdd(env, addr, id, holdAt, x.by); return { ok: true, status: 200, json: { id, held: holdAt } }; }
   const sent = await mailDo(env, addr, `/messages/${encodeURIComponent(id)}/send`, "POST");
   if (sent && sent.ok) await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}`, "PATCH", { singleValueExtendedProperties: [{ id: "Integer 0x1081", value: op === "createForward" ? "104" : op === "createReplyAll" ? "103" : "102" }] }).catch(() => {});
   return sent;
+}
+// Emails written after hours are kept as drafts and listed in Reservoir's own Outbox. A five minute run sends each one once its time comes, so it is always visible and never lost in Microsoft's queue.
+async function mailHoldTable(env) {
+  await env.DB.prepare("CREATE TABLE IF NOT EXISTS mail_hold (draft_id TEXT PRIMARY KEY, addr TEXT NOT NULL, send_at TEXT NOT NULL, by_email TEXT, made_at TEXT)").run();
+}
+async function mailHoldAdd(env, addr, draftId, sendAt, by) {
+  await mailHoldTable(env);
+  await env.DB.prepare("INSERT INTO mail_hold (draft_id, addr, send_at, by_email, made_at) VALUES (?, ?, ?, ?, datetime('now')) ON CONFLICT(draft_id) DO UPDATE SET send_at = excluded.send_at").bind(String(draftId), String(addr).toLowerCase(), String(sendAt), String(by || "")).run();
+}
+async function mailHoldIds(env, addr) {
+  try { await mailHoldTable(env); const r = await env.DB.prepare("SELECT draft_id, send_at FROM mail_hold WHERE addr = ? ORDER BY send_at").bind(String(addr).toLowerCase()).all(); return (r && r.results) || []; } catch (e) { return []; }
+}
+async function mailHoldSweep(env) {
+  if (!env.GRAPH_CLIENT_SECRET) return;
+  await mailHoldTable(env);
+  const due = await env.DB.prepare("SELECT draft_id, addr FROM mail_hold WHERE send_at <= ? ORDER BY send_at LIMIT 40").bind(new Date().toISOString()).all();
+  for (const h of (due && due.results) || []) {
+    const r = await mailDo(env, h.addr, `/messages/${encodeURIComponent(h.draft_id)}/send`, "POST");
+    if (r && (r.ok || r.status === 404 || r.status === 400)) await env.DB.prepare("DELETE FROM mail_hold WHERE draft_id = ?").bind(h.draft_id).run();
+    else console.log("hold send failed", h.addr, r && r.status);
+  }
 }
 const MAIL_ALIAS = { "inbox": "inbox", "sent items": "sentitems", "drafts": "drafts", "deleted items": "deleteditems", "junk email": "junkemail", "archive": "archive", "outbox": "outbox" };
 // A mail search asks Graph for 250 results a page and keeps following its next page link, up to this many pages.
 const MAIL_SEARCH_PAGE = 250;
 const MAIL_SEARCH_PAGES = 20;
-const MAIL_HIDE = /^(conversation history|sync issues|conflicts|local failures|server failures|rss feeds|rss subscriptions|clutter|scheduled|yammer|quick step settings|social activity notifications|personmetadata|externalcontacts)/i;
+const MAIL_HIDE = /^(conversation history|sync issues|conflicts|local failures|server failures|outbox|rss feeds|rss subscriptions|clutter|scheduled|yammer|quick step settings|social activity notifications|personmetadata|externalcontacts)/i;
 const mailPart = (x) => ({ name: String((x && x.emailAddress && x.emailAddress.name) || "").slice(0, 80), address: String((x && x.emailAddress && x.emailAddress.address) || "").slice(0, 120) });
 const mailShow = (x) => { const a = mailPart(x); return a.name || a.address; };
 // What was last done with a message: Outlook keeps it in the last verb property (102 reply, 103 reply all, 104 forward).
@@ -4274,7 +4297,7 @@ async function mailRoutes(request, env, user, url) {
     }
     const b = mine.find((x) => x.id === (url.searchParams.get("id") || ""));
     let body = null;
-    if (post) { try { body = await request.json(); } catch (e) { body = null; } }
+    if (post) { try { body = await request.json(); } catch (e) { body = null; } if (body && typeof body === "object") body.by = String(user.email || ""); }
     const box = b || (body && mine.find((x) => x.id === body.id));
     if (!box) return reply(env, 403, { error: "forbidden" });
     const addr = mailAddress(env, box);
@@ -4305,6 +4328,8 @@ async function mailRoutes(request, env, user, url) {
         });
         level = next;
       }
+      const held = await mailHoldIds(env, addr);
+      if (held.length) { const k = folders.findIndex((f) => f.id === "sentitems"); folders.splice(k >= 0 ? k + 1 : folders.length, 0, { id: "outbox", name: "Outbox", unread: 0, total: held.length }); }
       return reply(env, 200, { ok: true, folders, worker: WORKER_BUILD });
     }
     if (url.pathname === "/api/mail/box" && !post) {
@@ -4314,7 +4339,13 @@ async function mailRoutes(request, env, user, url) {
       const q = String(url.searchParams.get("q") || "").replace(/["\\]/g, " ").trim().slice(0, 100);
       const fields = "$select=subject,from,toRecipients,receivedDateTime,isRead,bodyPreview,hasAttachments,categories,flag,parentFolderId,internetMessageId&$expand=singleValueExtendedProperties($filter=id eq 'Integer 0x1081')";
       let rows = [];
-      if (q) {
+      if (!q && /^outbox$/i.test(String(folder))) {
+        for (const h of (await mailHoldIds(env, addr)).slice(0, 60)) {
+          const r = await mailGraph(env, addr, `/messages/${encodeURIComponent(h.draft_id)}?${fields}`);
+          if (r.ok && r.json) rows.push({ ...r.json, receivedDateTime: h.send_at });
+          else if (r.status === 404) await env.DB.prepare("DELETE FROM mail_hold WHERE draft_id = ?").bind(h.draft_id).run();
+        }
+      } else if (q) {
         // A search covers every folder in the mailbox and reads every page of results Graph offers, so older matches are never left out. Graph itself stops a message search at 1,000 results.
         const seen = new Set();
         let next = `/messages?$top=${MAIL_SEARCH_PAGE}&${fields}&$search=${encodeURIComponent('"' + q + '"')}`;
@@ -4335,6 +4366,7 @@ async function mailRoutes(request, env, user, url) {
         if (!r.ok) return reply(env, 200, { ok: false, error: mailWhy(r), worker: WORKER_BUILD });
         rows = (r.json && r.json.value) || [];
       }
+      if (!q && /^drafts$/i.test(String(folder))) { const hid = new Set((await mailHoldIds(env, addr)).map((h) => h.draft_id)); if (hid.size) rows = rows.filter((m) => !hid.has(m.id)); }
       // A search covers every folder, so each result says which folder it is in.
       const where = new Map();
       if (q) {
@@ -4659,11 +4691,12 @@ async function mailRoutes(request, env, user, url) {
         const to = mailRecipients(body && body.to);
         if (!to.length) return reply(env, 200, { ok: false, error: "Add at least one valid email address to send to.", worker: WORKER_BUILD });
         const msgObj = draftBody();
-        const atts = mailAtts(body.attachments), at = mailWhenOk(body.sendAt);
+        const atts = mailAtts(body.attachments), at = mailWhenOk(body.sendAt), holdNew = !!body.hold && !!at;
         if (!atts.length && !at) return done(await mailDo(env, addr, "/sendMail", "POST", { message: msgObj, saveToSentItems: true }));
-        const made = await mailDo(env, addr, "/messages", "POST", at ? { ...msgObj, singleValueExtendedProperties: [{ id: "SystemTime 0x3FEF", value: at }] } : msgObj);
+        const made = await mailDo(env, addr, "/messages", "POST", at && !holdNew ? { ...msgObj, singleValueExtendedProperties: [{ id: "SystemTime 0x3FEF", value: at }] } : msgObj);
         if (!made.ok || !made.json || !made.json.id) return done(made);
         for (const a of atts) { const ar = await mailDo(env, addr, `/messages/${encodeURIComponent(made.json.id)}/attachments`, "POST", a); if (!ar.ok) return done(ar); }
+        if (holdNew) { await mailHoldAdd(env, addr, made.json.id, at, user.email); return reply(env, 200, { ok: true, held: at, worker: WORKER_BUILD }); }
         return done(await mailDo(env, addr, `/messages/${encodeURIComponent(made.json.id)}/send`, "POST"));
       }
       if (act === "savedraft") {
@@ -7374,7 +7407,7 @@ export default {
   // Runs on a Cloudflare cron trigger if one is added (for example Thursday early morning). It only refreshes leave balances and leave history from Xero into D1.
   async scheduled(event, env, ctx) {
     // A five minute trigger, if one is added, only looks for new mail so pings arrive quickly.
-    if (event && event.cron === "*/5 * * * *") { ctx.waitUntil(mailWatch(env).catch((e) => console.log("mail watch failed", String(e && e.message || e)))); ctx.waitUntil(vbaSubscribe(env).then(() => vbaWatch(env)).catch((e) => console.log("vba watch failed", String(e && e.message || e)))); return; }
+    if (event && event.cron === "*/5 * * * *") { ctx.waitUntil(mailWatch(env).catch((e) => console.log("mail watch failed", String(e && e.message || e)))); ctx.waitUntil(mailHoldSweep(env).catch((e) => console.log("hold sweep failed", String(e && e.message || e)))); ctx.waitUntil(vbaSubscribe(env).then(() => vbaWatch(env)).catch((e) => console.log("vba watch failed", String(e && e.message || e)))); return; }
     // Every run checks the automatic timesheets and the payroll sweeps. The leave sync keeps its own schedule and is skipped on the half hourly one.
     ctx.waitUntil(tsAutoRun(env).catch((e) => console.log("auto timesheets failed", String(e && e.message || e))));
     ctx.waitUntil(pushFlushHeld(env));
@@ -7385,6 +7418,7 @@ export default {
     ctx.waitUntil(mailSubscribe(env).catch((e) => console.log("mail subscribe failed", String(e && e.message || e))));
     ctx.waitUntil(mailWatch(env).catch((e) => console.log("mail watch failed", String(e && e.message || e))));
     ctx.waitUntil(archiveReadSweep(env).catch((e) => console.log("archive sweep failed", String(e && e.message || e))));
+    ctx.waitUntil(mailHoldSweep(env).catch((e) => console.log("hold sweep failed", String(e && e.message || e))));
     ctx.waitUntil(mailDraftsSweep(env).catch((e) => console.log("drafts sweep failed", String(e && e.message || e))));
     ctx.waitUntil(invMailCron(env).catch((e) => console.log("invoice mail cron failed", String(e && e.message || e))));
     ctx.waitUntil(vbaSubscribe(env).then(() => vbaWatch(env)).catch((e) => console.log("vba watch failed", String(e && e.message || e))));
