@@ -337,7 +337,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
   await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
 }
 
-const WORKER_BUILD = "Reservoir-Worker-2026.11.19-w229";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.19-w230";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.izzyandloki.workers.dev/api/xero/callback";
@@ -4217,11 +4217,11 @@ async function mailDraftSend(env, addr, msg, op, text, to, extra) {
   if (sent && sent.ok) await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}`, "PATCH", { singleValueExtendedProperties: [{ id: "Integer 0x1081", value: op === "createForward" ? "104" : op === "createReplyAll" ? "103" : "102" }] }).catch(() => {});
   return sent;
 }
-const MAIL_ALIAS = { "inbox": "inbox", "sent items": "sentitems", "drafts": "drafts", "deleted items": "deleteditems", "junk email": "junkemail", "archive": "archive" };
+const MAIL_ALIAS = { "inbox": "inbox", "sent items": "sentitems", "drafts": "drafts", "deleted items": "deleteditems", "junk email": "junkemail", "archive": "archive", "outbox": "outbox" };
 // A mail search asks Graph for 250 results a page and keeps following its next page link, up to this many pages.
 const MAIL_SEARCH_PAGE = 250;
 const MAIL_SEARCH_PAGES = 20;
-const MAIL_HIDE = /^(conversation history|sync issues|conflicts|local failures|server failures|outbox|rss feeds|rss subscriptions|clutter|scheduled|yammer|quick step settings|social activity notifications|personmetadata|externalcontacts)/i;
+const MAIL_HIDE = /^(conversation history|sync issues|conflicts|local failures|server failures|rss feeds|rss subscriptions|clutter|scheduled|yammer|quick step settings|social activity notifications|personmetadata|externalcontacts)/i;
 const mailPart = (x) => ({ name: String((x && x.emailAddress && x.emailAddress.name) || "").slice(0, 80), address: String((x && x.emailAddress && x.emailAddress.address) || "").slice(0, 120) });
 const mailShow = (x) => { const a = mailPart(x); return a.name || a.address; };
 // What was last done with a message: Outlook keeps it in the last verb property (102 reply, 103 reply all, 104 forward).
