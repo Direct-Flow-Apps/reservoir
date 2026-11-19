@@ -337,7 +337,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
   await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
 }
 
-const WORKER_BUILD = "Reservoir-Worker-2026.11.19-w233";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.19-w234";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.izzyandloki.workers.dev/api/xero/callback";
@@ -7330,25 +7330,6 @@ async function vbaWatch(env) {
   if (!env.GRAPH_CLIENT_SECRET) return;
   await settingsTable(env);
   await jobsReadSweep(env).catch((e) => console.log("read sweep failed", String(e && e.message || e)));
-  const jobs = MAILBOXES.find((x) => x.id === "jobs");
-  const addr = mailAddress(env, jobs);
-  const since = new Date(Date.now() - 40 * 60000).toISOString();
-  const r = await mailGraph(env, addr, `/mailFolders/inbox/messages?$top=15&$select=id,subject,receivedDateTime,bodyPreview,body&$orderby=receivedDateTime desc&$filter=${encodeURIComponent("receivedDateTime ge " + since)}`);
-  if (!r.ok) { console.log("vba watch", r.status); return; }
-  const hits = ((r.json && r.json.value) || []).filter((m) => VBA_SUBJECT.test(String(m.subject || "")));
-  if (!hits.length) return;
-  const tiers = await accessTiers(env);
-  const to = Object.keys(tiers).filter((e) => (tiers[e] === "T1" || tiers[e] === "T2") && VBA_PEOPLE.test(e.split("@")[0]));
-  for (const m of hits) {
-    const key = "vba.done." + String(m.id).slice(-60);
-    const seen = await env.DB.prepare("SELECT 1 AS x FROM app_settings WHERE key = ?").bind(key).first();
-    if (seen) continue;
-    const text = String((m.bodyPreview || "") + " " + String((m.body && m.body.content) || "").replace(/<[^>]*>/g, " "));
-    const mm = text.match(/(?<!\d)(\d{6})(?!\d)/);
-    if (!mm) continue;
-    await env.DB.prepare("INSERT OR REPLACE INTO app_settings (key, value, detail, by_name, at) VALUES (?, '1', 'vba code sent', 'Reservoir', datetime('now'))").bind(key).run();
-    for (const e of to) await notify(env, { to: e, kind: "vba", title: `VBA 360 code ${mm[1]}`, body: "Tick this once you have used the code. It clears for the others and the email is archived.", todo: true, data: { vbaMsg: m.id, box: "jobs" }, by: "Reservoir" });
-  }
 }
 async function vbaClear(env, row, user) {
   let d = null;
