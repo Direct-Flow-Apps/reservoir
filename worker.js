@@ -329,7 +329,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
   await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
 }
 
-const WORKER_BUILD = "Reservoir-Worker-2026.11.19-w224";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.19-w225";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.izzyandloki.workers.dev/api/xero/callback";
@@ -4124,6 +4124,11 @@ async function mailGraphPost(env, path, bodyObj) {
   return { ok: res.ok, status: res.status, text: await res.text() };
 }
 async function mailDo(env, address, path, method, bodyObj) {
+  // Anything filed into the Archive is marked as read first, whichever route moves it there.
+  if (method === "POST" && /\/move$/.test(path) && bodyObj && String(bodyObj.destinationId || "").toLowerCase() === "archive") {
+    const rd = await mailDo(env, address, path.replace(/\/move$/, ""), "PATCH", { isRead: true });
+    if (!rd.ok) console.log("archive mark read failed", rd.status);
+  }
   const go = () => graphFetch(env, `/users/${encodeURIComponent(address)}${path}`, { method, headers: { "Content-Type": "application/json" }, body: bodyObj === void 0 ? void 0 : JSON.stringify(bodyObj) });
   let res = await go();
   if (res.status === 401 || res.status === 403) { graphToken = { value: null, at: 0 }; res = await go(); }
