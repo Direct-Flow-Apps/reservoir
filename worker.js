@@ -7679,6 +7679,16 @@ async function mergeAutoReply(env) {
   if (!r.ok) { console.log("autoreply failed", r.status, (await r.text()).slice(0, 300)); return; }
   await env.DB.prepare("INSERT OR REPLACE INTO app_settings (key, value, detail, by_name, at) VALUES ('merge.autoreply', '1', ?, 'Reservoir', datetime('now'))").bind(sig).run();
 }
+// Safety: an automatic reply was switched on by mistake (w251). If it was ever set, turn it off again and clear the record.
+async function undoAutoReply(env) {
+  if (!env.GRAPH_CLIENT_SECRET) return;
+  await settingsTable(env);
+  const row = await env.DB.prepare("SELECT key FROM app_settings WHERE key = 'merge.autoreply'").first();
+  if (!row) return;
+  const addr = mailAddress(env, MAILBOXES.find((x) => x.id === "maintenance"));
+  const r = await graphFetch(env, `/users/${encodeURIComponent(addr)}/mailboxSettings`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ automaticRepliesSetting: { status: "disabled" } }) });
+  if (r.ok) await env.DB.prepare("DELETE FROM app_settings WHERE key = 'merge.autoreply'").run(); else console.log("undo autoreply failed", r.status);
+}
 async function mergeSentCopy(env) {
   await copyFolderJob(env, "merge.sent_copy", async () => [{ src: "sentitems", dst: "sentitems" }]);
 }
@@ -7706,7 +7716,7 @@ export default {
   // Runs on a Cloudflare cron trigger if one is added (for example Thursday early morning). It only refreshes leave balances and leave history from Xero into D1.
   async scheduled(event, env, ctx) {
     // A five minute trigger, if one is added, only looks for new mail so pings arrive quickly.
-    if (event && event.cron === "*/5 * * * *") { ctx.waitUntil(mergeSentCopy(env).catch((e) => console.log("sent copy failed", String(e && e.message || e)))); ctx.waitUntil(mergeAutoReply(env).catch((e) => console.log("autoreply failed", String(e && e.message || e)))); ctx.waitUntil(mergeArchiveCopy(env).catch((e) => console.log("archive copy failed", String(e && e.message || e)))); ctx.waitUntil(mailWatch(env).catch((e) => console.log("mail watch failed", String(e && e.message || e)))); ctx.waitUntil(mailHoldSweep(env).catch((e) => console.log("hold sweep failed", String(e && e.message || e)))); ctx.waitUntil(vbaSubscribe(env).then(() => vbaWatch(env)).catch((e) => console.log("vba watch failed", String(e && e.message || e)))); return; }
+    if (event && event.cron === "*/5 * * * *") { ctx.waitUntil(mergeSentCopy(env).catch((e) => console.log("sent copy failed", String(e && e.message || e)))); ctx.waitUntil(mergeAutoReply(env).catch((e) => console.log("autoreply failed", String(e && e.message || e)))); ctx.waitUntil(undoAutoReply(env).catch(() => {})); ctx.waitUntil(mergeArchiveCopy(env).catch((e) => console.log("archive copy failed", String(e && e.message || e)))); ctx.waitUntil(mailWatch(env).catch((e) => console.log("mail watch failed", String(e && e.message || e)))); ctx.waitUntil(mailHoldSweep(env).catch((e) => console.log("hold sweep failed", String(e && e.message || e)))); ctx.waitUntil(vbaSubscribe(env).then(() => vbaWatch(env)).catch((e) => console.log("vba watch failed", String(e && e.message || e)))); return; }
     // Every run checks the automatic timesheets and the payroll sweeps. The leave sync keeps its own schedule and is skipped on the half hourly one.
     ctx.waitUntil(tsAutoRun(env).catch((e) => console.log("auto timesheets failed", String(e && e.message || e))));
     ctx.waitUntil(pushFlushHeld(env));
