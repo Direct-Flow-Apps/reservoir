@@ -3860,7 +3860,7 @@ const mxAddr = (a) => a ? [a.street, a.city, a.state, a.postalCode].filter(Boole
 // Client logos: a SharePoint folder (Reservoir site, beside Workplace Culture and Fleet Management) where each file is named for the web address it stands for, such as vestbuild.com.au.png.
 const LOGO_HOMES = [["Branding & Marketing", "Client Logos"], ["Reservoir", "Branding & Marketing", "Client Logos"]];
 let logoIndex = { at: 0, map: null };
-async function logoLookup(env, email) {
+async function logoLookup(env, email, probe) {
   const dom = String(email || "").split("@")[1] || "";
   if (!dom) return null;
   const ext = /\.(png|jpe?g|svg|webp|gif)$/i;
@@ -3885,6 +3885,7 @@ async function logoLookup(env, email) {
   for (let i = 0; i < parts.length - 1 && !id; i++) { const k = parts.slice(i).join("."); if (logoIndex.map.has(k)) id = logoIndex.map.get(k); }
   if (!id) { const stem = parts.length > 2 && /^(com|net|org|co|gov|edu)$/.test(parts[parts.length - 2]) ? parts[parts.length - 3] : parts[parts.length - 2]; for (const [name, v] of logoIndex.map) if (name.split(".")[0] === stem) { id = v; break; } if (!id && stem && stem.length >= 4) { const nz = (x) => String(x).toLowerCase().replace(/[^a-z0-9]/g, ""); const st = nz(stem); for (const [name, v] of logoIndex.map) { const n = nz(name.replace(/\.(com|net|org|co|au|nz|gov|edu)\b/g, "")); if (n && (n === st || n.startsWith(st) || (n.length >= 4 && st.startsWith(n)))) { id = v; break; } } } }
   if (!id) return null;
+  if (probe) return true;
   const res = await graphFetch(env, `/sites/${siteId(env)}/drive/items/${encodeURIComponent(id)}/content`);
   return res.ok ? res : null;
 }
@@ -3914,6 +3915,39 @@ async function approvalSeen(env, b, em, name) {
     await env.DB.prepare("UPDATE contact_approvals SET cnt = ?, status = 'pending' WHERE email = ?").bind(cnt, em).run();
     await tell(!!row.logo);
   } else await env.DB.prepare("UPDATE contact_approvals SET cnt = ? WHERE email = ?").bind(cnt, em).run();
+}
+async function approvalScan(env, boxes) {
+  await approvalsTable(env);
+  let added = 0;
+  for (const b of boxes) {
+    const owner = encodeURIComponent(mailAddress(env, b));
+    const have = new Set();
+    let next = `/users/${owner}/contacts?$top=999&$select=emailAddresses`;
+    for (let n = 0; next && n < 10; n++) {
+      const r = await graphFetch(env, next); if (!r.ok) break;
+      const j = await r.json();
+      for (const c of j.value || []) for (const a of c.emailAddresses || []) have.add(String(a.address || "").toLowerCase());
+      next = j["@odata.nextLink"] || "";
+    }
+    const seen = new Map();
+    next = `/users/${owner}/mailFolders/inbox/messages?$top=100&$select=from&$orderby=receivedDateTime desc`;
+    for (let n = 0; next && n < 6; n++) {
+      const r = await graphFetch(env, next); if (!r.ok) break;
+      const j = await r.json();
+      for (const m of j.value || []) { const fa = (m.from && m.from.emailAddress) || {}; const em = String(fa.address || "").toLowerCase().trim(); if (em) { const o = seen.get(em) || { name: fa.name || "", n: 0 }; o.n++; seen.set(em, o); } }
+      next = j["@odata.nextLink"] || "";
+    }
+    for (const [em, o] of seen) {
+      if (have.has(em) || !/^[^\s@'"<>]+@[^\s@'"<>]+$/.test(em) || /@(directflow\.com\.au|aroflo\.com)$/.test(em) || /^(no-?reply|do-?not-?reply|mailer-daemon|postmaster)/.test(em)) continue;
+      const row = await env.DB.prepare("SELECT status FROM contact_approvals WHERE email = ?").bind(em).first();
+      if (row) continue;
+      let logo = 0; try { if (await logoLookup(env, em, true)) logo = 1; } catch (e) {}
+      const nm = o.name && o.name.toLowerCase() !== em ? o.name : "";
+      await env.DB.prepare("INSERT INTO contact_approvals (email, box, name, status, logo, cnt) VALUES (?, ?, ?, 'pending', ?, ?)").bind(em, b.id, String(nm).slice(0, 120), logo, o.n).run();
+      added++;
+    }
+  }
+  return added;
 }
 async function mailGraph(env, address, qs) {
   // qs is a path inside the mailbox, or the full next page link Graph handed back.
@@ -4719,10 +4753,14 @@ async function mailRoutes(request, env, user, url) {
         logoIndex = { at: 0, map: null };
         return reply(env, 200, { ok: true, name: base + ".png", worker: WORKER_BUILD });
       }
-      if (act === "approvals" || act === "approvalact") {
+      if (act === "approvals" || act === "approvalact" || act === "approvalscan") {
         const isTayler = user.tier === "T1" && (/^tayler/i.test(String(user.email || "")) || /^tayler\b/i.test(String(user.name || "")));
         if (!isTayler) return reply(env, 200, { ok: false, error: "Only Tayler can approve contacts.", worker: WORKER_BUILD });
         await approvalsTable(env);
+        if (act === "approvalscan") {
+          const added = await approvalScan(env, mine.filter((x) => !x.only));
+          return reply(env, 200, { ok: true, added, worker: WORKER_BUILD });
+        }
         if (act === "approvals") {
           const rs = await env.DB.prepare("SELECT email, name, box, logo, cnt FROM contact_approvals WHERE status = 'pending' ORDER BY created_at").all();
           return reply(env, 200, { ok: true, items: (rs.results || []).map((r) => ({ email: r.email, name: r.name || "", box: r.box, logo: !!r.logo, count: r.cnt || 0 })), worker: WORKER_BUILD });
