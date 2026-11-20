@@ -337,7 +337,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
   await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
 }
 
-const WORKER_BUILD = "Reservoir-Worker-2026.11.20-w263";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.20-w264";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -4295,6 +4295,22 @@ async function mailRoutes(request, env, user, url) {
         return { id: b.id, label: b.label, address: mailAddress(env, b), personal: !!b.only, unread: r.ok && r.json ? Number(r.json.unreadItemCount || 0) : 0, total: r.ok && r.json ? Number(r.json.totalItemCount || 0) : 0, error: r.ok ? "" : mailWhy(r) };
       }));
       return reply(env, 200, { boxes: out, targets: MAILBOXES.filter((x) => !x.only || mailAllowed(x, user)).map((x) => ({ id: x.id, label: x.label })), worker: WORKER_BUILD });
+    }
+    if (url.pathname === "/api/mail/copystatus" && !post) {
+      // Progress of the Sent Items and Archive copy from maintenance into DFP Jobs: the total in Maintenance and how many the copy job has transferred.
+      if (!mine.find((x) => x.id === "maintenance")) return reply(env, 403, { error: "forbidden" });
+      await settingsTable(env);
+      const src = mailAddress(env, MAILBOXES.find((x) => x.id === "maintenance"));
+      const one = async (key, rootId) => {
+        const row = await env.DB.prepare("SELECT value, detail FROM app_settings WHERE key = ?").bind(key).first();
+        let st = {}; try { st = row && row.detail ? JSON.parse(row.detail) : {}; } catch (e) {}
+        const ids = st.folders && st.folders.length ? st.folders.map((f) => f.src) : [rootId];
+        const counts = await Promise.all(ids.map(async (i) => { const r = await mailGraph(env, src, `/mailFolders/${encodeURIComponent(i)}?$select=totalItemCount`); return r.ok && r.json ? Number(r.json.totalItemCount || 0) : 0; }));
+        return { state: row ? (row.value === "done" ? "done" : row.value === "halted" ? "halted" : "running") : "waiting", copied: Number(st.n || 0), total: counts.reduce((a, b) => a + b, 0) };
+      };
+      const undo = await env.DB.prepare("SELECT value FROM app_settings WHERE key = 'merge.undo2'").first();
+      const [sent, archive] = await Promise.all([one("merge.sent_copy2", "sentitems"), one("merge.archive_copy2", "archive")]);
+      return reply(env, 200, { ok: true, undo: undo ? undo.value : "waiting", sent, archive, worker: WORKER_BUILD });
     }
     if (url.pathname === "/api/mail/signature" && !post) {
       // The signature reads the signed in person's name, job title and business phone from Entra.
