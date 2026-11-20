@@ -337,7 +337,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
   await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
 }
 
-const WORKER_BUILD = "Reservoir-Worker-2026.11.20-w241";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.20-w242";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -7494,6 +7494,68 @@ async function invMailCron(env) {
   await invMailSweep(env, 2);
   await invHistoryTidy(env);
 }
+// Mailbox merge: maintenance@ and enquiries@ both redirect whatever lands in their Inbox to DFP Jobs, and their Junk folders are swept into the DFP Jobs Junk folder once a day at 7 am. The inbox redirect is a server side rule, so it only sees mail Microsoft has already filtered.
+const ENQUIRIES_ADDR = "enquiries@directflow.com.au";
+function mergeSources(env) {
+  return [mailAddress(env, MAILBOXES.find((x) => x.id === "maintenance")), String(env.MAILBOX_ENQUIRIES || ENQUIRIES_ADDR).toLowerCase()];
+}
+async function mergeRulesSync(env) {
+  if (!env.GRAPH_CLIENT_SECRET) return;
+  await settingsTable(env);
+  const to = mailAddress(env, MAILBOXES.find((x) => x.id === "jobs"));
+  const sig = "redirect-v1:" + to;
+  const row = await env.DB.prepare("SELECT detail FROM app_settings WHERE key = 'merge.rules_sync'").first();
+  if (row && row.detail === sig) return;
+  let ok = true;
+  for (const addr of mergeSources(env)) {
+    const base = `/users/${encodeURIComponent(addr)}/mailFolders/inbox/messageRules`;
+    const list = await graphFetch(env, base);
+    if (!list.ok) { ok = false; console.log("merge rules list failed", addr, list.status); continue; }
+    const name = "Reservoir: redirect to DFP Jobs";
+    const have = (((await list.json()).value) || []).find((x) => x.displayName === name);
+    const body = JSON.stringify({ displayName: name, sequence: 1, isEnabled: true, conditions: {}, actions: { redirectTo: [{ emailAddress: { address: to } }], markAsRead: true, stopProcessingRules: true } });
+    const res = have ? await graphFetch(env, `${base}/${have.id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body }) : await graphFetch(env, base, { method: "POST", headers: { "Content-Type": "application/json" }, body });
+    if (!res.ok) { ok = false; console.log("merge rule failed", addr, res.status, (await res.text()).slice(0, 300)); }
+  }
+  if (ok) await env.DB.prepare("INSERT OR REPLACE INTO app_settings (key, value, detail, by_name, at) VALUES ('merge.rules_sync', '1', ?, 'Reservoir', datetime('now'))").bind(sig).run();
+}
+async function mergeJunkSweep(env) {
+  if (!env.GRAPH_CLIENT_SECRET) return;
+  const now = tsMelbourne(new Date());
+  if (now.mins < 7 * 60 || now.mins >= 9 * 60) return;
+  await settingsTable(env);
+  const key = "merge.junk_sweep";
+  const done = await env.DB.prepare("SELECT value FROM app_settings WHERE key = ?").bind(key).first();
+  if (done && done.value === now.date) return;
+  const dest = mailAddress(env, MAILBOXES.find((x) => x.id === "jobs"));
+  let moved = 0, left = 0;
+  for (const src of mergeSources(env)) {
+    for (let round = 0; round < 6; round++) {
+      const r = await mailGraph(env, src, "/mailFolders/junkemail/messages?$top=20&$select=id,isRead");
+      if (!r.ok) { console.log("junk sweep list failed", src, r.status); left++; break; }
+      const msgs = (r.json && r.json.value) || [];
+      if (!msgs.length) break;
+      let progressed = 0;
+      for (const m of msgs) {
+        const raw = await graphFetch(env, `/users/${encodeURIComponent(src)}/messages/${encodeURIComponent(m.id)}/$value`);
+        if (!raw.ok) { console.log("junk sweep read failed", raw.status); continue; }
+        const bytes = new Uint8Array(await raw.arrayBuffer());
+        let bin = "";
+        for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+        const put = await graphFetch(env, `/users/${encodeURIComponent(dest)}/mailFolders/junkemail/messages`, { method: "POST", headers: { "Content-Type": "text/plain" }, body: btoa(bin) });
+        if (!put.ok) { console.log("junk sweep copy failed", put.status); continue; }
+        let made = null; try { made = await put.json(); } catch (e) { made = null; }
+        if (made && made.id) await mailDo(env, dest, `/messages/${encodeURIComponent(made.id)}`, "PATCH", { isRead: !!m.isRead });
+        const gone = await mailDo(env, src, `/messages/${encodeURIComponent(m.id)}/move`, "POST", { destinationId: "deleteditems" });
+        if (gone.ok) { moved++; progressed++; } else console.log("junk sweep remove failed", gone.status);
+      }
+      if (!progressed) { left++; break; }
+      if (round === 5) left++;
+    }
+  }
+  if (left === 0) await env.DB.prepare("INSERT OR REPLACE INTO app_settings (key, value, detail, by_name, at) VALUES (?, ?, ?, 'Reservoir', datetime('now'))").bind(key, now.date, String(moved) + " swept").run();
+  console.log("junk sweep", moved, "moved", left ? "more to do" : "done");
+}
 export default {
   // Runs on a Cloudflare cron trigger if one is added (for example Thursday early morning). It only refreshes leave balances and leave history from Xero into D1.
   async scheduled(event, env, ctx) {
@@ -7506,6 +7568,8 @@ export default {
     ctx.waitUntil(tsResendSalaried(env).catch((e) => console.log("resend salaried failed", String(e && e.message || e))));
     ctx.waitUntil(tsXeroPullSchedule(env).catch((e) => console.log("timesheet pull failed", String(e && e.message || e))));
     ctx.waitUntil(morningCountPush(env).catch((e) => console.log("morning count failed", String(e && e.message || e))));
+    ctx.waitUntil(mergeRulesSync(env).catch((e) => console.log("merge rules failed", String(e && e.message || e))));
+    ctx.waitUntil(mergeJunkSweep(env).catch((e) => console.log("junk sweep failed", String(e && e.message || e))));
     ctx.waitUntil(pushOneOffAndrey(env).catch((e) => console.log("one off failed", String(e && e.message || e))));
     ctx.waitUntil(mailSubscribe(env).catch((e) => console.log("mail subscribe failed", String(e && e.message || e))));
     ctx.waitUntil(mailWatch(env).catch((e) => console.log("mail watch failed", String(e && e.message || e))));
