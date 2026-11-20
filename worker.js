@@ -337,7 +337,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
   await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
 }
 
-const WORKER_BUILD = "Reservoir-Worker-2026.11.20-w258";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.20-w259";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -7623,7 +7623,9 @@ async function copyOneMail(env, src, dest, folderId, m, verify) {
   }
   return { ok: true, id: made.id };
 }
+const COPY_PAUSED = true; // Paused at Tayler's request. Set to false to resume the undo and the Sent Items and Archive copies.
 async function copyFolderJob(env, key, buildFolders) {
+  if (COPY_PAUSED) return;
   if (!env.GRAPH_CLIENT_SECRET) return;
   await settingsTable(env);
   await mailMarkerCol(env);
@@ -7696,6 +7698,7 @@ async function mergeAutoReply(env) {
 }
 // Undo of the first (wrongly dated) copies: they are found in DFP Jobs Sent Items and Archive (and its subfolders), created today, and either carrying a Maintenance marker or sent from maintenance, and moved to Deleted Items (the 7am sweep clears that). Nothing else is touched. When a full pass finds none left the copy jobs are allowed to start again.
 async function mergeCopyUndo(env) {
+  if (COPY_PAUSED) return;
   if (!env.GRAPH_CLIENT_SECRET) return;
   await settingsTable(env);
   await mailMarkerCol(env);
