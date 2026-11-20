@@ -337,7 +337,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
   await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
 }
 
-const WORKER_BUILD = "Reservoir-Worker-2026.11.20-w259";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.20-w260";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -4454,6 +4454,16 @@ async function mailRoutes(request, env, user, url) {
       const q = String(url.searchParams.get("q") || "").replace(/['"\\]/g, " ").trim().slice(0, 60);
       if (q.length < 1) return reply(env, 200, { ok: true, contacts: [], worker: WORKER_BUILD });
       const f = encodeURIComponent(`startswith(displayName,'${q}') or startswith(givenName,'${q}') or startswith(surname,'${q}') or startswith(companyName,'${q}')`);
+      // The sent mail lookup starts at the same time as the contacts lookup, and is kept for five minutes per mailbox, so typing stays quick.
+      globalThis.__sentRcpt = globalThis.__sentRcpt || new Map();
+      const sentP = Promise.all(mine.map(async (bx) => {
+        const hit = globalThis.__sentRcpt.get(bx.id);
+        if (hit && Date.now() - hit.t < 300000) return hit.v;
+        const r = await mailGraph(env, mailAddress(env, bx), "/mailFolders/sentitems/messages?$top=100&$select=toRecipients,ccRecipients,bccRecipients");
+        const v = (r.ok && r.json && r.json.value) || [];
+        if (r.ok) globalThis.__sentRcpt.set(bx.id, { t: Date.now(), v });
+        return v;
+      }));
       const found = await Promise.all(mine.map(async (bx) => {
         const ad = mailAddress(env, bx);
         const r = await mailGraph(env, ad, `/contacts?$top=8&$select=id,displayName,emailAddresses,companyName,photo&$filter=${f}`);
@@ -4464,10 +4474,7 @@ async function mailRoutes(request, env, user, url) {
       // Addresses already used in sent mail are remembered too, even when nobody saved them as a contact.
       if (out.length < 8) {
         const ql = q.toLowerCase();
-        const sent = await Promise.all(mine.map(async (bx) => {
-          const r = await mailGraph(env, mailAddress(env, bx), "/mailFolders/sentitems/messages?$top=100&$select=toRecipients,ccRecipients,bccRecipients");
-          return (r.ok && r.json && r.json.value) || [];
-        }));
+        const sent = await sentP;
         for (const m of sent.flat()) for (const x of [...(m.toRecipients || []), ...(m.ccRecipients || []), ...(m.bccRecipients || [])]) {
           const ea = x && x.emailAddress; const addr = String((ea && ea.address) || "").trim(); const nm = String((ea && ea.name) || "").trim();
           if (!addr || seen.has(addr.toLowerCase())) continue;
