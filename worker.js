@@ -7682,13 +7682,13 @@ async function copyFolderJob(env, key, buildFolders) {
 async function mergeAutoReply(env) {
   if (!env.GRAPH_CLIENT_SECRET) return;
   await settingsTable(env);
-  const sig = "autoreply-v2";
+  const sig = "autoreply-v3";
   const row = await env.DB.prepare("SELECT detail FROM app_settings WHERE key = 'merge.autoreply'").first();
   if (row && row.detail === sig) return;
   const addr = mailAddress(env, MAILBOXES.find((x) => x.id === "maintenance"));
   const jobs = mailAddress(env, MAILBOXES.find((x) => x.id === "jobs"));
   const logo = String(env.ALLOWED_ORIGIN || "").split(",")[0].trim().replace(/\/$/, "") + "/dfp-signature-logo.png";
-  const msg = `<div style="font-family:Calibri,sans-serif;font-size:11pt"><p>Hello,</p><p>Your email to ${addr} has been received and forwarded to our centralised mailbox, <a href="mailto:${jobs}">${jobs}</a>, where our team will respond.</p><p>Please update your contact details to our new email address.</p><p><img src="${logo}" alt="Direct Flow Plumbing" style="max-width:280px"></p></div>`;
+  const msg = `<div style="font-family:Calibri,sans-serif;font-size:11pt"><div>Hello,</div><div><br></div><div><br></div><div>Re: DFP Mailbox Closure Notice</div><div><br></div><div>Your email to ${addr} has been received and forwarded to our centralised mailbox,<br><a href="mailto:${jobs}">${jobs}</a>, where our team will respond.</div><div><br></div><div>Please update your contact details to our new email address.</div><div><br></div><div><img src="${logo}" width="190" alt="Direct Flow Plumbing" style="display:block;border:0"></div></div>`;
   const r = await graphFetch(env, `/users/${encodeURIComponent(addr)}/mailboxSettings`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ automaticRepliesSetting: { status: "alwaysEnabled", externalAudience: "all", internalReplyMessage: msg, externalReplyMessage: msg } }) });
   if (!r.ok) { console.log("autoreply failed", r.status, (await r.text()).slice(0, 300)); return; }
   await env.DB.prepare("INSERT OR REPLACE INTO app_settings (key, value, detail, by_name, at) VALUES ('merge.autoreply', '1', ?, 'Reservoir', datetime('now'))").bind(sig).run();
