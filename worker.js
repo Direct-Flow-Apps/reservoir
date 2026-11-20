@@ -337,7 +337,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
   await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
 }
 
-const WORKER_BUILD = "Reservoir-Worker-2026.11.20-w245";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.20-w246";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -4153,7 +4153,7 @@ function mailHtml(text) {
 function mailSafeHtml(h) {
   return String(h || "").slice(0, 400000).replace(/<script[\s\S]*?<\/script>/gi, "").replace(/\son[a-z]+\s*=\s*("[^"]*"|'[^']*')/gi, "").replace(/\scontenteditable="[^"]*"/gi, "");
 }
-const mailBodyHtml = (b, text) => b && typeof b.html === "string" && b.html.trim() ? `<div style="font-family:Calibri,sans-serif;font-size:11pt">${mailSafeHtml(b.html)}</div>` : mailHtml(String(text || "").slice(0, 200000));
+const mailBodyHtml = (b, text) => b && typeof b.html === "string" && b.html.trim() ? (b.html.trim().startsWith('<div style="font-family:Calibri,sans-serif;font-size:11pt">') ? mailSafeHtml(b.html) : `<div style="font-family:Calibri,sans-serif;font-size:11pt">${mailSafeHtml(b.html)}</div>`) : mailHtml(String(text || "").slice(0, 200000));
 // The signature logo is a link to the Reservoir site, which iPhone Mail and others drop from the quoted trail when a client replies. Swap the link for an inline attachment so the logo travels inside the email.
 let mailLogoCache = null;
 async function mailEmbedLogo(env, body) {
@@ -4393,7 +4393,7 @@ async function mailRoutes(request, env, user, url) {
     if (url.pathname === "/api/mail/message" && !post) {
       const msg = mailId(url.searchParams.get("msg"));
       if (!msg) return reply(env, 400, { error: "bad request" });
-      const r = await mailGraph(env, addr, `/messages/${encodeURIComponent(msg)}?$select=subject,from,toRecipients,ccRecipients,bccRecipients,receivedDateTime,sentDateTime,body,hasAttachments,isRead,categories,flag,internetMessageId&$expand=attachments($select=id,name,size,contentType,isInline)`);
+      const r = await mailGraph(env, addr, `/messages/${encodeURIComponent(msg)}?$select=subject,from,toRecipients,ccRecipients,bccRecipients,isDraft,importance,receivedDateTime,sentDateTime,body,hasAttachments,isRead,categories,flag,internetMessageId&$expand=attachments($select=id,name,size,contentType,isInline)`);
       if (!r.ok) return reply(env, 200, { ok: false, error: mailWhy(r), worker: WORKER_BUILD });
       const m = r.json || {};
       const html = !!(m.body && String(m.body.contentType || "").toLowerCase() === "html");
@@ -4412,9 +4412,10 @@ async function mailRoutes(request, env, user, url) {
           } catch (e) {}
         }
       }
+      if (html && m.isDraft && /cid:dfplogo/i.test(shown)) shown = shown.split("cid:dfplogo").join(String(env.ALLOWED_ORIGIN || "").split(",")[0].trim().replace(/\/$/, "") + "/dfp-signature-logo.png");
       const imid = String(m.internetMessageId || "").slice(0, 300);
       const ex = imid ? (await mailExtraFor(env, box.id, [imid])).get(imid) : null;
-      return reply(env, 200, { ok: true, id: m.id, imid, note: ex && ex.note ? { text: String(ex.note), by: String(ex.note_by || ""), at: String(ex.note_at || "") } : null, urgentOff: !!(ex && ex.urgent_off), subject: String(m.subject || "(no subject)"), from: mailPart(m.from), to: (m.toRecipients || []).map(mailPart), cc: (m.ccRecipients || []).map(mailPart), bcc: (m.bccRecipients || []).map(mailPart), at: m.receivedDateTime || m.sentDateTime || "", read: !!m.isRead, categories: (m.categories || []).slice(0, 6).map((c) => String(c).slice(0, 40)), flag: mailFlag(m.flag), html, body: shown, attachments: (m.attachments || []).filter((a) => !a.isInline).map((a) => ({ id: a.id, name: String(a.name || "attachment").slice(0, 160), size: Number(a.size || 0), type: String(a.contentType || "") })), worker: WORKER_BUILD });
+      return reply(env, 200, { ok: true, id: m.id, imid, note: ex && ex.note ? { text: String(ex.note), by: String(ex.note_by || ""), at: String(ex.note_at || "") } : null, urgentOff: !!(ex && ex.urgent_off), subject: String(m.subject || "(no subject)"), from: mailPart(m.from), to: (m.toRecipients || []).map(mailPart), cc: (m.ccRecipients || []).map(mailPart), bcc: (m.bccRecipients || []).map(mailPart), importance: String(m.importance || "normal"), at: m.receivedDateTime || m.sentDateTime || "", read: !!m.isRead, categories: (m.categories || []).slice(0, 6).map((c) => String(c).slice(0, 40)), flag: mailFlag(m.flag), html, body: shown, attachments: (m.attachments || []).filter((a) => !a.isInline).map((a) => ({ id: a.id, name: String(a.name || "attachment").slice(0, 160), size: Number(a.size || 0), type: String(a.contentType || "") })), worker: WORKER_BUILD });
     }
     if (url.pathname === "/api/mail/replies" && !post) {
       // Everything our side sent in the same conversation as this email: replies and forwards, with the folder each one sits in.
@@ -4730,7 +4731,14 @@ async function mailRoutes(request, env, user, url) {
       }
       if (act === "savedraft") {
         let id = mailId(body.draftId);
-        if (id) { const u = await mailDo(env, addr, `/messages/${encodeURIComponent(id)}`, "PATCH", draftBody()); return u.ok ? reply(env, 200, { ok: true, draftId: id, worker: WORKER_BUILD }) : done(u); }
+        if (id) {
+          const u = await mailDo(env, addr, `/messages/${encodeURIComponent(id)}`, "PATCH", draftBody());
+          if (u.ok) {
+            const have = await mailGraph(env, addr, `/messages/${encodeURIComponent(id)}/attachments?$select=name`);
+            const names = new Set(((have.ok && have.json && have.json.value) || []).map((x) => String(x.name || "")));
+            for (const a of mailAtts(body.attachments)) if (!names.has(a.name)) await mailDo(env, addr, `/messages/${encodeURIComponent(id)}/attachments`, "POST", a);
+          }
+          return u.ok ? reply(env, 200, { ok: true, draftId: id, worker: WORKER_BUILD }) : done(u); }
         let made;
         if (String(body.kind) === "forward" && msg) made = await mailDraftSend(env, addr, msg, "createForward", body.comment, mailRecipients(body.to), { ...body, noSend: true });
         else if ((String(body.kind) === "reply" || String(body.kind) === "replyall") && msg) made = await mailDraftSend(env, addr, msg, String(body.kind) === "reply" ? "createReply" : "createReplyAll", body.comment, mailRecipients(body.to), { ...body, noSend: true });
