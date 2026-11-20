@@ -3919,35 +3919,44 @@ async function approvalSeen(env, b, em, name) {
 async function approvalScan(env, boxes) {
   await approvalsTable(env);
   let added = 0;
+  const info = [];
   for (const b of boxes) {
-    const owner = encodeURIComponent(mailAddress(env, b));
-    const have = new Set();
-    let next = `/users/${owner}/contacts?$top=999&$select=emailAddresses`;
-    for (let n = 0; next && n < 10; n++) {
-      const r = await graphFetch(env, next); if (!r.ok) break;
-      const j = await r.json();
-      for (const c of j.value || []) for (const a of c.emailAddresses || []) have.add(String(a.address || "").toLowerCase());
-      next = j["@odata.nextLink"] || "";
-    }
-    const seen = new Map();
-    next = `/users/${owner}/mailFolders/inbox/messages?$top=100&$select=from&$orderby=receivedDateTime desc`;
-    for (let n = 0; next && n < 6; n++) {
-      const r = await graphFetch(env, next); if (!r.ok) break;
-      const j = await r.json();
-      for (const m of j.value || []) { const fa = (m.from && m.from.emailAddress) || {}; const em = String(fa.address || "").toLowerCase().trim(); if (em) { const o = seen.get(em) || { name: fa.name || "", n: 0 }; o.n++; seen.set(em, o); } }
-      next = j["@odata.nextLink"] || "";
-    }
-    for (const [em, o] of seen) {
-      if (have.has(em) || !/^[^\s@'"<>]+@[^\s@'"<>]+$/.test(em) || /@(directflow\.com\.au|aroflo\.com)$/.test(em) || /^(no-?reply|do-?not-?reply|mailer-daemon|postmaster)/.test(em)) continue;
-      const row = await env.DB.prepare("SELECT status FROM contact_approvals WHERE email = ?").bind(em).first();
-      if (row) continue;
-      let logo = 0; try { if (await logoLookup(env, em, true)) logo = 1; } catch (e) {}
-      const nm = o.name && o.name.toLowerCase() !== em ? o.name : "";
-      await env.DB.prepare("INSERT INTO contact_approvals (email, box, name, status, logo, cnt) VALUES (?, ?, ?, 'pending', ?, ?)").bind(em, b.id, String(nm).slice(0, 120), logo, o.n).run();
-      added++;
-    }
+    const row0 = { box: b.id, contacts: 0, senders: 0, added: 0, note: "" };
+    info.push(row0);
+    try {
+      const owner = encodeURIComponent(mailAddress(env, b));
+      const have = new Set();
+      let next = `/users/${owner}/contacts?$top=500&$select=emailAddresses`;
+      for (let n = 0; next && n < 10; n++) {
+        const r = await graphFetch(env, next);
+        if (!r.ok) { row0.note = "contacts " + r.status; break; }
+        const j = await r.json();
+        for (const c of j.value || []) for (const a of c.emailAddresses || []) have.add(String(a.address || "").toLowerCase());
+        next = j["@odata.nextLink"] || "";
+      }
+      row0.contacts = have.size;
+      const seen = new Map();
+      next = `/users/${owner}/mailFolders/inbox/messages?$top=100&$select=from,receivedDateTime`;
+      for (let n = 0; next && n < 6; n++) {
+        const r = await graphFetch(env, next);
+        if (!r.ok) { row0.note += " mail " + r.status; break; }
+        const j = await r.json();
+        for (const m of j.value || []) { const fa = (m.from && m.from.emailAddress) || {}; const em = String(fa.address || "").toLowerCase().trim(); if (em) { const o = seen.get(em) || { name: fa.name || "", n: 0 }; o.n++; seen.set(em, o); } }
+        next = j["@odata.nextLink"] || "";
+      }
+      row0.senders = seen.size;
+      for (const [em, o] of seen) {
+        if (have.has(em) || !/^[^\s@'"<>]+@[^\s@'"<>]+$/.test(em) || /@(directflow\.com\.au|aroflo\.com)$/.test(em) || /^(no-?reply|do-?not-?reply|mailer-daemon|postmaster)/.test(em)) continue;
+        const row = await env.DB.prepare("SELECT status FROM contact_approvals WHERE email = ?").bind(em).first();
+        if (row) continue;
+        let logo = 0; try { if (await logoLookup(env, em, true)) logo = 1; } catch (e) {}
+        const nm = o.name && o.name.toLowerCase() !== em ? o.name : "";
+        await env.DB.prepare("INSERT INTO contact_approvals (email, box, name, status, logo, cnt) VALUES (?, ?, ?, 'pending', ?, ?)").bind(em, b.id, String(nm).slice(0, 120), logo, o.n).run();
+        added++; row0.added++;
+      }
+    } catch (e) { row0.note += " error " + String(e && e.message || e).slice(0, 80); }
   }
-  return added;
+  return { added, info };
 }
 async function mailGraph(env, address, qs) {
   // qs is a path inside the mailbox, or the full next page link Graph handed back.
@@ -4758,8 +4767,8 @@ async function mailRoutes(request, env, user, url) {
         if (!isTayler) return reply(env, 200, { ok: false, error: "Only Tayler can approve contacts.", worker: WORKER_BUILD });
         await approvalsTable(env);
         if (act === "approvalscan") {
-          const added = await approvalScan(env, mine.filter((x) => !x.only));
-          return reply(env, 200, { ok: true, added, worker: WORKER_BUILD });
+          const sc = await approvalScan(env, mine.filter((x) => !x.only));
+          return reply(env, 200, { ok: true, added: sc.added, info: sc.info, worker: WORKER_BUILD });
         }
         if (act === "approvals") {
           const rs = await env.DB.prepare("SELECT email, name, box, logo, cnt FROM contact_approvals WHERE status = 'pending' ORDER BY created_at").all();
