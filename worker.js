@@ -337,7 +337,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
   await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
 }
 
-const WORKER_BUILD = "Reservoir-Worker-2026.11.20-w265";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.20-w266";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -4310,7 +4310,7 @@ async function mailRoutes(request, env, user, url) {
       };
       const undo = await env.DB.prepare("SELECT value FROM app_settings WHERE key = 'merge.undo2'").first();
       const [sent, archive] = await Promise.all([one("merge.sent_copy2", "sentitems"), one("merge.archive_copy2", "archive")]);
-      const xt = await env.DB.prepare("SELECT value, detail FROM app_settings WHERE key = 'merge.exporttest'").first();
+      const xt = await env.DB.prepare("SELECT value, detail FROM app_settings WHERE key = 'merge.exporttest2'").first();
       let xlog = []; try { xlog = xt && xt.detail ? JSON.parse(xt.detail).log : []; } catch (e) {}
       return reply(env, 200, { ok: true, undo: undo ? undo.value : "waiting", sent, archive, test: xt ? { state: xt.value, log: xlog } : null, worker: WORKER_BUILD });
     }
@@ -7804,7 +7804,7 @@ async function mergeArchiveCopy(env) {
 async function mergeExportTest(env) {
   if (!env.GRAPH_CLIENT_SECRET) return;
   await settingsTable(env);
-  const key = "merge.exporttest";
+  const key = "merge.exporttest2";
   const row = await env.DB.prepare("SELECT value FROM app_settings WHERE key = ?").bind(key).first();
   if (row) return;
   const log = [];
@@ -7817,12 +7817,11 @@ async function mergeExportTest(env) {
     const src = mailAddress(env, MAILBOXES.find((x) => x.id === "maintenance"));
     const dst = mailAddress(env, MAILBOXES.find((x) => x.id === "jobs"));
     const mbx = async (addr) => {
-      let r = await call(`${B}/${encodeURIComponent(addr)}`);
-      if (r.ok && r.j && r.j.id) return r.j.id;
-      say(`mailbox by address ${r.status} ${r.t.slice(0, 120)}`);
-      r = await call(`${B}?$filter=${encodeURIComponent("primarySmtpAddress eq '" + addr + "'")}`);
-      if (r.ok && r.j && r.j.value && r.j.value[0]) return r.j.value[0].id;
-      say(`mailbox by filter ${r.status} ${r.t.slice(0, 120)}`);
+      const r = await call(`https://graph.microsoft.com/v1.0/users/${encodeURIComponent(addr)}/settings/exchange`);
+      const j = r.j || {};
+      const id = j.primaryMailboxId || (j.value && j.value[0] && (j.value[0].primaryMailboxId || j.value[0].id)) || "";
+      if (r.ok && id) return id;
+      say(`exchange settings ${r.status} ${r.t.slice(0, 160)}`);
       return "";
     };
     const sId = await mbx(src), dId = await mbx(dst);
