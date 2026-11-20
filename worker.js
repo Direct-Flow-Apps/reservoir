@@ -337,7 +337,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
   await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
 }
 
-const WORKER_BUILD = "Reservoir-Worker-2026.11.20-w250";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.20-w251";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -4388,6 +4388,7 @@ async function mailRoutes(request, env, user, url) {
       const list = rows.map((m) => ({ id: m.id, pf: String(m.parentFolderId || ""), ...(q && where.get(m.parentFolderId) ? { folder: where.get(m.parentFolderId).slice(0, 40) } : null), from: mailShow(m.from).slice(0, 80), fromAddr: mailPart(m.from).address.toLowerCase(), to: ((m.toRecipients || []).map(mailShow).join(", ")).slice(0, 120), subject: String(m.subject || "(no subject)").slice(0, 160), at: m.receivedDateTime || "", read: !!m.isRead, attach: !!m.hasAttachments, categories: (m.categories || []).slice(0, 6).map((c) => String(c).slice(0, 40)), flag: mailFlag(m.flag), ans: mailAns(m), preview: String(m.bodyPreview || "").replace(/\s+/g, " ").slice(0, 140) }));
       const extra = await mailExtraFor(env, box.id, rows.map((m) => m.internetMessageId));
       list.forEach((it, i) => { const imid = rows[i] && rows[i].internetMessageId; if (!imid) return; it.imid = String(imid).slice(0, 300); const x = extra.get(it.imid); if (x) { if (x.note) it.note = true; if (x.urgent_off) it.uoff = true; if (x.marker) it.marker = String(x.marker).slice(0, 20); } });
+      if (box.id === "jobs") list.forEach((it, i) => { if (it.marker) return; const tos = ((rows[i] && rows[i].toRecipients) || []).map((x) => String((x.emailAddress && x.emailAddress.address) || "").toLowerCase()); if (tos.includes(mailAddress(env, MAILBOXES.find((b) => b.id === "maintenance")).toLowerCase())) it.marker = "Maintenance"; else if (tos.includes(String(env.MAILBOX_ENQUIRIES || ENQUIRIES_ADDR).toLowerCase())) it.marker = "Enquiries"; });
       return reply(env, 200, { ok: true, label: box.label, messages: list, more: !q && list.length >= top, worker: WORKER_BUILD });
     }
     if (url.pathname === "/api/mail/message" && !post) {
@@ -7664,6 +7665,20 @@ async function copyFolderJob(env, key, buildFolders) {
     else console.log("copy progress", key, st.n, st.i + "/" + st.folders.length);
   } finally { await setLock(0); }
 }
+// The automatic reply on the maintenance mailbox. Set once (and again whenever the wording version below changes).
+async function mergeAutoReply(env) {
+  if (!env.GRAPH_CLIENT_SECRET) return;
+  await settingsTable(env);
+  const sig = "autoreply-v1";
+  const row = await env.DB.prepare("SELECT detail FROM app_settings WHERE key = 'merge.autoreply'").first();
+  if (row && row.detail === sig) return;
+  const addr = mailAddress(env, MAILBOXES.find((x) => x.id === "maintenance"));
+  const jobs = mailAddress(env, MAILBOXES.find((x) => x.id === "jobs"));
+  const msg = `<div style="font-family:Calibri,sans-serif;font-size:11pt"><p>Hello,</p><p>We have received your email and it has been forwarded to our new mailbox, <a href="mailto:${jobs}">${jobs}</a>.</p><p>Please update your contact information for Direct Flow Plumbing so that all future emails come into DFP Jobs.</p><p>Kind regards,<br>Direct Flow Plumbing</p></div>`;
+  const r = await graphFetch(env, `/users/${encodeURIComponent(addr)}/mailboxSettings`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ automaticRepliesSetting: { status: "alwaysEnabled", externalAudience: "all", internalReplyMessage: msg, externalReplyMessage: msg } }) });
+  if (!r.ok) { console.log("autoreply failed", r.status, (await r.text()).slice(0, 300)); return; }
+  await env.DB.prepare("INSERT OR REPLACE INTO app_settings (key, value, detail, by_name, at) VALUES ('merge.autoreply', '1', ?, 'Reservoir', datetime('now'))").bind(sig).run();
+}
 async function mergeSentCopy(env) {
   await copyFolderJob(env, "merge.sent_copy", async () => [{ src: "sentitems", dst: "sentitems" }]);
 }
@@ -7691,7 +7706,7 @@ export default {
   // Runs on a Cloudflare cron trigger if one is added (for example Thursday early morning). It only refreshes leave balances and leave history from Xero into D1.
   async scheduled(event, env, ctx) {
     // A five minute trigger, if one is added, only looks for new mail so pings arrive quickly.
-    if (event && event.cron === "*/5 * * * *") { ctx.waitUntil(mergeSentCopy(env).catch((e) => console.log("sent copy failed", String(e && e.message || e)))); ctx.waitUntil(mergeArchiveCopy(env).catch((e) => console.log("archive copy failed", String(e && e.message || e)))); ctx.waitUntil(mailWatch(env).catch((e) => console.log("mail watch failed", String(e && e.message || e)))); ctx.waitUntil(mailHoldSweep(env).catch((e) => console.log("hold sweep failed", String(e && e.message || e)))); ctx.waitUntil(vbaSubscribe(env).then(() => vbaWatch(env)).catch((e) => console.log("vba watch failed", String(e && e.message || e)))); return; }
+    if (event && event.cron === "*/5 * * * *") { ctx.waitUntil(mergeSentCopy(env).catch((e) => console.log("sent copy failed", String(e && e.message || e)))); ctx.waitUntil(mergeAutoReply(env).catch((e) => console.log("autoreply failed", String(e && e.message || e)))); ctx.waitUntil(mergeArchiveCopy(env).catch((e) => console.log("archive copy failed", String(e && e.message || e)))); ctx.waitUntil(mailWatch(env).catch((e) => console.log("mail watch failed", String(e && e.message || e)))); ctx.waitUntil(mailHoldSweep(env).catch((e) => console.log("hold sweep failed", String(e && e.message || e)))); ctx.waitUntil(vbaSubscribe(env).then(() => vbaWatch(env)).catch((e) => console.log("vba watch failed", String(e && e.message || e)))); return; }
     // Every run checks the automatic timesheets and the payroll sweeps. The leave sync keeps its own schedule and is skipped on the half hourly one.
     ctx.waitUntil(tsAutoRun(env).catch((e) => console.log("auto timesheets failed", String(e && e.message || e))));
     ctx.waitUntil(pushFlushHeld(env));
