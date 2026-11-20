@@ -337,7 +337,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
   await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
 }
 
-const WORKER_BUILD = "Reservoir-Worker-2026.11.20-w261";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.20-w262";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -4243,6 +4243,7 @@ async function mailHoldSweep(env) {
 const MAIL_ALIAS = { "inbox": "inbox", "sent items": "sentitems", "drafts": "drafts", "deleted items": "deleteditems", "junk email": "junkemail", "archive": "archive", "outbox": "outbox" };
 // A mail search asks Graph for 250 results a page and keeps following its next page link, up to this many pages.
 const MAIL_SEARCH_PAGE = 250;
+const MAIL_SEARCH_FIRST = 25;
 const MAIL_SEARCH_PAGES = 20;
 const MAIL_HIDE = /^(conversation history|sync issues|conflicts|local failures|server failures|outbox|rss feeds|rss subscriptions|clutter|scheduled|yammer|quick step settings|social activity notifications|personmetadata|externalcontacts)/i;
 const mailPart = (x) => ({ name: String((x && x.emailAddress && x.emailAddress.name) || "").slice(0, 80), address: String((x && x.emailAddress && x.emailAddress.address) || "").slice(0, 120) });
@@ -4348,7 +4349,32 @@ async function mailRoutes(request, env, user, url) {
       const filter = url.searchParams.get("filter") || "";
       const q = String(url.searchParams.get("q") || "").replace(/["\\]/g, " ").trim().slice(0, 100);
       const fields = "$select=subject,from,toRecipients,receivedDateTime,isRead,bodyPreview,hasAttachments,categories,flag,parentFolderId,internetMessageId&$expand=singleValueExtendedProperties($filter=id eq 'Integer 0x1081')";
+      const where = new Map();
+      const loadWhere = async () => {
+        if (!q) return;
+        // The folder names are kept for ten minutes per mailbox, so only the first search pays for walking the tree.
+        globalThis.__folderNames = globalThis.__folderNames || new Map();
+        const hit = globalThis.__folderNames.get(addr);
+        if (hit && Date.now() - hit.t < 600000) hit.v.forEach((v, k) => where.set(k, v));
+        else {
+          try {
+            const tf = await mailGraph(env, addr, "/mailFolders?$top=100&$select=displayName,childFolderCount");
+            const tops = (tf.ok && tf.json && tf.json.value) || [];
+            tops.forEach((f) => where.set(f.id, String(f.displayName || "")));
+            let level = tops.filter((f) => Number(f.childFolderCount || 0) > 0);
+            for (let depth = 0; depth < 8 && level.length; depth++) {
+              const kids = await Promise.all(level.map((f) => mailGraph(env, addr, `/mailFolders/${encodeURIComponent(f.id)}/childFolders?$top=100&$select=displayName,childFolderCount`)));
+              const next = [];
+              kids.forEach((k) => ((k && k.ok && k.json && k.json.value) || []).forEach((f) => { where.set(f.id, String(f.displayName || "")); if (Number(f.childFolderCount || 0) > 0) next.push(f); }));
+              level = next;
+            }
+            if (where.size) globalThis.__folderNames.set(addr, { t: Date.now(), v: new Map(where) });
+          } catch (e) {}
+        }
+      };
+      const whereP = q ? loadWhere() : null;
       let rows = [];
+      let searchNext = "";
       if (!q && /^outbox$/i.test(String(folder))) {
         for (const h of (await mailHoldIds(env, addr)).slice(0, 60)) {
           const r = await mailGraph(env, addr, `/messages/${encodeURIComponent(h.draft_id)}?${fields}`);
@@ -4356,16 +4382,14 @@ async function mailRoutes(request, env, user, url) {
           else if (r.status === 404) await env.DB.prepare("DELETE FROM mail_hold WHERE draft_id = ?").bind(h.draft_id).run();
         }
       } else if (q) {
-        // A search covers every folder in the mailbox and reads every page of results Graph offers, so older matches are never left out. Graph itself stops a message search at 1,000 results.
-        const seen = new Set();
-        let next = `/messages?$top=${MAIL_SEARCH_PAGE}&${fields}&$search=${encodeURIComponent('"' + q + '"')}`;
-        for (let page = 0; next && page < MAIL_SEARCH_PAGES; page++) {
-          const r = await mailGraph(env, addr, next);
-          if (!r.ok) return reply(env, 200, { ok: false, error: mailWhy(r), worker: WORKER_BUILD });
-          ((r.json && r.json.value) || []).forEach((m) => { if (m && m.id && !seen.has(m.id)) { seen.add(m.id); rows.push(m); } });
-          const link = r.json && r.json["@odata.nextLink"];
-          next = typeof link === "string" && link.startsWith(GRAPH + "/") ? link : "";
-        }
+        // A search is read a page at a time so the first results show straight away. The first page is small and quick, and each answer carries a cursor for the next page, which the app keeps asking for until Graph has no more (Graph itself stops a message search at 1,000 results).
+        const cur = String(url.searchParams.get("cursor") || "");
+        const start = cur && cur.startsWith(GRAPH + "/") && cur.length < 4000 ? cur : `/messages?$top=${MAIL_SEARCH_FIRST}&${fields}&$search=${encodeURIComponent('"' + q + '"')}`;
+        const r = await mailGraph(env, addr, start);
+        if (!r.ok) return reply(env, 200, { ok: false, error: mailWhy(r), worker: WORKER_BUILD });
+        rows = ((r.json && r.json.value) || []).filter((m) => m && m.id);
+        const link = r.json && r.json["@odata.nextLink"];
+        searchNext = typeof link === "string" && link.startsWith(GRAPH + "/") ? link : "";
         rows.sort((x, y) => String(y.receivedDateTime || "").localeCompare(String(x.receivedDateTime || "")));
       } else {
         if (/^archive$/i.test(String(folder))) await archiveReadSweep(env, addr);
@@ -4378,26 +4402,12 @@ async function mailRoutes(request, env, user, url) {
       }
       if (!q && /^drafts$/i.test(String(folder))) { const hid = new Set((await mailHoldIds(env, addr)).map((h) => h.draft_id)); if (hid.size) rows = rows.filter((m) => !hid.has(m.id)); }
       // A search covers every folder, so each result says which folder it is in.
-      const where = new Map();
-      if (q) {
-        try {
-          const tf = await mailGraph(env, addr, "/mailFolders?$top=100&$select=displayName,childFolderCount");
-          const tops = (tf.ok && tf.json && tf.json.value) || [];
-          tops.forEach((f) => where.set(f.id, String(f.displayName || "")));
-          let level = tops.filter((f) => Number(f.childFolderCount || 0) > 0);
-          for (let depth = 0; depth < 8 && level.length; depth++) {
-            const kids = await Promise.all(level.map((f) => mailGraph(env, addr, `/mailFolders/${encodeURIComponent(f.id)}/childFolders?$top=100&$select=displayName,childFolderCount`)));
-            const next = [];
-            kids.forEach((k) => ((k && k.ok && k.json && k.json.value) || []).forEach((f) => { where.set(f.id, String(f.displayName || "")); if (Number(f.childFolderCount || 0) > 0) next.push(f); }));
-            level = next;
-          }
-        } catch (e) {}
-      }
+      await whereP;
       const list = rows.map((m) => ({ id: m.id, pf: String(m.parentFolderId || ""), ...(q && where.get(m.parentFolderId) ? { folder: where.get(m.parentFolderId).slice(0, 40) } : null), from: mailShow(m.from).slice(0, 80), fromAddr: mailPart(m.from).address.toLowerCase(), to: ((m.toRecipients || []).map(mailShow).join(", ")).slice(0, 120), subject: String(m.subject || "(no subject)").slice(0, 160), at: m.receivedDateTime || "", read: !!m.isRead, attach: !!m.hasAttachments, categories: (m.categories || []).slice(0, 6).map((c) => String(c).slice(0, 40)), flag: mailFlag(m.flag), ans: mailAns(m), preview: String(m.bodyPreview || "").replace(/\s+/g, " ").slice(0, 140) }));
       const extra = await mailExtraFor(env, box.id, rows.map((m) => m.internetMessageId));
       list.forEach((it, i) => { const imid = rows[i] && rows[i].internetMessageId; if (!imid) return; it.imid = String(imid).slice(0, 300); const x = extra.get(it.imid); if (x) { if (x.note) it.note = true; if (x.urgent_off) it.uoff = true; if (x.marker) it.marker = String(x.marker).slice(0, 20); } });
       if (box.id === "jobs") list.forEach((it, i) => { if (it.marker) return; const tos = ((rows[i] && rows[i].toRecipients) || []).map((x) => String((x.emailAddress && x.emailAddress.address) || "").toLowerCase()); if (tos.includes(mailAddress(env, MAILBOXES.find((b) => b.id === "maintenance")).toLowerCase())) it.marker = "Maintenance"; else if (tos.includes(String(env.MAILBOX_ENQUIRIES || ENQUIRIES_ADDR).toLowerCase())) it.marker = "Enquiries"; });
-      return reply(env, 200, { ok: true, label: box.label, messages: list, more: !q && list.length >= top, worker: WORKER_BUILD });
+      return reply(env, 200, { ok: true, label: box.label, messages: list, more: !q && list.length >= top, ...(q && searchNext ? { next: searchNext } : {}), worker: WORKER_BUILD });
     }
     if (url.pathname === "/api/mail/message" && !post) {
       const msg = mailId(url.searchParams.get("msg"));
@@ -4480,7 +4490,7 @@ async function mailRoutes(request, env, user, url) {
       const seen = new Set(), out = [];
       for (const c of found.flat()) { const k = (c.emails[0] || c.name).toLowerCase(); if (seen.has(k) || !c.emails.length) continue; seen.add(k); out.push(c); }
       // Addresses already used in sent mail are remembered too, even when nobody saved them as a contact.
-      if (out.length < 8) {
+      if (out.length < 8 && url.searchParams.get("fast") !== "1") {
         const ql = q.toLowerCase();
         const sent = await sentP;
         for (const m of sent.flat()) for (const x of [...(m.toRecipients || []), ...(m.ccRecipients || []), ...(m.bccRecipients || [])]) {
