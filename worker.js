@@ -337,7 +337,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
   await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
 }
 
-const WORKER_BUILD = "Reservoir-Worker-2026.11.20-w248";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.20-w249";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -7527,6 +7527,34 @@ async function mergeRulesSync(env) {
   }
   if (ok) await env.DB.prepare("INSERT OR REPLACE INTO app_settings (key, value, detail, by_name, at) VALUES ('merge.rules_sync', '1', ?, 'Reservoir', datetime('now'))").bind(sig).run();
 }
+// Every morning at 7am the Deleted Items folder of each shared mailbox is emptied for good. Nobody deletes on purpose, so what lands there (discarded drafts, redirected copies, legacy deletes) is cleared out.
+async function deletedSweep(env) {
+  if (!env.GRAPH_CLIENT_SECRET) return;
+  const now = tsMelbourne(new Date());
+  if (now.mins < 7 * 60 || now.mins >= 9 * 60) return;
+  await settingsTable(env);
+  const key = "merge.deleted_sweep";
+  const done = await env.DB.prepare("SELECT value FROM app_settings WHERE key = ?").bind(key).first();
+  if (done && done.value === now.date) return;
+  const boxes = MAILBOXES.filter((x) => ["jobs", "maintenance", "accounts"].includes(x.id)).map((x) => mailAddress(env, x));
+  if (typeof ENQUIRIES_ADDR === "string" && ENQUIRIES_ADDR) boxes.push(ENQUIRIES_ADDR);
+  let left = 0, gone = 0;
+  for (const addr of boxes) {
+    for (let round = 0; round < 8; round++) {
+      const r = await mailGraph(env, addr, "/mailFolders/deleteditems/messages?$top=50&$select=id");
+      if (!r.ok) { console.log("deleted sweep list failed", addr, r.status); left++; break; }
+      const msgs = (r.json && r.json.value) || [];
+      if (!msgs.length) break;
+      for (const m of msgs) {
+        const d = await mailDo(env, addr, `/messages/${encodeURIComponent(m.id)}/permanentDelete`, "POST");
+        if (d.ok) gone++; else left++;
+      }
+      if (round === 7) left++;
+    }
+  }
+  if (!left) await env.DB.prepare("INSERT OR REPLACE INTO app_settings (key, value, detail, by_name, at) VALUES (?, ?, ?, 'Reservoir', datetime('now'))").bind(key, now.date, JSON.stringify({ gone })).run();
+  console.log("deleted sweep", gone, left);
+}
 async function mergeJunkSweep(env) {
   if (!env.GRAPH_CLIENT_SECRET) return;
   const now = tsMelbourne(new Date());
@@ -7622,6 +7650,7 @@ export default {
     ctx.waitUntil(morningCountPush(env).catch((e) => console.log("morning count failed", String(e && e.message || e))));
     ctx.waitUntil(mergeRulesSync(env).catch((e) => console.log("merge rules failed", String(e && e.message || e))));
     ctx.waitUntil(mergeSentCopy(env).catch((e) => console.log("sent copy failed", String(e && e.message || e))));
+    ctx.waitUntil(deletedSweep(env).catch((e) => console.log("deleted sweep failed", String(e && e.message || e))));
     ctx.waitUntil(mergeJunkSweep(env).catch((e) => console.log("junk sweep failed", String(e && e.message || e))));
     ctx.waitUntil(pushOneOffAndrey(env).catch((e) => console.log("one off failed", String(e && e.message || e))));
     ctx.waitUntil(mailSubscribe(env).catch((e) => console.log("mail subscribe failed", String(e && e.message || e))));
