@@ -337,7 +337,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
   await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
 }
 
-const WORKER_BUILD = "Reservoir-Worker-2026.11.20-w243";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.20-w244";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -7559,6 +7559,11 @@ async function mergeJunkSweep(env) {
 // One time copy of the maintenance Sent Items into the DFP Jobs Sent Items folder. It copies the original message, so the sender stays maintenance and the originals are left where they are. A few at a time on every run, oldest first, with the place it got to kept in D1 until the whole folder is done.
 async function mergeSentCopy(env) {
   if (!env.GRAPH_CLIENT_SECRET) return;
+  const parts = new Intl.DateTimeFormat("en-AU", { timeZone: "Australia/Melbourne", weekday: "short", hour: "numeric", hour12: false }).formatToParts(new Date());
+  const wd = (parts.find((x) => x.type === "weekday") || {}).value;
+  const hr = Number((parts.find((x) => x.type === "hour") || {}).value) % 24;
+  const afterHours = wd === "Sat" || wd === "Sun" || hr >= 18 || hr < 6;
+  if (!afterHours) return;
   await settingsTable(env);
   const key = "merge.sent_copy";
   const row = await env.DB.prepare("SELECT value, detail FROM app_settings WHERE key = ?").bind(key).first();
