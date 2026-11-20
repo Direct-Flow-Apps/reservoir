@@ -337,7 +337,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
   await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
 }
 
-const WORKER_BUILD = "Reservoir-Worker-2026.11.20-w251";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.20-w258";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -4785,7 +4785,7 @@ async function mailWatch(env) {
     const now = new Date().toISOString();
     const save = (v) => env.DB.prepare("INSERT INTO app_settings (key, value, detail, by_name, at) VALUES (?, ?, 'mail watch', 'Reservoir', datetime('now')) ON CONFLICT(key) DO UPDATE SET value = excluded.value, at = datetime('now')").bind(key, v).run();
     if (!row) { await save(now); continue; }
-    const r = await mailGraph(env, mailAddress(env, b), `/mailFolders/inbox/messages?$top=20&$select=id,receivedDateTime&$orderby=receivedDateTime desc&$filter=${encodeURIComponent("receivedDateTime gt " + row.value)}`);
+    const r = await mailGraph(env, mailAddress(env, b), `/mailFolders/inbox/messages?$top=20&$select=id,receivedDateTime,subject,from&$orderby=receivedDateTime desc&$filter=${encodeURIComponent("receivedDateTime gt " + row.value)}`);
     if (!r.ok) { console.log("mail watch", b.id, r.status); continue; }
     const fresh = ((r.json && r.json.value) || []);
     if (!fresh.length) continue;
@@ -4801,7 +4801,8 @@ async function mailWatch(env) {
     await env.DB.prepare("INSERT INTO app_settings (key, value, detail, by_name, at) VALUES (?, ?, 'mail ids', 'Reservoir', datetime('now')) ON CONFLICT(key) DO UPDATE SET value = excluded.value, at = datetime('now')").bind(idKey, JSON.stringify(doneIds.concat(fresh.map((m) => m.id)).slice(-60))).run();
     if (!brandNew.length) continue;
     const to = Object.keys(tiers).filter((e) => mailAllowed(b, { email: e, tier: tiers[e] }));
-    for (const e of to) await notify(env, { to: e, kind: "mail", title: `New Email - ${b.label}`, body: "New email", link: "emailbox", box: b.id, by: "Reservoir" });
+    const prev = brandNew.length === 1 ? `${who(brandNew[0])}: ${String(brandNew[0].subject || "(no subject)").slice(0, 100)}` : `${brandNew.length} new emails, latest from ${who(brandNew[0])}`;
+    for (const e of to) await notify(env, { to: e, kind: "mail", title: `New Email - ${b.label}`, body: prev, preview: true, link: "emailbox", box: b.id, by: "Reservoir" });
   }
 }
 // Once a day: drafts with no subject, recipients or words are deleted after 7 days, and any draft older than 14 days is deleted after a day's warning to whoever started it (matched from the name in its signature, or everyone with that mailbox if there is no match).
@@ -5985,7 +5986,7 @@ async function pushForNotice(env, n, id) {
     const muted = (r) => !!n.box && String(r.mail_off || "").split(",").includes(String(n.box));
     const sendTo = String(n.kind || "") === "mail" ? (hasWeir ? rows.filter((r) => r.app === "mail" && r.mail_on !== 0 && !muted(r)) : rows.filter((r) => r.mail_on !== 0 && !muted(r))) : rows;
     if (!sendTo.length) return;
-    const payload = { title: String(n.title || "Reservoir").slice(0, 120), body: n.kind === "request" ? String(n.body || "Open Reservoir to read it").slice(0, 160) : n.kind === "mail" ? "" : "Open Reservoir to read it", tag: `n-${id || Date.now()}`, open: /^[a-z]+$/.test(String(n.link || "")) ? String(n.link) : "notices" };
+    const payload = { title: String(n.title || "Reservoir").slice(0, 120), body: n.kind === "request" ? String(n.body || "Open Reservoir to read it").slice(0, 160) : n.kind === "mail" ? (n.preview ? String(n.body || "").slice(0, 160) : "") : "Open Reservoir to read it", tag: `n-${id || Date.now()}`, open: /^[a-z]+$/.test(String(n.link || "")) ? String(n.link) : "notices" };
     await Promise.allSettled(sendTo.map(async (r) => {
       const pl = String(n.kind || "") === "mail" ? { ...payload, ...(r.app === "mail" ? { url: "/mail" } : {}), ...(r.mail_sound === 0 ? { silent: true } : {}) } : payload;
       if (pushInHours(pushModeOf(r))) return pushSendOne(env, r, pl);
