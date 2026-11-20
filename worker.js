@@ -337,7 +337,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
   await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
 }
 
-const WORKER_BUILD = "Reservoir-Worker-2026.11.20-w242";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.20-w243";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -7556,11 +7556,50 @@ async function mergeJunkSweep(env) {
   if (left === 0) await env.DB.prepare("INSERT OR REPLACE INTO app_settings (key, value, detail, by_name, at) VALUES (?, ?, ?, 'Reservoir', datetime('now'))").bind(key, now.date, String(moved) + " swept").run();
   console.log("junk sweep", moved, "moved", left ? "more to do" : "done");
 }
+// One time copy of the maintenance Sent Items into the DFP Jobs Sent Items folder. It copies the original message, so the sender stays maintenance and the originals are left where they are. A few at a time on every run, oldest first, with the place it got to kept in D1 until the whole folder is done.
+async function mergeSentCopy(env) {
+  if (!env.GRAPH_CLIENT_SECRET) return;
+  await settingsTable(env);
+  const key = "merge.sent_copy";
+  const row = await env.DB.prepare("SELECT value, detail FROM app_settings WHERE key = ?").bind(key).first();
+  if (row && row.value === "done") return;
+  let st = { at: "", ids: [], n: 0 };
+  try { if (row && row.detail) st = { ...st, ...JSON.parse(row.detail) }; } catch (e) {}
+  const src = mailAddress(env, MAILBOXES.find((x) => x.id === "maintenance"));
+  const dest = mailAddress(env, MAILBOXES.find((x) => x.id === "jobs"));
+  const q = `/mailFolders/sentitems/messages?$top=12&$select=id,receivedDateTime&$orderby=receivedDateTime asc` + (st.at ? `&$filter=receivedDateTime ge ${st.at}` : "");
+  const r = await mailGraph(env, src, q);
+  if (!r.ok) { console.log("sent copy list failed", r.status); return; }
+  const all = (r.json && r.json.value) || [];
+  const msgs = all.filter((m) => !st.ids.includes(m.id));
+  if (!msgs.length) {
+    const finished = all.length < 12;
+    await env.DB.prepare("INSERT OR REPLACE INTO app_settings (key, value, detail, by_name, at) VALUES (?, ?, ?, 'Reservoir', datetime('now'))").bind(key, finished ? "done" : "running", JSON.stringify(finished ? { n: st.n } : { ...st, at: all.length ? all[all.length - 1].receivedDateTime : st.at })).run();
+    console.log("sent copy", finished ? "finished" : "advanced", st.n);
+    return;
+  }
+  for (const m of msgs) {
+    const raw = await graphFetch(env, `/users/${encodeURIComponent(src)}/messages/${encodeURIComponent(m.id)}/$value`);
+    if (!raw.ok) { console.log("sent copy read failed", raw.status); return; }
+    const bytes = new Uint8Array(await raw.arrayBuffer());
+    let bin = "";
+    for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+    const put = await graphFetch(env, `/users/${encodeURIComponent(dest)}/mailFolders/sentitems/messages`, { method: "POST", headers: { "Content-Type": "text/plain" }, body: btoa(bin) });
+    if (!put.ok) { console.log("sent copy put failed", put.status, (await put.text()).slice(0, 200)); return; }
+    let made = null; try { made = await put.json(); } catch (e) { made = null; }
+    if (made && made.id) await mailDo(env, dest, `/messages/${encodeURIComponent(made.id)}`, "PATCH", { isRead: true });
+    const day = m.receivedDateTime;
+    st.ids = day === st.at ? [...st.ids, m.id] : [m.id];
+    st.at = day;
+    st.n++;
+    await env.DB.prepare("INSERT OR REPLACE INTO app_settings (key, value, detail, by_name, at) VALUES (?, 'running', ?, 'Reservoir', datetime('now'))").bind(key, JSON.stringify(st)).run();
+  }
+}
 export default {
   // Runs on a Cloudflare cron trigger if one is added (for example Thursday early morning). It only refreshes leave balances and leave history from Xero into D1.
   async scheduled(event, env, ctx) {
     // A five minute trigger, if one is added, only looks for new mail so pings arrive quickly.
-    if (event && event.cron === "*/5 * * * *") { ctx.waitUntil(mailWatch(env).catch((e) => console.log("mail watch failed", String(e && e.message || e)))); ctx.waitUntil(mailHoldSweep(env).catch((e) => console.log("hold sweep failed", String(e && e.message || e)))); ctx.waitUntil(vbaSubscribe(env).then(() => vbaWatch(env)).catch((e) => console.log("vba watch failed", String(e && e.message || e)))); return; }
+    if (event && event.cron === "*/5 * * * *") { ctx.waitUntil(mergeSentCopy(env).catch((e) => console.log("sent copy failed", String(e && e.message || e)))); ctx.waitUntil(mailWatch(env).catch((e) => console.log("mail watch failed", String(e && e.message || e)))); ctx.waitUntil(mailHoldSweep(env).catch((e) => console.log("hold sweep failed", String(e && e.message || e)))); ctx.waitUntil(vbaSubscribe(env).then(() => vbaWatch(env)).catch((e) => console.log("vba watch failed", String(e && e.message || e)))); return; }
     // Every run checks the automatic timesheets and the payroll sweeps. The leave sync keeps its own schedule and is skipped on the half hourly one.
     ctx.waitUntil(tsAutoRun(env).catch((e) => console.log("auto timesheets failed", String(e && e.message || e))));
     ctx.waitUntil(pushFlushHeld(env));
@@ -7569,6 +7608,7 @@ export default {
     ctx.waitUntil(tsXeroPullSchedule(env).catch((e) => console.log("timesheet pull failed", String(e && e.message || e))));
     ctx.waitUntil(morningCountPush(env).catch((e) => console.log("morning count failed", String(e && e.message || e))));
     ctx.waitUntil(mergeRulesSync(env).catch((e) => console.log("merge rules failed", String(e && e.message || e))));
+    ctx.waitUntil(mergeSentCopy(env).catch((e) => console.log("sent copy failed", String(e && e.message || e))));
     ctx.waitUntil(mergeJunkSweep(env).catch((e) => console.log("junk sweep failed", String(e && e.message || e))));
     ctx.waitUntil(pushOneOffAndrey(env).catch((e) => console.log("one off failed", String(e && e.message || e))));
     ctx.waitUntil(mailSubscribe(env).catch((e) => console.log("mail subscribe failed", String(e && e.message || e))));
