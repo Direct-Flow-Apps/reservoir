@@ -3892,10 +3892,12 @@ async function logoLookup(env, email, probe) {
 // Contact approvals: a new sender with no contact waits here for Tayler to approve, change or skip. A skipped sender comes back after another 10 emails.
 async function approvalsTable(env) {
   await env.DB.prepare("CREATE TABLE IF NOT EXISTS contact_approvals (email TEXT PRIMARY KEY, box TEXT, name TEXT, status TEXT, logo INTEGER DEFAULT 0, cnt INTEGER DEFAULT 0, next_at INTEGER DEFAULT 0, created_at TEXT DEFAULT (datetime('now')))").run();
+  try { await env.DB.prepare("ALTER TABLE contact_approvals ADD COLUMN msg TEXT").run(); } catch (e) {}
+  await env.DB.prepare("DELETE FROM contact_approvals WHERE email LIKE '%aroflo%'").run();
 }
-async function approvalSeen(env, b, em, name) {
+async function approvalSeen(env, b, em, name, msgId) {
   em = String(em || "").toLowerCase().trim();
-  if (!/^[^\s@'"<>]+@[^\s@'"<>]+$/.test(em) || /@(directflow\.com\.au|aroflo\.com)$/.test(em) || /^(no-?reply|do-?not-?reply|mailer-daemon|postmaster)/.test(em)) return;
+  if (!/^[^\s@'"<>]+@[^\s@'"<>]+$/.test(em) || /(@directflow\.com\.au$|aroflo)/.test(em) || /^(no-?reply|do-?not-?reply|mailer-daemon|postmaster)/.test(em)) return;
   await approvalsTable(env);
   const row = await env.DB.prepare("SELECT * FROM contact_approvals WHERE email = ?").bind(em).first();
   const tell = (logo) => notify(env, { to: "tayler@directflow.com.au", kind: "info", title: "Contact approval", body: `${name || em} (${em}): ${logo ? "logo found" : "no logo found"}. Approve, change or skip it in Weir settings.`, link: "emailbox", by: "Reservoir" });
@@ -3905,7 +3907,7 @@ async function approvalSeen(env, b, em, name) {
     const has = f.ok && ((await f.json()).value || []).length > 0;
     if (has) { await env.DB.prepare("INSERT INTO contact_approvals (email, box, name, status, cnt) VALUES (?, ?, ?, 'known', 1)").bind(em, b.id, String(name || "").slice(0, 120)).run(); return; }
     let logo = 0; try { const lg = await logoLookup(env, em); if (lg) logo = 1; } catch (e) {}
-    await env.DB.prepare("INSERT INTO contact_approvals (email, box, name, status, logo, cnt) VALUES (?, ?, ?, 'pending', ?, 1)").bind(em, b.id, String(name || "").slice(0, 120), logo).run();
+    await env.DB.prepare("INSERT INTO contact_approvals (email, box, name, status, logo, cnt, msg) VALUES (?, ?, ?, 'pending', ?, 1, ?)").bind(em, b.id, String(name || "").slice(0, 120), logo, String(msgId || "")).run();
     await tell(logo);
     return;
   }
@@ -3936,22 +3938,22 @@ async function approvalScan(env, boxes) {
       }
       row0.contacts = have.size;
       const seen = new Map();
-      next = `/users/${owner}/mailFolders/inbox/messages?$top=100&$select=from,receivedDateTime`;
+      next = `/users/${owner}/mailFolders/inbox/messages?$top=100&$select=id,from,receivedDateTime`;
       for (let n = 0; next && n < 6; n++) {
         const r = await graphFetch(env, next);
         if (!r.ok) { row0.note += " mail " + r.status; break; }
         const j = await r.json();
-        for (const m of j.value || []) { const fa = (m.from && m.from.emailAddress) || {}; const em = String(fa.address || "").toLowerCase().trim(); if (em) { const o = seen.get(em) || { name: fa.name || "", n: 0 }; o.n++; seen.set(em, o); } }
+        for (const m of j.value || []) { const fa = (m.from && m.from.emailAddress) || {}; const em = String(fa.address || "").toLowerCase().trim(); if (em) { const o = seen.get(em) || { name: fa.name || "", n: 0, id: m.id }; o.n++; seen.set(em, o); } }
         next = j["@odata.nextLink"] || "";
       }
       row0.senders = seen.size;
       for (const [em, o] of seen) {
-        if (have.has(em) || !/^[^\s@'"<>]+@[^\s@'"<>]+$/.test(em) || /@(directflow\.com\.au|aroflo\.com)$/.test(em) || /^(no-?reply|do-?not-?reply|mailer-daemon|postmaster)/.test(em)) continue;
+        if (have.has(em) || !/^[^\s@'"<>]+@[^\s@'"<>]+$/.test(em) || /(@directflow\.com\.au$|aroflo)/.test(em) || /^(no-?reply|do-?not-?reply|mailer-daemon|postmaster)/.test(em)) continue;
         const row = await env.DB.prepare("SELECT status FROM contact_approvals WHERE email = ?").bind(em).first();
-        if (row) continue;
+        if (row) { await env.DB.prepare("UPDATE contact_approvals SET msg = ? WHERE email = ? AND status = 'pending' AND (msg IS NULL OR msg = '')").bind(String(o.id || ""), em).run(); continue; }
         let logo = 0; try { if (await logoLookup(env, em, true)) logo = 1; } catch (e) {}
         const nm = o.name && o.name.toLowerCase() !== em ? o.name : "";
-        await env.DB.prepare("INSERT INTO contact_approvals (email, box, name, status, logo, cnt) VALUES (?, ?, ?, 'pending', ?, ?)").bind(em, b.id, String(nm).slice(0, 120), logo, o.n).run();
+        await env.DB.prepare("INSERT INTO contact_approvals (email, box, name, status, logo, cnt, msg) VALUES (?, ?, ?, 'pending', ?, ?, ?)").bind(em, b.id, String(nm).slice(0, 120), logo, o.n, String(o.id || "")).run();
         added++; row0.added++;
       }
     } catch (e) { row0.note += " error " + String(e && e.message || e).slice(0, 80); }
@@ -4771,8 +4773,8 @@ async function mailRoutes(request, env, user, url) {
           return reply(env, 200, { ok: true, added: sc.added, info: sc.info, worker: WORKER_BUILD });
         }
         if (act === "approvals") {
-          const rs = await env.DB.prepare("SELECT email, name, box, logo, cnt FROM contact_approvals WHERE status = 'pending' ORDER BY created_at").all();
-          return reply(env, 200, { ok: true, items: (rs.results || []).map((r) => ({ email: r.email, name: r.name || "", box: r.box, logo: !!r.logo, count: r.cnt || 0 })), worker: WORKER_BUILD });
+          const rs = await env.DB.prepare("SELECT email, name, box, logo, cnt, msg FROM contact_approvals WHERE status = 'pending' ORDER BY created_at").all();
+          return reply(env, 200, { ok: true, items: (rs.results || []).map((r) => ({ email: r.email, name: r.name || "", box: r.box, logo: !!r.logo, count: r.cnt || 0, msg: r.msg || "" })), worker: WORKER_BUILD });
         }
         const em = String(body.email || "").toLowerCase().trim();
         const row = await env.DB.prepare("SELECT * FROM contact_approvals WHERE email = ?").bind(em).first();
@@ -4981,7 +4983,7 @@ async function mailWatch(env) {
     if (!brandNew.length) continue;
     const to = Object.keys(tiers).filter((e) => mailAllowed(b, { email: e, tier: tiers[e] }));
     const prev = brandNew.length === 1 ? `${who(brandNew[0])}: ${String(brandNew[0].subject || "(no subject)").slice(0, 100)}` : `${brandNew.length} new emails, latest from ${who(brandNew[0])}`;
-    for (const m of brandNew) { try { const fa = (m.from && m.from.emailAddress) || {}; await approvalSeen(env, b, fa.address, fa.name); } catch (e) { console.log("approval seen", String(e && e.message || e).slice(0, 120)); } }
+    for (const m of brandNew) { try { const fa = (m.from && m.from.emailAddress) || {}; await approvalSeen(env, b, fa.address, fa.name, m.id); } catch (e) { console.log("approval seen", String(e && e.message || e).slice(0, 120)); } }
     for (const e of to) await notify(env, { to: e, kind: "mail", title: `New Email - ${b.label}`, body: prev, preview: true, link: "emailbox", box: b.id, by: "Reservoir" });
   }
 }
