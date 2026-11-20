@@ -3883,10 +3883,37 @@ async function logoLookup(env, email) {
   const parts = dom.toLowerCase().split(".");
   let id = "";
   for (let i = 0; i < parts.length - 1 && !id; i++) { const k = parts.slice(i).join("."); if (logoIndex.map.has(k)) id = logoIndex.map.get(k); }
-  if (!id) { const stem = parts.length > 2 && /^(com|net|org|co|gov|edu)$/.test(parts[parts.length - 2]) ? parts[parts.length - 3] : parts[parts.length - 2]; for (const [name, v] of logoIndex.map) if (name.split(".")[0] === stem) { id = v; break; } }
+  if (!id) { const stem = parts.length > 2 && /^(com|net|org|co|gov|edu)$/.test(parts[parts.length - 2]) ? parts[parts.length - 3] : parts[parts.length - 2]; for (const [name, v] of logoIndex.map) if (name.split(".")[0] === stem) { id = v; break; } if (!id && stem && stem.length >= 4) { const nz = (x) => String(x).toLowerCase().replace(/[^a-z0-9]/g, ""); const st = nz(stem); for (const [name, v] of logoIndex.map) { const n = nz(name.replace(/\.(com|net|org|co|au|nz|gov|edu)\b/g, "")); if (n && (n === st || n.startsWith(st) || (n.length >= 4 && st.startsWith(n)))) { id = v; break; } } } }
   if (!id) return null;
   const res = await graphFetch(env, `/sites/${siteId(env)}/drive/items/${encodeURIComponent(id)}/content`);
   return res.ok ? res : null;
+}
+// Contact approvals: a new sender with no contact waits here for Tayler to approve, change or skip. A skipped sender comes back after another 10 emails.
+async function approvalsTable(env) {
+  await env.DB.prepare("CREATE TABLE IF NOT EXISTS contact_approvals (email TEXT PRIMARY KEY, box TEXT, name TEXT, status TEXT, logo INTEGER DEFAULT 0, cnt INTEGER DEFAULT 0, next_at INTEGER DEFAULT 0, created_at TEXT DEFAULT (datetime('now')))").run();
+}
+async function approvalSeen(env, b, em, name) {
+  em = String(em || "").toLowerCase().trim();
+  if (!/^[^\s@'"<>]+@[^\s@'"<>]+$/.test(em) || /@(directflow\.com\.au|aroflo\.com)$/.test(em) || /^(no-?reply|do-?not-?reply|mailer-daemon|postmaster)/.test(em)) return;
+  await approvalsTable(env);
+  const row = await env.DB.prepare("SELECT * FROM contact_approvals WHERE email = ?").bind(em).first();
+  const tell = (logo) => notify(env, { to: "tayler@directflow.com.au", kind: "info", title: "Contact approval", body: `${name || em} (${em}): ${logo ? "logo found" : "no logo found"}. Approve, change or skip it in Weir settings.`, link: "emailbox", by: "Reservoir" });
+  if (!row) {
+    const owner = encodeURIComponent(mailAddress(env, b));
+    const f = await graphFetch(env, `/users/${owner}/contacts?$filter=${encodeURIComponent(`emailAddresses/any(a:a/address eq '${em}')`)}&$select=id&$top=1`);
+    const has = f.ok && ((await f.json()).value || []).length > 0;
+    if (has) { await env.DB.prepare("INSERT INTO contact_approvals (email, box, name, status, cnt) VALUES (?, ?, ?, 'known', 1)").bind(em, b.id, String(name || "").slice(0, 120)).run(); return; }
+    let logo = 0; try { const lg = await logoLookup(env, em); if (lg) logo = 1; } catch (e) {}
+    await env.DB.prepare("INSERT INTO contact_approvals (email, box, name, status, logo, cnt) VALUES (?, ?, ?, 'pending', ?, 1)").bind(em, b.id, String(name || "").slice(0, 120), logo).run();
+    await tell(logo);
+    return;
+  }
+  if (row.status === "known" || row.status === "approved") return;
+  const cnt = (row.cnt || 0) + 1;
+  if (row.status === "skipped" && cnt >= (row.next_at || 10)) {
+    await env.DB.prepare("UPDATE contact_approvals SET cnt = ?, status = 'pending' WHERE email = ?").bind(cnt, em).run();
+    await tell(!!row.logo);
+  } else await env.DB.prepare("UPDATE contact_approvals SET cnt = ? WHERE email = ?").bind(cnt, em).run();
 }
 async function mailGraph(env, address, qs) {
   // qs is a path inside the mailbox, or the full next page link Graph handed back.
@@ -4546,7 +4573,8 @@ async function mailRoutes(request, env, user, url) {
         const res = await graphFetch(env, `/users/${owner}/contacts/${encodeURIComponent(cid)}/photo/$value`);
         if (res.ok) return new Response(res.body, { status: 200, headers: { ...cors(env), "Content-Type": res.headers.get("Content-Type") || "image/jpeg", "Cache-Control": "private, max-age=3600" } });
       }
-      try { const lg = await logoLookup(env, em); if (lg) return new Response(lg.body, { status: 200, headers: { ...cors(env), "Content-Type": lg.headers.get("Content-Type") || "image/png", "Cache-Control": "private, max-age=3600" } }); } catch (e) {}
+      try { const lg = await logoLookup(env, em); if (lg) {
+        return new Response(lg.body, { status: 200, headers: { ...cors(env), "Content-Type": lg.headers.get("Content-Type") || "image/png", "Cache-Control": "private, max-age=3600" } }); } } catch (e) {}
       return new Response(null, { status: 404, headers: cors(env) });
     }
     if (url.pathname === "/api/mail/contactphoto" && !post) {
@@ -4657,6 +4685,67 @@ async function mailRoutes(request, env, user, url) {
         for (let k = 0; k < bin.length; k++) bytes[k] = bin.charCodeAt(k);
         const up = await graphFetch(env, `/users/${encodeURIComponent(mailAddress(env, ob))}/contacts/${encodeURIComponent(ref.slice(i + 1))}/photo/$value`, { method: "PUT", headers: { "Content-Type": "image/jpeg" }, body: bytes });
         return up.ok ? reply(env, 200, { ok: true, worker: WORKER_BUILD }) : reply(env, 200, { ok: false, error: "Microsoft did not take the photo. It answered " + up.status + ".", worker: WORKER_BUILD });
+      }
+      if (act === "imgproxy" || act === "logosave") {
+        // Logo picking is Tayler's tool. imgproxy lets the page read a signature picture that sits on someone else's server; logosave files the chosen picture in the Client Logos folder.
+        const isTayler = user.tier === "T1" && (/^tayler/i.test(String(user.email || "")) || /^tayler\b/i.test(String(user.name || "")));
+        if (!isTayler) return reply(env, 200, { ok: false, error: "Only Tayler can add logos.", worker: WORKER_BUILD });
+        if (act === "imgproxy") {
+          let u = null;
+          try { u = new URL(String(body.url || "")); } catch (e) { u = null; }
+          if (!u || u.protocol !== "https:" || /^(localhost|\d+\.\d+\.\d+\.\d+|\[.*\])$/i.test(u.hostname) || !u.hostname.includes(".")) return reply(env, 200, { ok: false, error: "That picture cannot be fetched.", worker: WORKER_BUILD });
+          try {
+            const r = await fetch(u.toString(), { redirect: "follow", headers: { "User-Agent": "Mozilla/5.0" } });
+            const ct = String(r.headers.get("Content-Type") || "").split(";")[0].trim().toLowerCase();
+            if (!r.ok || !/^image\/(png|jpe?g|gif|webp|svg\+xml)$/.test(ct)) return reply(env, 200, { ok: false, error: "That is not a picture.", worker: WORKER_BUILD });
+            const buf = await r.arrayBuffer();
+            if (buf.byteLength > 1500000) return reply(env, 200, { ok: false, error: "That picture is too big.", worker: WORKER_BUILD });
+            return reply(env, 200, { ok: true, data: `data:${ct};base64,${toB64(buf)}`, worker: WORKER_BUILD });
+          } catch (e) { return reply(env, 200, { ok: false, error: "That picture could not be fetched.", worker: WORKER_BUILD }); }
+        }
+        const em = String(body.email || "").trim().toLowerCase();
+        const dom = em.split("@")[1] || "";
+        if (!dom || !/^[a-z0-9.-]+$/.test(dom)) return reply(env, 200, { ok: false, error: "That email address does not look right.", worker: WORKER_BUILD });
+        if (/^(gmail|googlemail|outlook|hotmail|live|msn|yahoo|ymail|icloud|me|bigpond|optusnet|tpg|iinet|internode|aapt|westnet|dodo|telstra)\./.test(dom)) return reply(env, 200, { ok: false, error: "That is a free email service, so one logo would land on everyone using it.", worker: WORKER_BUILD });
+        const dp = dom.split(".");
+        const base = dp.length > 2 && /^(com|net|org|co|gov|edu|asn|id)$/.test(dp[dp.length - 2]) ? dp.slice(-3).join(".") : dp.slice(-2).join(".");
+        const b64 = String(body.data || "").replace(/^data:[^,]*,/, "");
+        if (!b64 || b64.length > 700000) return reply(env, 200, { ok: false, error: "That logo is too big.", worker: WORKER_BUILD });
+        const bin = atob(b64), bytes = new Uint8Array(bin.length);
+        for (let k = 0; k < bin.length; k++) bytes[k] = bin.charCodeAt(k);
+        let saved = null, why = "";
+        for (const segs of LOGO_HOMES) { try { saved = await uploadToSharePoint(env, segs, base + ".png", bytes, "image/png", true); break; } catch (e) { why = String(e && e.message || e); } }
+        if (!saved) return reply(env, 200, { ok: false, error: "The Client Logos folder did not take it (" + why.slice(0, 60) + ").", worker: WORKER_BUILD });
+        logoIndex = { at: 0, map: null };
+        return reply(env, 200, { ok: true, name: base + ".png", worker: WORKER_BUILD });
+      }
+      if (act === "approvals" || act === "approvalact") {
+        const isTayler = user.tier === "T1" && (/^tayler/i.test(String(user.email || "")) || /^tayler\b/i.test(String(user.name || "")));
+        if (!isTayler) return reply(env, 200, { ok: false, error: "Only Tayler can approve contacts.", worker: WORKER_BUILD });
+        await approvalsTable(env);
+        if (act === "approvals") {
+          const rs = await env.DB.prepare("SELECT email, name, box, logo, cnt FROM contact_approvals WHERE status = 'pending' ORDER BY created_at").all();
+          return reply(env, 200, { ok: true, items: (rs.results || []).map((r) => ({ email: r.email, name: r.name || "", box: r.box, logo: !!r.logo, count: r.cnt || 0 })), worker: WORKER_BUILD });
+        }
+        const em = String(body.email || "").toLowerCase().trim();
+        const row = await env.DB.prepare("SELECT * FROM contact_approvals WHERE email = ?").bind(em).first();
+        if (!row) return reply(env, 200, { ok: false, error: "That sender is not waiting.", worker: WORKER_BUILD });
+        if (body.op === "skip") {
+          await env.DB.prepare("UPDATE contact_approvals SET status = 'skipped', next_at = ? WHERE email = ?").bind((row.cnt || 0) + 10, em).run();
+          return reply(env, 200, { ok: true, worker: WORKER_BUILD });
+        }
+        const ob = MAILBOXES.find((x) => x.id === row.box) || MAILBOXES[0];
+        const owner = encodeURIComponent(mailAddress(env, ob));
+        const cr = await graphFetch(env, `/users/${owner}/contacts`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ displayName: row.name || em, emailAddresses: [{ address: em, name: row.name || em }] }) });
+        if (!cr.ok) return reply(env, 200, { ok: false, error: "The contact could not be created.", worker: WORKER_BUILD });
+        const c = await cr.json();
+        let pic = false;
+        try {
+          const lg = await logoLookup(env, em);
+          if (lg) { const pr = await graphFetch(env, `/users/${owner}/contacts/${encodeURIComponent(c.id)}/photo/$value`, { method: "PUT", headers: { "Content-Type": lg.headers.get("Content-Type") || "image/png" }, body: new Uint8Array(await lg.arrayBuffer()) }); pic = pr.ok; }
+        } catch (e) {}
+        await env.DB.prepare("UPDATE contact_approvals SET status = 'approved' WHERE email = ?").bind(em).run();
+        return reply(env, 200, { ok: true, logo: pic, worker: WORKER_BUILD });
       }
       if (act === "newfolder") {
         const name = String(body.name || "").replace(/\s+/g, " ").trim().slice(0, 100);
@@ -4845,6 +4934,7 @@ async function mailWatch(env) {
     if (!brandNew.length) continue;
     const to = Object.keys(tiers).filter((e) => mailAllowed(b, { email: e, tier: tiers[e] }));
     const prev = brandNew.length === 1 ? `${who(brandNew[0])}: ${String(brandNew[0].subject || "(no subject)").slice(0, 100)}` : `${brandNew.length} new emails, latest from ${who(brandNew[0])}`;
+    for (const m of brandNew) { try { const fa = (m.from && m.from.emailAddress) || {}; await approvalSeen(env, b, fa.address, fa.name); } catch (e) { console.log("approval seen", String(e && e.message || e).slice(0, 120)); } }
     for (const e of to) await notify(env, { to: e, kind: "mail", title: `New Email - ${b.label}`, body: prev, preview: true, link: "emailbox", box: b.id, by: "Reservoir" });
   }
 }
