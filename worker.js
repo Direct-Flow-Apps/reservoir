@@ -7601,25 +7601,35 @@ async function mailMarkerCol(env) {
   try { await env.DB.prepare("ALTER TABLE mail_extra ADD COLUMN marker TEXT NOT NULL DEFAULT ''").run(); } catch (e) {}
   mailMarkerCol.done = true;
 }
-async function copyOneMail(env, src, dest, folderId, m) {
+// A direct copy: the whole original message (headers, body, attachments) is imported, then its original received and sent times are stamped on it so it sorts and reads exactly as the original did. verify reads the copy back and checks the received time matches.
+async function copyOneMail(env, src, dest, folderId, m, verify) {
   const raw = await graphFetch(env, `/users/${encodeURIComponent(src)}/messages/${encodeURIComponent(m.id)}/$value`);
-  if (!raw.ok) { console.log("copy read failed", raw.status); return false; }
+  if (!raw.ok) { console.log("copy read failed", raw.status); return { ok: false }; }
   const bytes = new Uint8Array(await raw.arrayBuffer());
   let bin = "";
   for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
   const put = await graphFetch(env, `/users/${encodeURIComponent(dest)}/mailFolders/${encodeURIComponent(folderId)}/messages`, { method: "POST", headers: { "Content-Type": "text/plain" }, body: btoa(bin) });
-  if (!put.ok) { console.log("copy put failed", put.status, (await put.text()).slice(0, 200)); return false; }
+  if (!put.ok) { console.log("copy put failed", put.status, (await put.text()).slice(0, 200)); return { ok: false }; }
   let made = null; try { made = await put.json(); } catch (e) { made = null; }
-  if (made && made.id) await mailDo(env, dest, `/messages/${encodeURIComponent(made.id)}`, "PATCH", { isRead: true });
-  return true;
+  if (!made || !made.id) return { ok: false };
+  const props = [{ id: "SystemTime 0x0E06", value: new Date(m.receivedDateTime).toISOString() }, { id: "SystemTime 0x0039", value: new Date(m.sentDateTime || m.receivedDateTime).toISOString() }];
+  const up = await mailDo(env, dest, `/messages/${encodeURIComponent(made.id)}`, "PATCH", { isRead: true, singleValueExtendedProperties: props });
+  if (!up.ok) { console.log("copy date stamp failed", up.status); return { ok: false, bad: "stamp", id: made.id }; }
+  if (verify) {
+    const chk = await mailGraph(env, dest, `/messages/${encodeURIComponent(made.id)}?$select=receivedDateTime,isDraft`);
+    const got = chk.ok && chk.json ? Date.parse(chk.json.receivedDateTime) : NaN;
+    if (!(Math.abs(got - Date.parse(m.receivedDateTime)) < 2000) || (chk.json && chk.json.isDraft)) return { ok: false, bad: "date", id: made.id, got: chk.json && chk.json.receivedDateTime };
+  }
+  return { ok: true, id: made.id };
 }
-const COPY_PAUSED = true;
 async function copyFolderJob(env, key, buildFolders) {
-  if (!env.GRAPH_CLIENT_SECRET || COPY_PAUSED) return;
+  if (!env.GRAPH_CLIENT_SECRET) return;
   await settingsTable(env);
   await mailMarkerCol(env);
+  const undo = await env.DB.prepare("SELECT value FROM app_settings WHERE key = 'merge.undo2'").first();
+  if (!undo || undo.value !== "done") return;
   const row = await env.DB.prepare("SELECT value, detail FROM app_settings WHERE key = ?").bind(key).first();
-  if (row && row.value === "done") return;
+  if (row && (row.value === "done" || row.value === "halted")) return;
   const lk = await env.DB.prepare("SELECT value FROM app_settings WHERE key = ?").bind(key + ".lock").first();
   if (lk && Date.now() - Number(lk.value || 0) < 4 * 60000) return;
   const setLock = (v) => env.DB.prepare("INSERT OR REPLACE INTO app_settings (key, value, detail, by_name, at) VALUES (?, ?, '', 'Reservoir', datetime('now'))").bind(key + ".lock", String(v)).run();
@@ -7635,7 +7645,7 @@ async function copyFolderJob(env, key, buildFolders) {
     let copiedNow = 0;
     while (st.i < st.folders.length && copiedNow < COPY_BATCH && Date.now() - started < 20000) {
       const f = st.folders[st.i];
-      const q = `/mailFolders/${encodeURIComponent(f.src)}/messages?$top=100&$select=id,receivedDateTime,internetMessageId&$orderby=receivedDateTime asc` + (st.at ? `&$filter=receivedDateTime ge ${st.at}` : "");
+      const q = `/mailFolders/${encodeURIComponent(f.src)}/messages?$top=100&$select=id,receivedDateTime,sentDateTime,internetMessageId&$orderby=receivedDateTime asc` + (st.at ? `&$filter=receivedDateTime ge ${st.at}` : "");
       const r = await mailGraph(env, src, q);
       if (!r.ok) { console.log("copy list failed", r.status); break; }
       const all = (r.json && r.json.value) || [];
@@ -7647,10 +7657,12 @@ async function copyFolderJob(env, key, buildFolders) {
       let broke = false;
       for (let c = 0; c < msgs.length && copiedNow < COPY_BATCH && Date.now() - started < 20000; c += 5) {
         const chunk = msgs.slice(c, c + 5);
-        const res = await Promise.all(chunk.map((m) => copyOneMail(env, src, dest, f.dst, m).catch(() => false)));
+        const res = await Promise.all(chunk.map((m) => copyOneMail(env, src, dest, f.dst, m, st.n < 3).catch(() => ({ ok: false }))));
+        const badOne = res.find((x) => x && (x.bad === "date" || x.bad === "stamp"));
+        if (badOne) { await mailDo(env, dest, `/messages/${encodeURIComponent(badOne.id)}`, "DELETE"); await save("halted", { ...st, reason: "copy date check failed " + badOne.bad + " " + badOne.got }); console.log("copy halted", key, badOne.bad); return; }
         const marks = [];
         for (let k = 0; k < chunk.length; k++) {
-          if (!res[k]) { broke = true; break; }
+          if (!res[k] || !res[k].ok) { broke = true; break; }
           const m = chunk[k];
           if (m.receivedDateTime !== st.at) { st.at = m.receivedDateTime; st.ids = []; }
           st.ids.push(m.id); st.n++; copiedNow++;
@@ -7681,12 +7693,47 @@ async function mergeAutoReply(env) {
   if (!r.ok) { console.log("autoreply failed", r.status, (await r.text()).slice(0, 300)); return; }
   await env.DB.prepare("INSERT OR REPLACE INTO app_settings (key, value, detail, by_name, at) VALUES ('merge.autoreply', '1', ?, 'Reservoir', datetime('now'))").bind(sig).run();
 }
+// Undo of the first (wrongly dated) copies: they are found in DFP Jobs Sent Items and Archive (and its subfolders), created today, and either carrying a Maintenance marker or sent from maintenance, and moved to Deleted Items (the 7am sweep clears that). Nothing else is touched. When a full pass finds none left the copy jobs are allowed to start again.
+async function mergeCopyUndo(env) {
+  if (!env.GRAPH_CLIENT_SECRET) return;
+  await settingsTable(env);
+  await mailMarkerCol(env);
+  const key = "merge.undo2";
+  const row = await env.DB.prepare("SELECT value FROM app_settings WHERE key = ?").bind(key).first();
+  if (row && row.value === "done") return;
+  const dest = mailAddress(env, MAILBOXES.find((x) => x.id === "jobs"));
+  const maint = mailAddress(env, MAILBOXES.find((x) => x.id === "maintenance")).toLowerCase();
+  const since = "2026-11-19T13:00:00Z";
+  const markers = new Set(((await env.DB.prepare("SELECT imid FROM mail_extra WHERE box = 'jobs' AND marker = 'Maintenance'").all()).results || []).map((x) => x.imid));
+  const folders = [{ id: "sentitems", sent: true }, { id: "archive", sent: false }];
+  const walk = async (id) => { const r = await mailGraph(env, dest, `/mailFolders/${encodeURIComponent(id)}/childFolders?$top=100&$select=id`); for (const f of ((r.ok && r.json && r.json.value) || [])) { folders.push({ id: f.id, sent: false }); await walk(f.id); } };
+  await walk("archive");
+  let found = 0, deleted = 0, failed = 0;
+  for (const f of folders) {
+    const hits = [];
+    for (let skip = 0; skip < 3000; skip += 100) {
+      const r = await mailGraph(env, dest, `/mailFolders/${encodeURIComponent(f.id)}/messages?$top=100&$skip=${skip}&$select=id,internetMessageId,from,createdDateTime&$filter=${encodeURIComponent("createdDateTime ge " + since)}`);
+      if (!r.ok) { failed++; break; }
+      const v = (r.json && r.json.value) || [];
+      for (const m of v) { const fr = String((m.from && m.from.emailAddress && m.from.emailAddress.address) || "").toLowerCase(); if ((m.internetMessageId && markers.has(String(m.internetMessageId).slice(0, 300))) || (f.sent && fr === maint)) hits.push(m.id); }
+      if (v.length < 100) break;
+    }
+    found += hits.length;
+    for (let c = 0; c < hits.length && deleted < 200; c += 5) {
+      const res = await Promise.all(hits.slice(c, c + 5).map((id) => mailDo(env, dest, `/messages/${encodeURIComponent(id)}`, "DELETE").then((x) => x.ok).catch(() => false)));
+      res.forEach((ok) => { if (ok) deleted++; else failed++; });
+    }
+    if (deleted >= 200) break;
+  }
+  console.log("copy undo", found, deleted, failed);
+  if (!found && !failed) await env.DB.prepare("INSERT OR REPLACE INTO app_settings (key, value, detail, by_name, at) VALUES (?, 'done', '', 'Reservoir', datetime('now'))").bind(key).run();
+}
 async function mergeSentCopy(env) {
-  await copyFolderJob(env, "merge.sent_copy", async () => [{ src: "sentitems", dst: "sentitems" }]);
+  await copyFolderJob(env, "merge.sent_copy2", async () => [{ src: "sentitems", dst: "sentitems" }]);
 }
 // The Archive copy: the same folder tree is made in DFP Jobs (existing folders of the same name are reused), then every folder is copied across.
 async function mergeArchiveCopy(env) {
-  await copyFolderJob(env, "merge.archive_copy", async (e, src, dest) => {
+  await copyFolderJob(env, "merge.archive_copy2", async (e, src, dest) => {
     const out = [{ src: "archive", dst: "archive" }];
     const kids = async (addr, id) => { const r = await mailGraph(e, addr, `/mailFolders/${encodeURIComponent(id)}/childFolders?$top=100&$select=id,displayName`); if (!r.ok) throw new Error("folder list " + r.status); return (r.json && r.json.value) || []; };
     const walk = async (sId, dId) => {
@@ -7708,7 +7755,7 @@ export default {
   // Runs on a Cloudflare cron trigger if one is added (for example Thursday early morning). It only refreshes leave balances and leave history from Xero into D1.
   async scheduled(event, env, ctx) {
     // A five minute trigger, if one is added, only looks for new mail so pings arrive quickly.
-    if (event && event.cron === "*/5 * * * *") { ctx.waitUntil(mergeSentCopy(env).catch((e) => console.log("sent copy failed", String(e && e.message || e)))); ctx.waitUntil(mergeAutoReply(env).catch((e) => console.log("autoreply failed", String(e && e.message || e)))); ctx.waitUntil(mergeArchiveCopy(env).catch((e) => console.log("archive copy failed", String(e && e.message || e)))); ctx.waitUntil(mailWatch(env).catch((e) => console.log("mail watch failed", String(e && e.message || e)))); ctx.waitUntil(mailHoldSweep(env).catch((e) => console.log("hold sweep failed", String(e && e.message || e)))); ctx.waitUntil(vbaSubscribe(env).then(() => vbaWatch(env)).catch((e) => console.log("vba watch failed", String(e && e.message || e)))); return; }
+    if (event && event.cron === "*/5 * * * *") { ctx.waitUntil(mergeCopyUndo(env).catch((e) => console.log("copy undo failed", String(e && e.message || e)))); ctx.waitUntil(mergeSentCopy(env).catch((e) => console.log("sent copy failed", String(e && e.message || e)))); ctx.waitUntil(mergeAutoReply(env).catch((e) => console.log("autoreply failed", String(e && e.message || e)))); ctx.waitUntil(mergeArchiveCopy(env).catch((e) => console.log("archive copy failed", String(e && e.message || e)))); ctx.waitUntil(mailWatch(env).catch((e) => console.log("mail watch failed", String(e && e.message || e)))); ctx.waitUntil(mailHoldSweep(env).catch((e) => console.log("hold sweep failed", String(e && e.message || e)))); ctx.waitUntil(vbaSubscribe(env).then(() => vbaWatch(env)).catch((e) => console.log("vba watch failed", String(e && e.message || e)))); return; }
     // Every run checks the automatic timesheets and the payroll sweeps. The leave sync keeps its own schedule and is skipped on the half hourly one.
     ctx.waitUntil(tsAutoRun(env).catch((e) => console.log("auto timesheets failed", String(e && e.message || e))));
     ctx.waitUntil(pushFlushHeld(env));
