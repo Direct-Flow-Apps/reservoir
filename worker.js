@@ -337,7 +337,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
   await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
 }
 
-const WORKER_BUILD = "Reservoir-Worker-2026.11.20-w264";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.20-w265";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -4310,7 +4310,9 @@ async function mailRoutes(request, env, user, url) {
       };
       const undo = await env.DB.prepare("SELECT value FROM app_settings WHERE key = 'merge.undo2'").first();
       const [sent, archive] = await Promise.all([one("merge.sent_copy2", "sentitems"), one("merge.archive_copy2", "archive")]);
-      return reply(env, 200, { ok: true, undo: undo ? undo.value : "waiting", sent, archive, worker: WORKER_BUILD });
+      const xt = await env.DB.prepare("SELECT value, detail FROM app_settings WHERE key = 'merge.exporttest'").first();
+      let xlog = []; try { xlog = xt && xt.detail ? JSON.parse(xt.detail).log : []; } catch (e) {}
+      return reply(env, 200, { ok: true, undo: undo ? undo.value : "waiting", sent, archive, test: xt ? { state: xt.value, log: xlog } : null, worker: WORKER_BUILD });
     }
     if (url.pathname === "/api/mail/signature" && !post) {
       // The signature reads the signed in person's name, job title and business phone from Entra.
@@ -7797,11 +7799,87 @@ async function mergeArchiveCopy(env) {
     return out;
   });
 }
+
+// One email test of the Graph mailbox export and import (preview API): finds Kuna Electrics "Re: Hot water quote" in Maintenance Archive, exports it, imports it into DFP Jobs Archive and reads back the received date. Every step is logged to D1 so it can be shown on the Maintenance screen.
+async function mergeExportTest(env) {
+  if (!env.GRAPH_CLIENT_SECRET) return;
+  await settingsTable(env);
+  const key = "merge.exporttest";
+  const row = await env.DB.prepare("SELECT value FROM app_settings WHERE key = ?").bind(key).first();
+  if (row) return;
+  const log = [];
+  const save = (value) => env.DB.prepare("INSERT OR REPLACE INTO app_settings (key, value, detail, by_name, at) VALUES (?, ?, ?, 'Reservoir', datetime('now'))").bind(key, value, JSON.stringify({ log })).run();
+  await save("running");
+  const B = "https://graph.microsoft.com/beta/admin/exchange/mailboxes";
+  const say = (t) => { log.push(String(t).slice(0, 300)); };
+  const call = async (url, init) => { const r = await graphFetch(env, url, init); const t = await r.text(); let j = null; try { j = JSON.parse(t); } catch (e) {} return { ok: r.ok, status: r.status, j, t }; };
+  try {
+    const src = mailAddress(env, MAILBOXES.find((x) => x.id === "maintenance"));
+    const dst = mailAddress(env, MAILBOXES.find((x) => x.id === "jobs"));
+    const mbx = async (addr) => {
+      let r = await call(`${B}/${encodeURIComponent(addr)}`);
+      if (r.ok && r.j && r.j.id) return r.j.id;
+      say(`mailbox by address ${r.status} ${r.t.slice(0, 120)}`);
+      r = await call(`${B}?$filter=${encodeURIComponent("primarySmtpAddress eq '" + addr + "'")}`);
+      if (r.ok && r.j && r.j.value && r.j.value[0]) return r.j.value[0].id;
+      say(`mailbox by filter ${r.status} ${r.t.slice(0, 120)}`);
+      return "";
+    };
+    const sId = await mbx(src), dId = await mbx(dst);
+    if (!sId || !dId) { say("stopped: no mailbox id"); return await save("failed"); }
+    say("mailbox ids found");
+    const archive = async (id) => {
+      const r = await call(`${B}/${encodeURIComponent(id)}/folders?$top=200`);
+      if (!r.ok) { say(`folders ${r.status} ${r.t.slice(0, 120)}`); return ""; }
+      const f = (r.j.value || []).find((x) => String(x.displayName || "").toLowerCase() === "archive");
+      if (!f) say("folders: " + (r.j.value || []).map((x) => x.displayName).join(",").slice(0, 150));
+      return f ? f.id : "";
+    };
+    const sF = await archive(sId), dF = await archive(dId);
+    if (!sF || !dF) { say("stopped: no Archive folder"); return await save("failed"); }
+    say("archive folders found");
+    const t0 = Date.now();
+    let url = `${B}/${encodeURIComponent(sId)}/folders/${encodeURIComponent(sF)}/items?$top=100`;
+    let pages = 0, scanned = 0, found = null, sample = false;
+    while (url && !found && Date.now() - t0 < 120000) {
+      const r = await call(url);
+      if (!r.ok) { say(`items ${r.status} ${r.t.slice(0, 160)}`); break; }
+      const items = (r.j && r.j.value) || [];
+      if (!sample && items[0]) { say("item sample " + JSON.stringify(items[0]).slice(0, 200)); sample = true; }
+      pages++; scanned += items.length;
+      const day = items.filter((x) => String(x.createdDateTime || x.receivedDateTime || x.lastModifiedDateTime || "").startsWith("2026-09-30") || String(x.subject || "").includes("Hot water quote"));
+      const ids = (day.length ? day : []).map((x) => x.id).slice(0, 20);
+      if (ids.length) {
+        const ex = await call(`${B}/${encodeURIComponent(sId)}/exportItems`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ itemIds: ids }) });
+        if (!ex.ok) { say(`export ${ex.status} ${ex.t.slice(0, 160)}`); break; }
+        for (const e of ((ex.j && ex.j.value) || [])) {
+          const bin = atob(String(e.data || ""));
+          const u16 = "H\0o\0t\0 \0w\0a\0t\0e\0r\0 \0q\0u\0o\0t\0e";
+          if ((bin.includes("Hot water quote") || bin.includes(u16)) && (bin.includes("Kuna") || bin.includes("K\0u\0n\0a"))) { found = e; break; }
+        }
+      }
+      url = r.j && r.j["@odata.nextLink"] ? r.j["@odata.nextLink"] : "";
+    }
+    say(`scanned ${scanned} items in ${pages} pages`);
+    if (!found) { say("stopped: test email not found"); return await save("failed"); }
+    say("exported the test email");
+    const ses = await call(`${B}/${encodeURIComponent(dId)}/createImportSession`, { method: "POST" });
+    if (!ses.ok || !ses.j || !ses.j.importUrl) { say(`import session ${ses.status} ${ses.t.slice(0, 160)}`); return await save("failed"); }
+    const imp = await fetch(ses.j.importUrl, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ FolderId: dF, Mode: "create", Data: found.data }) });
+    const it = await imp.text();
+    if (!imp.ok) { say(`import ${imp.status} ${it.slice(0, 160)}`); return await save("failed"); }
+    say("imported into DFP Jobs Archive");
+    const chk = await mailGraph(env, dst, `/mailFolders/archive/messages?$top=5&$select=subject,receivedDateTime,from&$filter=${encodeURIComponent("subject eq 'Re: Hot water quote'")}&$orderby=receivedDateTime desc`);
+    const hits = (chk.ok && chk.json && chk.json.value) || [];
+    say("DFP Jobs Archive now has: " + (hits.length ? hits.map((m) => `${m.receivedDateTime}`).join(" | ") : "nothing found by subject"));
+    await save("done");
+  } catch (e) { say("error " + String(e && e.message || e)); await save("failed"); }
+}
 export default {
   // Runs on a Cloudflare cron trigger if one is added (for example Thursday early morning). It only refreshes leave balances and leave history from Xero into D1.
   async scheduled(event, env, ctx) {
     // A five minute trigger, if one is added, only looks for new mail so pings arrive quickly.
-    if (event && event.cron === "*/5 * * * *") { ctx.waitUntil(mergeCopyUndo(env).catch((e) => console.log("copy undo failed", String(e && e.message || e)))); ctx.waitUntil(mergeSentCopy(env).catch((e) => console.log("sent copy failed", String(e && e.message || e)))); ctx.waitUntil(mergeAutoReply(env).catch((e) => console.log("autoreply failed", String(e && e.message || e)))); ctx.waitUntil(mergeArchiveCopy(env).catch((e) => console.log("archive copy failed", String(e && e.message || e)))); ctx.waitUntil(mailWatch(env).catch((e) => console.log("mail watch failed", String(e && e.message || e)))); ctx.waitUntil(mailHoldSweep(env).catch((e) => console.log("hold sweep failed", String(e && e.message || e)))); ctx.waitUntil(vbaSubscribe(env).then(() => vbaWatch(env)).catch((e) => console.log("vba watch failed", String(e && e.message || e)))); return; }
+    if (event && event.cron === "*/5 * * * *") { ctx.waitUntil(mergeExportTest(env).catch((e) => console.log("export test failed", String(e && e.message || e)))); ctx.waitUntil(mergeCopyUndo(env).catch((e) => console.log("copy undo failed", String(e && e.message || e)))); ctx.waitUntil(mergeSentCopy(env).catch((e) => console.log("sent copy failed", String(e && e.message || e)))); ctx.waitUntil(mergeAutoReply(env).catch((e) => console.log("autoreply failed", String(e && e.message || e)))); ctx.waitUntil(mergeArchiveCopy(env).catch((e) => console.log("archive copy failed", String(e && e.message || e)))); ctx.waitUntil(mailWatch(env).catch((e) => console.log("mail watch failed", String(e && e.message || e)))); ctx.waitUntil(mailHoldSweep(env).catch((e) => console.log("hold sweep failed", String(e && e.message || e)))); ctx.waitUntil(vbaSubscribe(env).then(() => vbaWatch(env)).catch((e) => console.log("vba watch failed", String(e && e.message || e)))); return; }
     // Every run checks the automatic timesheets and the payroll sweeps. The leave sync keeps its own schedule and is skipped on the half hourly one.
     ctx.waitUntil(tsAutoRun(env).catch((e) => console.log("auto timesheets failed", String(e && e.message || e))));
     ctx.waitUntil(pushFlushHeld(env));
