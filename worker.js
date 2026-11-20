@@ -337,7 +337,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
   await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
 }
 
-const WORKER_BUILD = "Reservoir-Worker-2026.11.20-w262";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.20-w263";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -7620,7 +7620,7 @@ async function mergeJunkSweep(env) {
   console.log("junk sweep", moved, "moved", left ? "more to do" : "done");
 }
 // Copies maintenance mail into DFP Jobs: Sent Items and the Archive (with its subfolders). The copy is the original message, so the sender stays maintenance, and the originals are left where they are. Every copy is marked read and gets a Maintenance marker (kept in Reservoir, shown as an orange pill in Weir, not a category). Oldest first, in batches on every run, with the place it got to kept in D1 until each job is done.
-const COPY_BATCH = 100;
+const COPY_BATCH = 2500;
 async function mailMarkerCol(env) {
   if (mailMarkerCol.done) return;
   await mailExtraTable(env);
@@ -7648,7 +7648,7 @@ async function copyOneMail(env, src, dest, folderId, m, verify) {
   }
   return { ok: true, id: made.id };
 }
-const COPY_PAUSED = true; // Paused at Tayler's request. Set to false to resume the undo and the Sent Items and Archive copies.
+const COPY_PAUSED = false; // Set to true to pause the undo and the Sent Items and Archive copies.
 async function copyFolderJob(env, key, buildFolders) {
   if (COPY_PAUSED) return;
   if (!env.GRAPH_CLIENT_SECRET) return;
@@ -7671,7 +7671,7 @@ async function copyFolderJob(env, key, buildFolders) {
     if (!st.folders) { st.folders = await buildFolders(env, src, dest); if (!st.folders) return; await save("running", st); }
     const started = Date.now();
     let copiedNow = 0;
-    while (st.i < st.folders.length && copiedNow < COPY_BATCH && Date.now() - started < 20000) {
+    while (st.i < st.folders.length && copiedNow < COPY_BATCH && Date.now() - started < 200000) {
       const f = st.folders[st.i];
       const q = `/mailFolders/${encodeURIComponent(f.src)}/messages?$top=100&$select=id,receivedDateTime,sentDateTime,internetMessageId&$orderby=receivedDateTime asc` + (st.at ? `&$filter=receivedDateTime ge ${st.at}` : "");
       const r = await mailGraph(env, src, q);
@@ -7683,7 +7683,7 @@ async function copyFolderJob(env, key, buildFolders) {
         st.at = all[all.length - 1].receivedDateTime; st.ids = []; await save("running", st); continue;
       }
       let broke = false;
-      for (let c = 0; c < msgs.length && copiedNow < COPY_BATCH && Date.now() - started < 20000; c += 5) {
+      for (let c = 0; c < msgs.length && copiedNow < COPY_BATCH && Date.now() - started < 200000; c += 5) {
         const chunk = msgs.slice(c, c + 5);
         const res = await Promise.all(chunk.map((m) => copyOneMail(env, src, dest, f.dst, m, st.n < 3).catch(() => ({ ok: false }))));
         const badOne = res.find((x) => x && (x.bad === "date" || x.bad === "stamp"));
@@ -7737,6 +7737,7 @@ async function mergeCopyUndo(env) {
   const folders = [{ id: "sentitems", sent: true }, { id: "archive", sent: false }];
   const walk = async (id) => { const r = await mailGraph(env, dest, `/mailFolders/${encodeURIComponent(id)}/childFolders?$top=100&$select=id`); for (const f of ((r.ok && r.json && r.json.value) || [])) { folders.push({ id: f.id, sent: false }); await walk(f.id); } };
   await walk("archive");
+  const t0 = Date.now();
   let found = 0, deleted = 0, failed = 0;
   for (const f of folders) {
     const hits = [];
@@ -7748,11 +7749,11 @@ async function mergeCopyUndo(env) {
       if (v.length < 100) break;
     }
     found += hits.length;
-    for (let c = 0; c < hits.length && deleted < 200; c += 5) {
+    for (let c = 0; c < hits.length && deleted < 3000 && Date.now() - t0 < 200000; c += 5) {
       const res = await Promise.all(hits.slice(c, c + 5).map((id) => mailDo(env, dest, `/messages/${encodeURIComponent(id)}`, "DELETE").then((x) => x.ok).catch(() => false)));
       res.forEach((ok) => { if (ok) deleted++; else failed++; });
     }
-    if (deleted >= 200) break;
+    if (deleted >= 3000 || Date.now() - t0 >= 200000) break;
   }
   console.log("copy undo", found, deleted, failed);
   if (!found && !failed) await env.DB.prepare("INSERT OR REPLACE INTO app_settings (key, value, detail, by_name, at) VALUES (?, 'done', '', 'Reservoir', datetime('now'))").bind(key).run();
