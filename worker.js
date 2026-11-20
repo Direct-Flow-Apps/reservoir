@@ -337,7 +337,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
   await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
 }
 
-const WORKER_BUILD = "Reservoir-Worker-2026.11.20-w247";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.20-w248";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -4464,10 +4464,10 @@ async function mailRoutes(request, env, user, url) {
       if (out.length < 8) {
         const ql = q.toLowerCase();
         const sent = await Promise.all(mine.map(async (bx) => {
-          const r = await mailGraph(env, mailAddress(env, bx), "/mailFolders/sentitems/messages?$top=100&$select=toRecipients,ccRecipients");
+          const r = await mailGraph(env, mailAddress(env, bx), "/mailFolders/sentitems/messages?$top=100&$select=toRecipients,ccRecipients,bccRecipients");
           return (r.ok && r.json && r.json.value) || [];
         }));
-        for (const m of sent.flat()) for (const x of [...(m.toRecipients || []), ...(m.ccRecipients || [])]) {
+        for (const m of sent.flat()) for (const x of [...(m.toRecipients || []), ...(m.ccRecipients || []), ...(m.bccRecipients || [])]) {
           const ea = x && x.emailAddress; const addr = String((ea && ea.address) || "").trim(); const nm = String((ea && ea.name) || "").trim();
           if (!addr || seen.has(addr.toLowerCase())) continue;
           if (!(addr.toLowerCase().includes(ql) || nm.toLowerCase().startsWith(ql))) continue;
@@ -4719,7 +4719,7 @@ async function mailRoutes(request, env, user, url) {
       const draftBody = () => ({ subject: String(body.subject || "").slice(0, 250), body: { contentType: "HTML", content: mailBodyHtml(body, body.text) }, toRecipients: mailRecipients(body.to), ccRecipients: mailRecipients(body.cc), bccRecipients: mailRecipients(body.bcc), importance: body.importance === "high" ? "high" : "normal" });
       if (act === "send") {
         const to = mailRecipients(body && body.to);
-        if (!to.length) return reply(env, 200, { ok: false, error: "Add at least one valid email address to send to.", worker: WORKER_BUILD });
+        if (!to.length && !mailRecipients(body && body.bcc).length) return reply(env, 200, { ok: false, error: "Add at least one valid email address to send to.", worker: WORKER_BUILD });
         const msgObj = draftBody();
         const atts = mailAtts(body.attachments), at = mailWhenOk(body.sendAt), holdNew = !!body.hold && !!at;
         if (!atts.length && !at) return done(await mailDo(env, addr, "/sendMail", "POST", { message: msgObj, saveToSentItems: true }));
