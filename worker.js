@@ -7613,8 +7613,9 @@ async function copyOneMail(env, src, dest, folderId, m) {
   if (made && made.id) await mailDo(env, dest, `/messages/${encodeURIComponent(made.id)}`, "PATCH", { isRead: true });
   return true;
 }
+const COPY_PAUSED = true;
 async function copyFolderJob(env, key, buildFolders) {
-  if (!env.GRAPH_CLIENT_SECRET) return;
+  if (!env.GRAPH_CLIENT_SECRET || COPY_PAUSED) return;
   await settingsTable(env);
   await mailMarkerCol(env);
   const row = await env.DB.prepare("SELECT value, detail FROM app_settings WHERE key = ?").bind(key).first();
