@@ -337,7 +337,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
   await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
 }
 
-const WORKER_BUILD = "Reservoir-Worker-2026.11.20-w260";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.20-w261";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -4294,6 +4294,14 @@ async function mailRoutes(request, env, user, url) {
         return { id: b.id, label: b.label, address: mailAddress(env, b), personal: !!b.only, unread: r.ok && r.json ? Number(r.json.unreadItemCount || 0) : 0, total: r.ok && r.json ? Number(r.json.totalItemCount || 0) : 0, error: r.ok ? "" : mailWhy(r) };
       }));
       return reply(env, 200, { boxes: out, targets: MAILBOXES.filter((x) => !x.only || mailAllowed(x, user)).map((x) => ({ id: x.id, label: x.label })), worker: WORKER_BUILD });
+    }
+    if (url.pathname === "/api/mail/signature" && !post) {
+      // The signature reads the signed in person's name, job title and business phone from Entra.
+      if (!ownEmail) return reply(env, 200, { ok: false, error: "no user", worker: WORKER_BUILD });
+      const r = await graphFetch(env, `/users/${encodeURIComponent(ownEmail)}?$select=givenName,surname,jobTitle,businessPhones`);
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) return reply(env, 200, { ok: false, error: "Entra read failed " + r.status, worker: WORKER_BUILD });
+      return reply(env, 200, { ok: true, first: String(j.givenName || "").slice(0, 60), last: String(j.surname || "").slice(0, 60), title: String(j.jobTitle || "").slice(0, 80), phone: String((j.businessPhones || [])[0] || "").slice(0, 30), worker: WORKER_BUILD });
     }
     const b = mine.find((x) => x.id === (url.searchParams.get("id") || ""));
     let body = null;
