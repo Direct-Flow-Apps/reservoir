@@ -337,7 +337,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
   await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
 }
 
-const WORKER_BUILD = "Reservoir-Worker-2026.11.20-w246";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.20-w247";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -7511,7 +7511,7 @@ async function mergeRulesSync(env) {
   if (!env.GRAPH_CLIENT_SECRET) return;
   await settingsTable(env);
   const to = mailAddress(env, MAILBOXES.find((x) => x.id === "jobs"));
-  const sig = "redirect-v1:" + to;
+  const sig = "redirect-v2:" + to;
   const row = await env.DB.prepare("SELECT detail FROM app_settings WHERE key = 'merge.rules_sync'").first();
   if (row && row.detail === sig) return;
   let ok = true;
@@ -7521,7 +7521,7 @@ async function mergeRulesSync(env) {
     if (!list.ok) { ok = false; console.log("merge rules list failed", addr, list.status); continue; }
     const name = "Reservoir: redirect to DFP Jobs";
     const have = (((await list.json()).value) || []).find((x) => x.displayName === name);
-    const body = JSON.stringify({ displayName: name, sequence: 1, isEnabled: true, conditions: {}, actions: { redirectTo: [{ emailAddress: { address: to } }], markAsRead: true, stopProcessingRules: true } });
+    const body = JSON.stringify({ displayName: name, sequence: 1, isEnabled: true, conditions: {}, actions: { redirectTo: [{ emailAddress: { address: to } }], delete: true, stopProcessingRules: true } });
     const res = have ? await graphFetch(env, `${base}/${have.id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body }) : await graphFetch(env, base, { method: "POST", headers: { "Content-Type": "application/json" }, body });
     if (!res.ok) { ok = false; console.log("merge rule failed", addr, res.status, (await res.text()).slice(0, 300)); }
   }
