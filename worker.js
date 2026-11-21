@@ -6178,9 +6178,11 @@ async function pushForNotice(env, n, id) {
 }
 // ---- Incentives (T1 only). Tayler gives a team member a lunch or a voucher and notes why. ----
 const INCENTIVE_KINDS = ["Lunch", "Voucher"];
+// An incentive that has not been used within a month of being awarded shows as expired. One with a receipt in or already reimbursed never expires.
+const incStatus = (r) => { const st = r.status || "issued"; if (st !== "issued") return st; const t = Date.parse(String(r.at || "").replace(" ", "T") + "Z"); return !isNaN(t) && Date.now() - t > 30 * 86400000 ? "expired" : st; };
 async function incentivesTable(env) {
   await env.DB.prepare("CREATE TABLE IF NOT EXISTS incentives (id TEXT PRIMARY KEY, to_name TEXT, to_email TEXT, kind TEXT, note TEXT, by_name TEXT, at TEXT)").run();
-  for (const c of ["design TEXT", "status TEXT", "receipt TEXT", "receipt_at TEXT", "redeemed_at TEXT"]) { try { await env.DB.prepare("ALTER TABLE incentives ADD COLUMN " + c).run(); } catch (e) {} }
+  for (const c of ["design TEXT", "status TEXT", "receipt TEXT", "receipt_at TEXT", "redeemed_at TEXT", "amount INTEGER"]) { try { await env.DB.prepare("ALTER TABLE incentives ADD COLUMN " + c).run(); } catch (e) {} }
 }
 async function incentivesRoutes(request, env, user, url) {
   if (!url.pathname.startsWith("/api/incentives")) return null;
@@ -6191,14 +6193,15 @@ async function incentivesRoutes(request, env, user, url) {
   let body = {};
   if (request.method === "POST") { try { body = await request.json(); } catch (e) { body = {}; } }
   if (url.pathname === "/api/incentives/mine" && request.method === "GET") {
-    const rows = await env.DB.prepare("SELECT id, to_name, kind, note, by_name, design, status, at FROM incentives WHERE lower(to_email) = ? ORDER BY at DESC LIMIT 50").bind(me).all();
-    return reply(env, 200, { ok: true, items: (rows.results || []).map((r) => ({ id: r.id, name: r.to_name, kind: r.kind, note: r.note, from: r.by_name, design: r.design || "feast", status: r.status || "issued", at: r.at })) });
+    const rows = await env.DB.prepare("SELECT id, to_name, kind, note, by_name, design, status, amount, at FROM incentives WHERE lower(to_email) = ? ORDER BY at DESC LIMIT 50").bind(me).all();
+    return reply(env, 200, { ok: true, items: (rows.results || []).map((r) => ({ id: r.id, name: r.to_name, kind: r.kind, note: r.note, from: r.by_name, design: r.design || "feast", status: incStatus(r), amount: r.amount || 0, at: r.at })) });
   }
   if (url.pathname === "/api/incentives/receipt" && request.method === "POST") {
     const id = String(body.id || "");
     const row = await env.DB.prepare("SELECT * FROM incentives WHERE id = ? AND lower(to_email) = ?").bind(id, me).first();
     if (!row) return reply(env, 404, { error: "not found" });
-    if ((row.status || "issued") === "redeemed") return reply(env, 400, { error: "This one is already redeemed." });
+    if (incStatus(row) === "redeemed") return reply(env, 400, { error: "This one is already redeemed." });
+    if (incStatus(row) === "expired") return reply(env, 400, { error: "This one has expired." });
     const data = String(body.data || "");
     if (!/^data:(image\/[a-z+.-]+|application\/pdf);base64,/i.test(data) || data.length > 1800000) return reply(env, 400, { error: "That file is too big or not a picture or PDF." });
     await env.DB.prepare("UPDATE incentives SET receipt = ?, receipt_at = datetime('now'), status = 'processing' WHERE id = ?").bind(data, id).run();
@@ -6219,17 +6222,18 @@ async function incentivesRoutes(request, env, user, url) {
   }
   if (url.pathname !== "/api/incentives") return null;
   if (request.method === "GET") {
-    const rows = await env.DB.prepare("SELECT id, to_name, to_email, kind, note, design, status, (receipt IS NOT NULL AND receipt != '') AS has_receipt, at FROM incentives ORDER BY at DESC LIMIT 100").all();
-    return reply(env, 200, { ok: true, kinds: INCENTIVE_KINDS, items: (rows.results || []).map((r) => ({ id: r.id, name: r.to_name, email: r.to_email, kind: r.kind, note: r.note, design: r.design || "feast", status: r.status || "issued", receipt: !!r.has_receipt, at: r.at })) });
+    const rows = await env.DB.prepare("SELECT id, to_name, to_email, kind, note, design, status, amount, (receipt IS NOT NULL AND receipt != '') AS has_receipt, at FROM incentives ORDER BY at DESC LIMIT 100").all();
+    return reply(env, 200, { ok: true, kinds: INCENTIVE_KINDS, items: (rows.results || []).map((r) => ({ id: r.id, name: r.to_name, email: r.to_email, kind: r.kind, note: r.note, design: r.design || "feast", status: incStatus(r), amount: r.amount || 0, receipt: !!r.has_receipt, at: r.at })) });
   }
   const name = String(body.name || "").replace(/\s+/g, " ").trim().slice(0, 80);
   const kind = INCENTIVE_KINDS.find((k) => k === String(body.kind || ""));
   const note = String(body.note || "").trim().slice(0, 1000);
-  const design = ["feast", "icons"].includes(String(body.design || "")) ? String(body.design) : "feast";
+  const amount = Math.max(0, Math.min(9999, parseInt(body.amount, 10) || 0));
+  const design = ["feast", "geelong", "legend", "icons", "feckyeah"].includes(String(body.design || "")) ? String(body.design) : "feast";
   if (!name || !kind || !note) return reply(env, 400, { error: "Choose a person and an incentive, and say why." });
   const id = crypto.randomUUID();
   const to = String(body.email || "").toLowerCase().slice(0, 120);
-  await env.DB.prepare("INSERT INTO incentives (id, to_name, to_email, kind, note, by_name, design, status, at) VALUES (?, ?, ?, ?, ?, ?, ?, 'issued', datetime('now'))").bind(id, name, to, kind, note, String(user.name || ""), design).run();
+  await env.DB.prepare("INSERT INTO incentives (id, to_name, to_email, kind, note, by_name, design, status, amount, at) VALUES (?, ?, ?, ?, ?, ?, ?, 'issued', ?, datetime('now'))").bind(id, name, to, kind, note, String(user.name || ""), design, amount).run();
   if (to) await notify(env, { to, kind: "incentive", title: "New incentive awarded", body: `${first(user.name)} has given you a ${kind.toLowerCase()}.`, link: "myincentives", by: String(user.name || "Reservoir") });
   return reply(env, 200, { ok: true, id });
 }
