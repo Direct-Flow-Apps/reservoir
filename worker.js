@@ -6045,7 +6045,7 @@ async function noticesTable(env) {
   }
 }
 // Push notifications. Which kinds of notice also go to people's phones is decided here, once. Anything marked todo (someone has to act) also pushes. To change what pushes, change this list.
-const PUSH_KINDS = ["timesheet", "payroll", "cardreset", "card", "request", "policy", "dailyops", "mail", "incident"];
+const PUSH_KINDS = ["timesheet", "payroll", "cardreset", "card", "request", "policy", "dailyops", "mail", "incident", "incentive"];
 const b64uEnc = (buf) => { const u = new Uint8Array(buf); let s = ""; for (let i = 0; i < u.length; i++) s += String.fromCharCode(u[i]); return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, ""); };
 const b64uDec = (str) => { const s = String(str || "").replace(/-/g, "+").replace(/_/g, "/"); const bin = atob(s + "=".repeat((4 - (s.length % 4)) % 4)); const u = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i); return u; };
 const concatBytes = (...parts) => { const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0)); let o = 0; for (const p of parts) { out.set(p, o); o += p.length; } return out; };
@@ -6202,7 +6202,7 @@ async function incentivesRoutes(request, env, user, url) {
     const data = String(body.data || "");
     if (!/^data:(image\/[a-z+.-]+|application\/pdf);base64,/i.test(data) || data.length > 1800000) return reply(env, 400, { error: "That file is too big or not a picture or PDF." });
     await env.DB.prepare("UPDATE incentives SET receipt = ?, receipt_at = datetime('now'), status = 'processing' WHERE id = ?").bind(data, id).run();
-    await notify(env, { to: "tayler@directflow.com.au", kind: "info", title: "Incentive receipt in", body: `${first(row.to_name)} has processed their ${String(row.kind || "").toLowerCase()}. Check the receipt and reimburse it.`, link: "incentives", by: "Reservoir" });
+    await notify(env, { to: "tayler@directflow.com.au", kind: "incentive", title: "Incentive receipt in", body: `${first(row.to_name)} has processed their ${String(row.kind || "").toLowerCase()}. Check the receipt and reimburse it.`, link: "incentives", by: "Reservoir" });
     return reply(env, 200, { ok: true });
   }
   if (!isT1) return reply(env, 403, { error: "forbidden" });
@@ -6214,7 +6214,7 @@ async function incentivesRoutes(request, env, user, url) {
     const row = await env.DB.prepare("SELECT * FROM incentives WHERE id = ?").bind(String(body.id || "")).first();
     if (!row) return reply(env, 404, { error: "not found" });
     await env.DB.prepare("UPDATE incentives SET status = 'redeemed', redeemed_at = datetime('now') WHERE id = ?").bind(row.id).run();
-    if (row.to_email) await notify(env, { to: String(row.to_email).toLowerCase(), kind: "info", title: "Incentive reimbursed", body: `Your ${String(row.kind || "").toLowerCase()} has been reimbursed.`, link: "myincentives", by: "Reservoir" });
+    if (row.to_email) await notify(env, { to: String(row.to_email).toLowerCase(), kind: "incentive", title: "Incentive reimbursed", body: `Your ${String(row.kind || "").toLowerCase()} has been reimbursed.`, link: "myincentives", by: "Reservoir" });
     return reply(env, 200, { ok: true });
   }
   if (url.pathname !== "/api/incentives") return null;
@@ -6230,7 +6230,7 @@ async function incentivesRoutes(request, env, user, url) {
   const id = crypto.randomUUID();
   const to = String(body.email || "").toLowerCase().slice(0, 120);
   await env.DB.prepare("INSERT INTO incentives (id, to_name, to_email, kind, note, by_name, design, status, at) VALUES (?, ?, ?, ?, ?, ?, ?, 'issued', datetime('now'))").bind(id, name, to, kind, note, String(user.name || ""), design).run();
-  if (to) await notify(env, { to, kind: "info", title: "New incentive awarded", body: `${first(user.name)} has given you a ${kind.toLowerCase()}.`, link: "myincentives", by: String(user.name || "Reservoir") });
+  if (to) await notify(env, { to, kind: "incentive", title: "New incentive awarded", body: `${first(user.name)} has given you a ${kind.toLowerCase()}.`, link: "myincentives", by: String(user.name || "Reservoir") });
   return reply(env, 200, { ok: true, id });
 }
 async function pushRoutes(request, env, user, url) {
