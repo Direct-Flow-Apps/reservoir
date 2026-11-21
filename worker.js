@@ -3850,12 +3850,12 @@ const INVOICE_MAIL_RULES = [
 ];
 const MAILBOXES = [
   { id: "jobs", label: "DFP Jobs", address: "dfpjobs@directflow.com.au", tiers: ["T1", "T2"] },
-  { id: "maintenance", label: "Maintenance", address: "maintenance@directflow.com.au", tiers: ["T1", "T2"] },
+  { id: "maintenance", label: "Maintenance", address: "maintenance@directflow.com.au", tiers: ["T1", "T2"], who: ["tayler@directflow.com.au"] },
   { id: "accounts", label: "Accounts", address: "accounts@directflow.com.au", tiers: ["T1"] },
   { id: "tayler", label: "Tayler", address: "tayler@directflow.com.au", only: ["tayler@directflow.com.au"] }
 ];
 const mailAddress = (env, b) => String((env && env["MAILBOX_" + b.id.toUpperCase()]) || b.address).toLowerCase();
-const mailAllowed = (b, user) => b.only ? (b.only.includes(String(user.email || "").toLowerCase()) || (b.id === "tayler" && user.tier === "T1" && (/^tayler/i.test(String(user.email || "")) || /^tayler\b/i.test(String(user.name || ""))))) : b.tiers.includes(user.tier);
+const mailAllowed = (b, user) => b.who && !(b.who.includes(String(user.email || "").toLowerCase()) || (user.tier === "T1" && /^tayler/i.test(String(user.email || "")))) ? false : b.only ? (b.only.includes(String(user.email || "").toLowerCase()) || (b.id === "tayler" && user.tier === "T1" && (/^tayler/i.test(String(user.email || "")) || /^tayler\b/i.test(String(user.name || ""))))) : b.tiers.includes(user.tier);
 const mxAddr = (a) => a ? [a.street, a.city, a.state, a.postalCode].filter(Boolean).join(", ").slice(0, 160) : "";
 // Client logos: a SharePoint folder (Reservoir site, beside Workplace Culture and Fleet Management) where each file is named for the web address it stands for, such as vestbuild.com.au.png.
 const LOGO_HOMES = [["Branding & Marketing", "Client Logos"], ["Reservoir", "Branding & Marketing", "Client Logos"]];
@@ -4364,9 +4364,9 @@ async function mailRoutes(request, env, user, url) {
     if (url.pathname === "/api/mail/boxes" && !post) {
       const out = await Promise.all(mine.map(async (b) => {
         const r = await mailGraph(env, mailAddress(env, b), "/mailFolders/inbox?$select=unreadItemCount,totalItemCount");
-        return { id: b.id, label: b.label, address: mailAddress(env, b), personal: !!b.only, unread: r.ok && r.json ? Number(r.json.unreadItemCount || 0) : 0, total: r.ok && r.json ? Number(r.json.totalItemCount || 0) : 0, error: r.ok ? "" : mailWhy(r) };
+        return { id: b.id, label: b.label, address: mailAddress(env, b), personal: !!b.only, reservoirOnly: !!b.who, unread: r.ok && r.json ? Number(r.json.unreadItemCount || 0) : 0, total: r.ok && r.json ? Number(r.json.totalItemCount || 0) : 0, error: r.ok ? "" : mailWhy(r) };
       }));
-      return reply(env, 200, { boxes: out, targets: MAILBOXES.filter((x) => !x.only || mailAllowed(x, user)).map((x) => ({ id: x.id, label: x.label })), worker: WORKER_BUILD });
+      return reply(env, 200, { boxes: out, targets: MAILBOXES.filter((x) => ((!x.only && !x.who) || mailAllowed(x, user))).map((x) => ({ id: x.id, label: x.label })), worker: WORKER_BUILD });
     }
     if (url.pathname === "/api/mail/copystatus" && !post) {
       // Progress of the Sent Items and Archive copy from maintenance into DFP Jobs: the total in Maintenance and how many the copy job has transferred.
@@ -4684,7 +4684,7 @@ async function mailRoutes(request, env, user, url) {
         return mv.ok ? reply(env, 200, { ok: true, newId: String((mv.json && mv.json.id) || ""), worker: WORKER_BUILD }) : done(mv);
       }
       if (act === "moveto" && msg) {
-        const tb = MAILBOXES.find((x) => x.id === String(body.target || "") && (!x.only || mailAllowed(x, user)));
+        const tb = MAILBOXES.find((x) => x.id === String(body.target || "") && ((!x.only && !x.who) || mailAllowed(x, user)));
         if (!tb || tb.id === box.id) return reply(env, 200, { ok: false, error: "Choose another mailbox to move it to.", worker: WORKER_BUILD });
         const src = await graphFetch(env, `/users/${encodeURIComponent(addr)}/messages/${encodeURIComponent(msg)}/$value`);
         if (!src.ok) return reply(env, 200, { ok: false, error: "The email could not be read to move it. Microsoft answered " + src.status + ".", worker: WORKER_BUILD });
@@ -4703,7 +4703,7 @@ async function mailRoutes(request, env, user, url) {
         let cAddr = box.only ? mailAddress(env, MAILBOXES.find((x) => !x.only && mailAllowed(x, user)) || box) : addr, cid = "";
         const ref = String(body.cid || "");
         if (ref) {
-          const i = ref.indexOf(":"), ob = MAILBOXES.find((x) => x.id === ref.slice(0, i) && (!x.only || mailAllowed(x, user)));
+          const i = ref.indexOf(":"), ob = MAILBOXES.find((x) => x.id === ref.slice(0, i) && ((!x.only && !x.who) || mailAllowed(x, user)));
           if (i < 1 || !ob) return reply(env, 200, { ok: false, error: "That contact could not be found.", worker: WORKER_BUILD });
           cAddr = mailAddress(env, ob); cid = ref.slice(i + 1);
         }
@@ -4722,7 +4722,7 @@ async function mailRoutes(request, env, user, url) {
         return reply(env, 200, { ok: true, contact: { id: (cid ? ref.slice(0, ref.indexOf(":")) : (box.only ? (MAILBOXES.find((x) => !x.only && mailAllowed(x, user)) || box).id : box.id)) + ":" + String((sv.json && sv.json.id) || cid), name: data.displayName, company: data.companyName, emails: em ? [em] : [], phone: ph, address: String(body.address || "").trim().slice(0, 160) }, worker: WORKER_BUILD });
       }
       if (act === "contactphoto") {
-        const ref = String(body.cid || ""), i = ref.indexOf(":"), ob = MAILBOXES.find((x) => x.id === ref.slice(0, i) && (!x.only || mailAllowed(x, user)));
+        const ref = String(body.cid || ""), i = ref.indexOf(":"), ob = MAILBOXES.find((x) => x.id === ref.slice(0, i) && ((!x.only && !x.who) || mailAllowed(x, user)));
         if (i < 1 || !ob) return reply(env, 200, { ok: false, error: "That contact could not be found.", worker: WORKER_BUILD });
         const b64 = String(body.data || "").replace(/^data:[^,]*,/, "");
         if (!b64 || b64.length > 700000) return reply(env, 200, { ok: false, error: "That photo is too big.", worker: WORKER_BUILD });
