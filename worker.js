@@ -6166,7 +6166,7 @@ async function pushForNotice(env, n, id) {
     const hasWeir = rows.some((r) => r.app === "mail");
     // A device can mute single mailboxes (mail_off holds their ids, comma separated). Only new mail alerts carry a mailbox id.
     const muted = (r) => !!n.box && String(r.mail_off || "").split(",").includes(String(n.box));
-    const sendTo = String(n.kind || "") === "mail" ? (hasWeir ? rows.filter((r) => r.app === "mail" && r.mail_on !== 0 && !muted(r)) : rows.filter((r) => r.mail_on !== 0 && !muted(r))) : rows;
+    const sendTo = String(n.kind || "") === "mail" ? (hasWeir ? rows.filter((r) => r.app === "mail" && r.mail_on !== 0 && !muted(r)) : rows.filter((r) => r.mail_on !== 0 && !muted(r))) : rows.filter((r) => r.app !== "mail");
     if (!sendTo.length) return;
     const payload = { title: String(n.title || "Reservoir").slice(0, 120), body: n.kind === "request" ? String(n.body || "Open Reservoir to read it").slice(0, 160) : n.kind === "mail" ? (n.preview ? String(n.body || "").slice(0, 160) : "") : "Open Reservoir to read it", tag: `n-${id || Date.now()}`, open: /^[a-z]+$/.test(String(n.link || "")) ? String(n.link) : "notices" };
     await Promise.allSettled(sendTo.map(async (r) => {
