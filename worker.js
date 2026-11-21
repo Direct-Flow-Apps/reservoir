@@ -6180,23 +6180,57 @@ async function pushForNotice(env, n, id) {
 const INCENTIVE_KINDS = ["Lunch", "Voucher"];
 async function incentivesTable(env) {
   await env.DB.prepare("CREATE TABLE IF NOT EXISTS incentives (id TEXT PRIMARY KEY, to_name TEXT, to_email TEXT, kind TEXT, note TEXT, by_name TEXT, at TEXT)").run();
+  for (const c of ["design TEXT", "status TEXT", "receipt TEXT", "receipt_at TEXT", "redeemed_at TEXT"]) { try { await env.DB.prepare("ALTER TABLE incentives ADD COLUMN " + c).run(); } catch (e) {} }
 }
 async function incentivesRoutes(request, env, user, url) {
-  if (url.pathname !== "/api/incentives") return null;
-  if (user.tier !== "T1") return reply(env, 403, { error: "forbidden" });
+  if (!url.pathname.startsWith("/api/incentives")) return null;
   await incentivesTable(env);
-  if (request.method === "GET") {
-    const rows = await env.DB.prepare("SELECT id, to_name, to_email, kind, note, at FROM incentives ORDER BY at DESC LIMIT 100").all();
-    return reply(env, 200, { ok: true, kinds: INCENTIVE_KINDS, items: (rows.results || []).map((r) => ({ id: r.id, name: r.to_name, email: r.to_email, kind: r.kind, note: r.note, at: r.at })) });
-  }
+  const me = String(user.email || "").toLowerCase();
+  const isT1 = user.tier === "T1";
+  const first = (n) => String(n || "").split(" ")[0];
   let body = {};
-  try { body = await request.json(); } catch (e) { body = {}; }
+  if (request.method === "POST") { try { body = await request.json(); } catch (e) { body = {}; } }
+  if (url.pathname === "/api/incentives/mine" && request.method === "GET") {
+    const rows = await env.DB.prepare("SELECT id, to_name, kind, note, by_name, design, status, at FROM incentives WHERE lower(to_email) = ? ORDER BY at DESC LIMIT 50").bind(me).all();
+    return reply(env, 200, { ok: true, items: (rows.results || []).map((r) => ({ id: r.id, name: r.to_name, kind: r.kind, note: r.note, from: r.by_name, design: r.design || "feast", status: r.status || "issued", at: r.at })) });
+  }
+  if (url.pathname === "/api/incentives/receipt" && request.method === "POST") {
+    const id = String(body.id || "");
+    const row = await env.DB.prepare("SELECT * FROM incentives WHERE id = ? AND lower(to_email) = ?").bind(id, me).first();
+    if (!row) return reply(env, 404, { error: "not found" });
+    if ((row.status || "issued") === "redeemed") return reply(env, 400, { error: "This one is already redeemed." });
+    const data = String(body.data || "");
+    if (!/^data:(image\/[a-z+.-]+|application\/pdf);base64,/i.test(data) || data.length > 1800000) return reply(env, 400, { error: "That file is too big or not a picture or PDF." });
+    await env.DB.prepare("UPDATE incentives SET receipt = ?, receipt_at = datetime('now'), status = 'processing' WHERE id = ?").bind(data, id).run();
+    await notify(env, { to: "tayler@directflow.com.au", kind: "info", title: "Incentive receipt in", body: `${first(row.to_name)} has processed their ${String(row.kind || "").toLowerCase()}. Check the receipt and reimburse it.`, link: "incentives", by: "Reservoir" });
+    return reply(env, 200, { ok: true });
+  }
+  if (!isT1) return reply(env, 403, { error: "forbidden" });
+  if (url.pathname === "/api/incentives/receiptview" && request.method === "GET") {
+    const row = await env.DB.prepare("SELECT receipt FROM incentives WHERE id = ?").bind(String(url.searchParams.get("id") || "")).first();
+    return reply(env, 200, { ok: !!(row && row.receipt), data: row ? row.receipt || "" : "" });
+  }
+  if (url.pathname === "/api/incentives/redeem" && request.method === "POST") {
+    const row = await env.DB.prepare("SELECT * FROM incentives WHERE id = ?").bind(String(body.id || "")).first();
+    if (!row) return reply(env, 404, { error: "not found" });
+    await env.DB.prepare("UPDATE incentives SET status = 'redeemed', redeemed_at = datetime('now') WHERE id = ?").bind(row.id).run();
+    if (row.to_email) await notify(env, { to: String(row.to_email).toLowerCase(), kind: "info", title: "Incentive reimbursed", body: `Your ${String(row.kind || "").toLowerCase()} has been reimbursed.`, link: "myincentives", by: "Reservoir" });
+    return reply(env, 200, { ok: true });
+  }
+  if (url.pathname !== "/api/incentives") return null;
+  if (request.method === "GET") {
+    const rows = await env.DB.prepare("SELECT id, to_name, to_email, kind, note, design, status, (receipt IS NOT NULL AND receipt != '') AS has_receipt, at FROM incentives ORDER BY at DESC LIMIT 100").all();
+    return reply(env, 200, { ok: true, kinds: INCENTIVE_KINDS, items: (rows.results || []).map((r) => ({ id: r.id, name: r.to_name, email: r.to_email, kind: r.kind, note: r.note, design: r.design || "feast", status: r.status || "issued", receipt: !!r.has_receipt, at: r.at })) });
+  }
   const name = String(body.name || "").replace(/\s+/g, " ").trim().slice(0, 80);
   const kind = INCENTIVE_KINDS.find((k) => k === String(body.kind || ""));
   const note = String(body.note || "").trim().slice(0, 1000);
+  const design = ["feast", "icons"].includes(String(body.design || "")) ? String(body.design) : "feast";
   if (!name || !kind || !note) return reply(env, 400, { error: "Choose a person and an incentive, and say why." });
   const id = crypto.randomUUID();
-  await env.DB.prepare("INSERT INTO incentives (id, to_name, to_email, kind, note, by_name, at) VALUES (?, ?, ?, ?, ?, ?, datetime('now'))").bind(id, name, String(body.email || "").toLowerCase().slice(0, 120), kind, note, String(user.name || "")).run();
+  const to = String(body.email || "").toLowerCase().slice(0, 120);
+  await env.DB.prepare("INSERT INTO incentives (id, to_name, to_email, kind, note, by_name, design, status, at) VALUES (?, ?, ?, ?, ?, ?, ?, 'issued', datetime('now'))").bind(id, name, to, kind, note, String(user.name || ""), design).run();
+  if (to) await notify(env, { to, kind: "info", title: "New incentive awarded", body: `${first(user.name)} has given you a ${kind.toLowerCase()}.`, link: "myincentives", by: String(user.name || "Reservoir") });
   return reply(env, 200, { ok: true, id });
 }
 async function pushRoutes(request, env, user, url) {
