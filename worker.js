@@ -6183,6 +6183,16 @@ const incStatus = (r) => { const st = r.status || "issued"; if (st !== "issued")
 async function incentivesTable(env) {
   await env.DB.prepare("CREATE TABLE IF NOT EXISTS incentives (id TEXT PRIMARY KEY, to_name TEXT, to_email TEXT, kind TEXT, note TEXT, by_name TEXT, at TEXT)").run();
   for (const c of ["design TEXT", "status TEXT", "receipt TEXT", "receipt_at TEXT", "redeemed_at TEXT", "amount INTEGER"]) { try { await env.DB.prepare("ALTER TABLE incentives ADD COLUMN " + c).run(); } catch (e) {} }
+  // One time clean out of the test incentives (21.11.2026), so the first real ones start from nothing. It runs once and then leaves a flag.
+  try {
+    await env.DB.prepare("CREATE TABLE IF NOT EXISTS app_flags (k TEXT PRIMARY KEY, at TEXT)").run();
+    const done = await env.DB.prepare("SELECT k FROM app_flags WHERE k = 'incentives_wipe_20261121'").first();
+    if (!done) {
+      await env.DB.prepare("DELETE FROM incentives").run();
+      try { await env.DB.prepare("DELETE FROM receipt_records WHERE id LIKE 'inc-%'").run(); } catch (e) {}
+      await env.DB.prepare("INSERT OR IGNORE INTO app_flags (k, at) VALUES ('incentives_wipe_20261121', datetime('now'))").run();
+    }
+  } catch (e) {}
 }
 async function incentivesRoutes(request, env, user, url) {
   if (!url.pathname.startsWith("/api/incentives")) return null;
@@ -6202,6 +6212,11 @@ async function incentivesRoutes(request, env, user, url) {
     if (!row) return reply(env, 404, { error: "not found" });
     if (incStatus(row) === "redeemed") return reply(env, 400, { error: "This one is already redeemed." });
     if (incStatus(row) === "expired") return reply(env, 400, { error: "This one has expired." });
+    if (body.linked) {
+      await env.DB.prepare("UPDATE incentives SET receipt_at = datetime('now'), status = 'processing' WHERE id = ?").bind(id).run();
+      await notify(env, { to: "tayler@directflow.com.au", kind: "incentive", title: "Incentive reimbursement in", body: `${first(row.to_name)} has sent a reimbursement for their ${String(row.kind || "").toLowerCase()}. Open Receipts to process it.`, link: "financereceipts", by: String(row.to_name || "Reservoir") });
+      return reply(env, 200, { ok: true });
+    }
     const data = String(body.data || "");
     if (!/^data:(image\/[a-z+.-]+|application\/pdf);base64,/i.test(data) || data.length > 1800000) return reply(env, 400, { error: "That file is too big or not a picture or PDF." });
     await env.DB.prepare("UPDATE incentives SET receipt = ?, receipt_at = datetime('now'), status = 'processing' WHERE id = ?").bind(data, id).run();
@@ -10031,6 +10046,13 @@ export default {
         if (!["paid", "declined"].includes(body.status)) return reply(env, 400, { error: "bad status" });
         const date = /^\d{4}-\d{2}-\d{2}$/.test(String(body.date || "")) ? body.date : today;
         await env.DB.prepare("UPDATE receipt_records SET status = ?, done_date = ? WHERE id = ?").bind(body.status, date, rrm[1]).run();
+        if (/^inc-[A-Za-z0-9_-]{8,64}$/.test(rrm[1])) {
+          const incId = rrm[1].slice(4);
+          try {
+            if (body.status === "paid") await env.DB.prepare("UPDATE incentives SET status = 'redeemed', redeemed_at = datetime('now') WHERE id = ?").bind(incId).run();
+            else await env.DB.prepare("UPDATE incentives SET status = 'issued' WHERE id = ? AND status = 'processing'").bind(incId).run();
+          } catch (e) { /* the receipt still moves on */ }
+        }
         // The person being reimbursed is told it is processed, even when the director who processed it is the one who logged it.
         {
           const rr = await env.DB.prepare("SELECT by_email, type FROM receipt_records WHERE id = ?").bind(rrm[1]).first();
