@@ -6192,6 +6192,13 @@ async function incentivesTable(env) {
       try { await env.DB.prepare("DELETE FROM receipt_records WHERE id LIKE 'inc-%'").run(); } catch (e) {}
       await env.DB.prepare("INSERT OR IGNORE INTO app_flags (k, at) VALUES ('incentives_wipe_20261121', datetime('now'))").run();
     }
+    // Second clean out (21.11.2026 evening): the last test incentive and its receipt record.
+    const done2 = await env.DB.prepare("SELECT k FROM app_flags WHERE k = 'incentives_wipe_20261121b'").first();
+    if (!done2) {
+      await env.DB.prepare("DELETE FROM incentives").run();
+      try { await env.DB.prepare("DELETE FROM receipt_records WHERE id LIKE 'inc-%'").run(); } catch (e) {}
+      await env.DB.prepare("INSERT OR IGNORE INTO app_flags (k, at) VALUES ('incentives_wipe_20261121b', datetime('now'))").run();
+    }
   } catch (e) {}
 }
 async function incentivesRoutes(request, env, user, url) {
