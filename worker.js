@@ -337,11 +337,11 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
   await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
 }
 
-const WORKER_BUILD = "Reservoir-Worker-2026.11.23-w275";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.23-w276";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
-const XERO_SCOPES_DEFAULT = "offline_access accounting.contacts accounting.settings accounting.invoices payroll.employees payroll.settings payroll.payruns payroll.payslip payroll.timesheets accounting.attachments";
+const XERO_SCOPES_DEFAULT = "offline_access accounting.contacts accounting.settings accounting.invoices accounting.payments payroll.employees payroll.settings payroll.payruns payroll.payslip payroll.timesheets accounting.attachments";
 const xeroId = (env) => env.XERO_CLIENT_ID || XERO_CLIENT_ID_DEFAULT;
 const xeroRedirect = (env) => env.XERO_REDIRECT || XERO_REDIRECT_DEFAULT;
 const b64enc = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
