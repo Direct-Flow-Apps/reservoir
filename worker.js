@@ -337,7 +337,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
   await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
 }
 
-const WORKER_BUILD = "Reservoir-Worker-2026.11.22-w268";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.22-w269";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -3882,7 +3882,7 @@ async function logoLookup(env, email, probe) {
     logoIndex = { at: Date.now(), map };
   }
   const parts = dom.toLowerCase().split(".");
-  let id = "";
+  let id = logoIndex.map.get(String(email).toLowerCase().trim()) || "";
   for (let i = 0; i < parts.length - 1 && !id; i++) { const k = parts.slice(i).join("."); if (logoIndex.map.has(k)) id = logoIndex.map.get(k); }
   if (!id) { const stem = parts.length > 2 && /^(com|net|org|co|gov|edu)$/.test(parts[parts.length - 2]) ? parts[parts.length - 3] : parts[parts.length - 2]; for (const [name, v] of logoIndex.map) if (name.split(".")[0] === stem) { id = v; break; } if (!id && stem && stem.length >= 4) { const nz = (x) => String(x).toLowerCase().replace(/[^a-z0-9]/g, ""); const st = nz(stem); for (const [name, v] of logoIndex.map) { const n = nz(name.replace(/\.(com|net|org|co|au|nz|gov|edu)\b/g, "")); if (n && (n === st || n.startsWith(st) || (n.length >= 4 && st.startsWith(n)))) { id = v; break; } } } }
   if (!id) return null;
@@ -4784,9 +4784,10 @@ async function mailRoutes(request, env, user, url) {
         const em = String(body.email || "").trim().toLowerCase();
         const dom = em.split("@")[1] || "";
         if (!dom || !/^[a-z0-9.-]+$/.test(dom)) return reply(env, 200, { ok: false, error: "That email address does not look right.", worker: WORKER_BUILD });
-        if (/^(gmail|googlemail|outlook|hotmail|live|msn|yahoo|ymail|icloud|me|bigpond|optusnet|tpg|iinet|internode|aapt|westnet|dodo|telstra)\./.test(dom)) return reply(env, 200, { ok: false, error: "That is a free email service, so one logo would land on everyone using it.", worker: WORKER_BUILD });
+        const freeMail = /^(gmail|googlemail|outlook|hotmail|live|msn|yahoo|ymail|icloud|me|bigpond|optusnet|tpg|iinet|internode|aapt|westnet|dodo|telstra)\./.test(dom);
         const dp = dom.split(".");
-        const base = dp.length > 2 && /^(com|net|org|co|gov|edu|asn|id)$/.test(dp[dp.length - 2]) ? dp.slice(-3).join(".") : dp.slice(-2).join(".");
+        // A free email service (gmail, live and the like) is shared by everyone, so its logo is filed against the exact address. Any other sender is filed against the web address.
+        const base = freeMail ? em : dp.length > 2 && /^(com|net|org|co|gov|edu|asn|id)$/.test(dp[dp.length - 2]) ? dp.slice(-3).join(".") : dp.slice(-2).join(".");
         const b64 = String(body.data || "").replace(/^data:[^,]*,/, "");
         if (!b64 || b64.length > 700000) return reply(env, 200, { ok: false, error: "That logo is too big.", worker: WORKER_BUILD });
         const bin = atob(b64), bytes = new Uint8Array(bin.length);
