@@ -337,7 +337,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
   await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
 }
 
-const WORKER_BUILD = "Reservoir-Worker-2026.11.22-w267";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.22-w268";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -4731,6 +4731,20 @@ async function mailRoutes(request, env, user, url) {
         for (let k = 0; k < bin.length; k++) bytes[k] = bin.charCodeAt(k);
         const up = await graphFetch(env, `/users/${encodeURIComponent(mailAddress(env, ob))}/contacts/${encodeURIComponent(ref.slice(i + 1))}/photo/$value`, { method: "PUT", headers: { "Content-Type": "image/jpeg" }, body: bytes });
         return up.ok ? reply(env, 200, { ok: true, worker: WORKER_BUILD }) : reply(env, 200, { ok: false, error: "Microsoft did not take the photo. It answered " + up.status + ".", worker: WORKER_BUILD });
+      }
+      if (act === "avatarsave") {
+        const isT = user.tier === "T1" && (/^tayler/i.test(String(user.email || "")) || /^tayler\b/i.test(String(user.name || "")));
+        if (!isT) return reply(env, 200, { ok: false, error: "Only Tayler can add logos.", worker: WORKER_BUILD });
+        const nm = String(body.name || "").replace(/\.png$/i, "").replace(/[^A-Za-z0-9 &._-]/g, " ").replace(/\s+/g, " ").trim().slice(0, 40);
+        if (!nm) return reply(env, 200, { ok: false, error: "That file name does not look right.", worker: WORKER_BUILD });
+        const b64 = String(body.data || "").replace(/^data:[^,]*,/, "");
+        if (!b64 || b64.length > 400000) return reply(env, 200, { ok: false, error: "That logo is too big.", worker: WORKER_BUILD });
+        const bin = atob(b64), bytes = new Uint8Array(bin.length);
+        for (let k = 0; k < bin.length; k++) bytes[k] = bin.charCodeAt(k);
+        try { await uploadToSharePoint(env, ["Branding & Marketing", "Client Logos Avatars"], nm + ".png", bytes, "image/png", true); }
+        catch (e) { return reply(env, 200, { ok: false, error: "The Client Logos Avatars folder did not take it.", worker: WORKER_BUILD }); }
+        avatarCache = { at: 0, items: null };
+        return reply(env, 200, { ok: true, worker: WORKER_BUILD });
       }
       if (act === "avataropts") {
         const isT = user.tier === "T1" && (/^tayler/i.test(String(user.email || "")) || /^tayler\b/i.test(String(user.name || "")));
