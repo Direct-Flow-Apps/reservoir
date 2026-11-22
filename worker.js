@@ -337,7 +337,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
   await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
 }
 
-const WORKER_BUILD = "Reservoir-Worker-2026.11.22-w270";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.22-w271";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -4622,6 +4622,8 @@ async function mailRoutes(request, env, user, url) {
         const res = await graphFetch(env, `/users/${owner}/contacts/${encodeURIComponent(cid)}/photo/$value`);
         if (res.ok) return new Response(res.body, { status: 200, headers: { ...cors(env), "Content-Type": res.headers.get("Content-Type") || "image/jpeg", "Cache-Control": "private, max-age=3600" } });
       }
+      // A mail system address (no reply, or a Xero sending address) never gets a logo from the folder, only a real contact photo.
+      if (/^(no-?reply|do-?not-?reply|donotreply|mailer-daemon|postmaster)/i.test(em.split("@")[0]) || /(^|\.)xero\.com$/.test(em.split("@")[1] || "")) return new Response(null, { status: 404, headers: { ...cors(env), "Cache-Control": "no-store" } });
       try { const lg = await logoLookup(env, em); if (lg) {
         return new Response(lg.body, { status: 200, headers: { ...cors(env), "Content-Type": lg.headers.get("Content-Type") || "image/png", "Cache-Control": "private, max-age=3600" } }); } } catch (e) {}
       return new Response(null, { status: 404, headers: cors(env) });
