@@ -337,7 +337,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
   await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
 }
 
-const WORKER_BUILD = "Reservoir-Worker-2026.11.20-w266";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.22-w267";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -3860,6 +3860,7 @@ const mxAddr = (a) => a ? [a.street, a.city, a.state, a.postalCode].filter(Boole
 // Client logos: a SharePoint folder (Reservoir site, beside Workplace Culture and Fleet Management) where each file is named for the web address it stands for, such as vestbuild.com.au.png.
 const LOGO_HOMES = [["Branding & Marketing", "Client Logos"], ["Reservoir", "Branding & Marketing", "Client Logos"]];
 let logoIndex = { at: 0, map: null };
+let avatarCache = { at: 0, items: null };
 async function logoLookup(env, email, probe) {
   const dom = String(email || "").split("@")[1] || "";
   if (!dom) return null;
@@ -4730,6 +4731,24 @@ async function mailRoutes(request, env, user, url) {
         for (let k = 0; k < bin.length; k++) bytes[k] = bin.charCodeAt(k);
         const up = await graphFetch(env, `/users/${encodeURIComponent(mailAddress(env, ob))}/contacts/${encodeURIComponent(ref.slice(i + 1))}/photo/$value`, { method: "PUT", headers: { "Content-Type": "image/jpeg" }, body: bytes });
         return up.ok ? reply(env, 200, { ok: true, worker: WORKER_BUILD }) : reply(env, 200, { ok: false, error: "Microsoft did not take the photo. It answered " + up.status + ".", worker: WORKER_BUILD });
+      }
+      if (act === "avataropts") {
+        const isT = user.tier === "T1" && (/^tayler/i.test(String(user.email || "")) || /^tayler\b/i.test(String(user.name || "")));
+        if (!isT) return reply(env, 200, { ok: false, error: "Only Tayler can pick logos.", worker: WORKER_BUILD });
+        if (avatarCache.items && Date.now() - avatarCache.at < 600000) return reply(env, 200, { ok: true, items: avatarCache.items, worker: WORKER_BUILD });
+        const base = ["Branding & Marketing", "Client Logos Avatars"];
+        const lr = await graphFetch(env, `/sites/${siteId(env)}/drive/root:/${pathOf(base)}:/children?$top=999&$select=id,name,file`);
+        if (!lr.ok) return reply(env, 200, { ok: false, error: "The Client Logos Avatars folder could not be read.", worker: WORKER_BUILD });
+        const files = ((await lr.json()).value || []).filter((it) => it.file && /\.png$/i.test(it.name || "")).sort((a, b) => String(a.name).localeCompare(String(b.name), "en", { sensitivity: "base" }));
+        const items = [];
+        for (let i = 0; i < files.length; i += 8) {
+          const got = await Promise.all(files.slice(i, i + 8).map(async (it) => {
+            try { const r = await graphFetch(env, `/sites/${siteId(env)}/drive/items/${encodeURIComponent(it.id)}/content`); if (!r.ok) return null; const buf = await r.arrayBuffer(); if (buf.byteLength > 200000) return null; return { name: String(it.name).replace(/\.png$/i, ""), data: `data:image/png;base64,${toB64(buf)}` }; } catch (e) { return null; }
+          }));
+          for (const g of got) if (g) items.push(g);
+        }
+        avatarCache = { at: Date.now(), items };
+        return reply(env, 200, { ok: true, items, worker: WORKER_BUILD });
       }
       if (act === "imgproxy" || act === "logosave") {
         // Logo picking is Tayler's tool. imgproxy lets the page read a signature picture that sits on someone else's server; logosave files the chosen picture in the Client Logos folder.
