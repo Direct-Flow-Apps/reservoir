@@ -337,7 +337,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
   await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
 }
 
-const WORKER_BUILD = "Reservoir-Worker-2026.11.23-w274";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.23-w275";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -4814,9 +4814,10 @@ async function mailRoutes(request, env, user, url) {
         if (!problem && rows.length > 200) problem = "More than 200 invoices.";
         // The bank account the deposit lands in.
         const ac = await xeroFetch(env, "api.xro/2.0/Accounts?where=" + encodeURIComponent('Type=="BANK"'));
-        const banks = ac.ok ? ((await ac.json()).Accounts || []).filter((q) => q.Status === "ACTIVE" && q.CurrencyCode === "AUD" && q.EnablePaymentsToAccount !== false) : [];
-        const bank = (env.XERO_REMIT_ACCOUNT && banks.find((q) => q.AccountID === env.XERO_REMIT_ACCOUNT || q.Name === env.XERO_REMIT_ACCOUNT || q.Code === env.XERO_REMIT_ACCOUNT)) || (banks.length === 1 ? banks[0] : banks.find((q) => /nab/i.test(q.Name)));
-        if (!problem && !bank) problem = "Which bank account? Xero has: " + banks.map((q) => q.Name).join(", ") + ".";
+        const acJson = ac.ok ? await ac.json() : null;
+        const banks = acJson ? (acJson.Accounts || []).filter((q) => q.Status === "ACTIVE") : [];
+        const bank = (env.XERO_REMIT_ACCOUNT && banks.find((q) => q.AccountID === env.XERO_REMIT_ACCOUNT || q.Name === env.XERO_REMIT_ACCOUNT || q.Code === env.XERO_REMIT_ACCOUNT)) || banks.find((q) => /operating/i.test(q.Name));
+        if (!problem && !bank) problem = ac.ok ? "No Operating Account found. Xero has: " + banks.map((q) => q.Name).join(", ") + "." : "Xero answered " + ac.status + " when looking up the bank accounts.";
         const customer = rows[0] && rows[0].contact ? rows[0].contact : rem.payer;
         const date = rem.date || new Date().toISOString().slice(0, 10);
         if (!body.go) return reply(env, 200, { ok: true, customer, date, total: rem.total, sum, bank: bank ? bank.Name : "", rows: rows.map((r) => ({ number: r.number, pay: r.pay, problem: r.problem })), problem, worker: WORKER_BUILD });
