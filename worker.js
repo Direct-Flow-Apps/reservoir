@@ -337,7 +337,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
   await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
 }
 
-const WORKER_BUILD = "Reservoir-Worker-2026.11.23-w273";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.23-w274";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -3137,7 +3137,7 @@ function inflateBytes(src) {
   }
   return Uint8Array.from(out);
 }
-async function pdfTextRuns(bytes) {
+async function pdfTextRuns(bytes, opts = {}) {
   const raw = new Uint8Array(bytes);
   const bin = new TextDecoder("latin1").decode(raw);
   const items = [];
@@ -3152,10 +3152,27 @@ async function pdfTextRuns(bytes) {
   };
   const objBody = {};
   for (const om of bin.matchAll(/(\d+)\s+0\s+obj([\s\S]*?)endobj/g)) objBody[om[1]] = { head: om[2], at: om.index + om[0].indexOf(om[2]) };
+  // Objects packed inside object streams (PDF 1.5, Microsoft and Dynamics) are opened up so their fonts can be found too.
+  let extra = "";
+  for (const om of bin.matchAll(/(\d+)\s+0\s+obj\s*<<([^>]*\/Type\s*\/ObjStm[^>]*)>>\s*stream\r?\n/g)) {
+    const n = Number((om[2].match(/\/N\s+(\d+)/) || [])[1]), fst = Number((om[2].match(/\/First\s+(\d+)/) || [])[1]);
+    const st = om.index + om[0].length, en = bin.indexOf("endstream", st);
+    if (!n || !fst || en < 0) continue;
+    const txt = await inflate(st, en);
+    const pairs = (txt.slice(0, fst).match(/\d+/g) || []).map(Number);
+    for (let k = 0; k < n; k++) {
+      const num = pairs[k * 2], off = pairs[k * 2 + 1], nxt = k + 1 < n ? pairs[k * 2 + 3] : txt.length - fst;
+      if (num === undefined) continue;
+      const body = txt.slice(fst + off, fst + nxt);
+      objBody[num] = { head: body, at: -1 };
+      extra += "\n" + body;
+    }
+  }
+  const all2 = bin + extra;
   const fontObj = {};
-  for (const fm of bin.matchAll(/\/Font\s*<<([^>]*)>>/g)) for (const p of fm[1].matchAll(/\/([A-Za-z0-9_.+-]+)\s+(\d+)\s+0\s+R/g)) fontObj[p[1]] = p[2];
+  for (const fm of all2.matchAll(/\/Font\s*<<([^>]*)>>/g)) for (const p of fm[1].matchAll(/\/([A-Za-z0-9_.+-]+)\s+(\d+)\s+0\s+R/g)) fontObj[p[1]] = p[2];
   // Font dictionaries that sit in their own object (Qt): any name that points at a font object.
-  for (const fm of bin.matchAll(/\/([A-Za-z0-9_.+-]+)\s+(\d+)\s+0\s+R/g)) { const o = objBody[fm[2]]; if (o && /\/Type\s*\/Font\b/.test(o.head) && !(fm[1] in fontObj)) fontObj[fm[1]] = fm[2]; }
+  for (const fm of all2.matchAll(/\/([A-Za-z0-9_.+-]+)\s+(\d+)\s+0\s+R/g)) { const o = objBody[fm[2]]; if (o && /\/Type\s*\/Font\b/.test(o.head) && !(fm[1] in fontObj)) fontObj[fm[1]] = fm[2]; }
   const cmaps = {};
   const cmapOf = async (fname) => {
     if (fname in cmaps) return cmaps[fname];
@@ -3218,13 +3235,24 @@ async function pdfTextRuns(bytes) {
       const plain = bin.slice(start, end);
       if (/\bBT\b/.test(plain) && /\bTj\b|\bTJ\b/.test(plain)) text = plain;
     }
-    if (!text || !/\bTj\b|\bTJ\b/.test(text)) continue;
+    if (!text || !/\bTj\b|\bTJ\b|[>)]\s*'/.test(text)) continue;
     page++;
     const unesc = (s) => s.replace(/\\([0-7]{1,3}|.)/g, (_, c) => (/^[0-7]+$/.test(c) ? String.fromCharCode(parseInt(c, 8)) : c === "n" ? "\n" : c === "r" ? "\r" : c === "t" ? "\t" : c));
     const bt = /BT([\s\S]*?)ET/g;
     let b;
     let font = "", fsize = 0; // text state carries over between BT blocks
     while ((b = bt.exec(text))) {
+      const startLen = items.length;
+      // With opts.cm, text positions are carried through the page's cm and q/Q operators so they are true page positions (Dynamics, Microsoft print).
+      let M = null;
+      if (opts.cm) {
+        M = [1, 0, 0, 1, 0, 0]; const stack = [];
+        for (const ev of text.slice(0, b.index).matchAll(/(?:^|\s)(q|Q)(?=\s|$)|((?:-?[\d.]+\s+){5}-?[\d.]+)\s+cm\b/g)) {
+          if (ev[1] === "q") stack.push(M.slice());
+          else if (ev[1] === "Q") { if (stack.length) M = stack.pop(); }
+          else { const c = ev[2].trim().split(/\s+/).map(Number); M = [c[0] * M[0] + c[1] * M[2], c[0] * M[1] + c[1] * M[3], c[2] * M[0] + c[3] * M[2], c[2] * M[1] + c[3] * M[3], c[4] * M[0] + c[5] * M[2] + M[4], c[4] * M[1] + c[5] * M[3] + M[5]]; }
+        }
+      }
       let x = 0, y = 0, lead = 0;
       const nums = [];
       const tok = /\[((?:\((?:\\.|[^\\)])*\)|[^\]])*)\]|\(((?:\\.|[^\\)])*)\)|<([0-9A-Fa-f\s]+)>|\/([A-Za-z0-9_.+-]+)|(-?[\d.]+)|([A-Za-z*'"]+)/g;
@@ -3287,6 +3315,7 @@ async function pdfTextRuns(bytes) {
         }
         nums.length = 0;
       }
+      if (M) for (let k = startLen; k < items.length; k++) { const it = items[k], lx = it.x, ly = it.y; it.x = M[0] * lx + M[2] * ly + M[4]; it.y = M[1] * lx + M[3] * ly + M[5]; }
     }
   }
   return items;
@@ -3617,6 +3646,41 @@ async function geelongAccessParse(bytes) {
   const date = dateOf(side("Invoice Date:")), due = dateOf(side("Due Date:"));
   if (!/^\d{4,}$/.test(number) || !date || !(ex > 0)) return null;
   return { number, date, due: due || date, ex, gst, inc, order: /^\d{3,}$/.test(side("Purchase Order:")) ? side("Purchase Order:") : "" };
+}
+// A customer remittance advice PDF. Reads the payer, date, payment amount and each invoice line (invoice number first, current payment last).
+async function remittanceParse(bytes) {
+  const items0 = await pdfTextRuns(bytes, { cm: true });
+  // Glyphs placed one at a time on the same line are joined into the cell they belong to.
+  const items = [];
+  for (const it of items0.filter((i) => String(i.t).length).sort((a, b) => a.page - b.page || Math.round(b.y) - Math.round(a.y) || a.x - b.x)) {
+    const p = items[items.length - 1];
+    if (p && p.page === it.page && Math.abs(p.y - it.y) < 1.5 && it.x - (p.x + String(p.t).length * (p.size || 8) * 0.5) < 6 && it.x >= p.x) p.t = String(p.t) + String(it.t);
+    else items.push({ ...it });
+  }
+  if (!items.length) return null;
+  const moneyRe = /^\(?-?\$?\s?[\d,]+\.\d\d\)?$/;
+  const num = (t) => { const n = Number(String(t).replace(/[^0-9.]/g, "")); return /^\(|-/.test(String(t).trim()) ? -n : n; };
+  const rows = [];
+  for (const it of items.filter((i) => String(i.t).trim()).sort((a, b) => a.page - b.page || b.y - a.y || a.x - b.x)) {
+    const r = rows.find((q) => q.page === it.page && Math.abs(q.y - it.y) < 3);
+    if (r) r.cells.push(it); else rows.push({ page: it.page, y: it.y, cells: [it] });
+  }
+  for (const r of rows) r.cells.sort((a, b) => a.x - b.x);
+  const first = rows[0] && rows[0].cells[0] ? String(rows[0].cells[0].t).trim() : "";
+  const payer = first.replace(/\s*-\s*NEW$/i, "").slice(0, 60);
+  let total = 0, date = "";
+  const lines = [];
+  for (const r of rows) {
+    const texts = r.cells.map((c) => String(c.t).trim());
+    const joined = texts.join(" ");
+    if (/Payment Amount/i.test(joined)) { const m = texts.filter((t) => moneyRe.test(t)); if (m.length) total = num(m[m.length - 1]); }
+    if (/^Date:?$/i.test(texts[0]) || /^Date:/i.test(texts[0])) { const m = joined.match(/(\d{1,2})\/(\d{1,2})\/(\d{4})/); if (m) date = `${m[3]}-${String(m[2]).padStart(2, "0")}-${String(m[1]).padStart(2, "0")}`; }
+    const money = texts.filter((t) => moneyRe.test(t));
+    if (money.length >= 1 && texts.length >= 3 && /^[A-Za-z]{0,6}[-#\s]?\d{3,}[A-Za-z0-9-]*$/.test(texts[0]) && !moneyRe.test(texts[0])) lines.push({ number: texts[0].toUpperCase(), pay: num(money[money.length - 1]) });
+  }
+  if (!lines.length) return null;
+  const sum = Math.round(lines.reduce((a, l) => a + l.pay, 0) * 100) / 100;
+  return { payer, date, total: total || sum, sum, lines };
 }
 async function leaveplusParse(bytes) {
   const items = await pdfTextRuns(bytes);
@@ -4300,7 +4364,7 @@ async function mailDraftSend(env, addr, msg, op, text, to, extra) {
   if (to && to.length) patch.toRecipients = to;
   else if (x.setTo) { const t = mailRecipients(x.to); if (t.length) patch.toRecipients = t; }
   if (x.setTo) { patch.ccRecipients = mailRecipients(x.cc); patch.bccRecipients = mailRecipients(x.bcc); }
-  else if (x.bcc) patch.bccRecipients = mailRecipients(x.bcc);
+  else if (typeof x.bcc === "string") patch.bccRecipients = mailRecipients(x.bcc);
   if (x.importance === "high") patch.importance = "high";
   if (typeof x.subject === "string" && x.subject.trim()) patch.subject = x.subject.trim().slice(0, 255);
   const holdAt = x.hold ? mailWhenOk(x.sendAt) : "";
@@ -4673,6 +4737,14 @@ async function mailRoutes(request, env, user, url) {
     if (post) {
       const act = url.pathname.replace("/api/mail/", "");
       const msg = mailId(body && body.msg);
+      // The closed maintenance mailbox never goes on Cc or Bcc, and mail to the Xero or AroFlo bill imports carries no Bcc at all.
+      if (body && typeof body === "object") {
+        const drop = (v) => String(v || "").split(/[;,\n]/).filter((p) => p.trim() && !/maintenance@directflow\.com\.au/i.test(p)).join(", ");
+        if (body.cc !== undefined) body.cc = drop(body.cc);
+        if (body.bcc !== undefined) body.bcc = drop(body.bcc);
+        const bills = [env.XERO_BILLS_EMAIL, env.AROFLO_BILLS_EMAIL].filter(Boolean).map((v) => String(v).toLowerCase());
+        if (bills.length && bills.some((b) => String(body.to || "").toLowerCase().includes(b))) body.bcc = "";
+      }
       if (["send", "reply", "replyall", "forward", "savedraft"].includes(act)) await mailEmbedLogo(env, body);
       const done = (r) => r.ok ? reply(env, 200, { ok: true, worker: WORKER_BUILD }) : reply(env, 200, { ok: false, error: mailWhy(r, true), worker: WORKER_BUILD });
       if (act === "catadd") {
@@ -4701,6 +4773,65 @@ async function mailRoutes(request, env, user, url) {
         if (!fw.ok) return done(fw);
         const ar = await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}/move`, "POST", { destinationId: "archive" });
         return ar.ok ? reply(env, 200, { ok: true, newId: String((ar.json && ar.json.id) || ""), worker: WORKER_BUILD }) : reply(env, 200, { ok: false, error: "Sent to Xero, but the email could not be archived.", worker: WORKER_BUILD });
+      }
+      if (act === "remit" && msg) {
+        if (box.id !== "accounts") return reply(env, 200, { ok: false, error: "Only the Accounts mailbox can process remittances.", worker: WORKER_BUILD });
+        const fail = (error) => reply(env, 200, { ok: false, error, worker: WORKER_BUILD });
+        const al = await mailGraph(env, addr, `/messages/${encodeURIComponent(msg)}/attachments?$select=id,name,isInline,contentType`);
+        const pdfs = ((al && al.json && al.json.value) || []).filter((x) => !x.isInline && (/\.pdf$/i.test(x.name || "") || /pdf/i.test(x.contentType || "")));
+        if (!pdfs.length) return fail("There is no PDF remittance on this email.");
+        let rem = null;
+        for (const p of pdfs) {
+          const ar = await graphFetch(env, `/users/${encodeURIComponent(addr)}/messages/${encodeURIComponent(msg)}/attachments/${encodeURIComponent(p.id)}/$value`);
+          if (!ar.ok) continue;
+          try { rem = await remittanceParse(new Uint8Array(await ar.arrayBuffer())); } catch (e) { rem = null; }
+          if (rem) break;
+        }
+        if (!rem) return fail("The remittance could not be read. No invoice numbers were found.");
+        const nums = [...new Set(rem.lines.map((l) => l.number))];
+        const found = {};
+        for (let i = 0; i < nums.length; i += 40) {
+          const xr = await xeroFetch(env, "api.xro/2.0/Invoices?InvoiceNumbers=" + encodeURIComponent(nums.slice(i, i + 40).join(",")));
+          if (!xr.ok) return fail("Xero answered " + xr.status + " when looking up the invoices.");
+          for (const inv of ((await xr.json()).Invoices || [])) if (inv.Type === "ACCREC") (found[String(inv.InvoiceNumber).toUpperCase()] = found[String(inv.InvoiceNumber).toUpperCase()] || []).push(inv);
+        }
+        const rows = rem.lines.map((l) => {
+          const list = found[l.number] || [];
+          const inv = list.find((q) => q.Status === "AUTHORISED") || list[0];
+          let problem = "";
+          if (!inv) problem = "Not found in Xero";
+          else if (list.filter((q) => q.Status === "AUTHORISED").length > 1) problem = "More than one invoice has this number";
+          else if (inv.Status === "PAID") problem = "Already paid";
+          else if (inv.Status !== "AUTHORISED") problem = "Status is " + inv.Status;
+          else if (inv.CurrencyCode && inv.CurrencyCode !== "AUD") problem = "Not in AUD";
+          else if (Math.round(l.pay * 100) > Math.round(inv.AmountDue * 100)) problem = "Remittance is more than the amount due ($" + inv.AmountDue.toFixed(2) + ")";
+          return { number: l.number, pay: l.pay, id: inv ? inv.InvoiceID : "", contact: inv && inv.Contact ? inv.Contact.Name : "", due: inv ? inv.AmountDue : 0, problem };
+        });
+        const sum = Math.round(rows.reduce((a, r) => a + r.pay, 0) * 100) / 100;
+        let problem = rows.find((r) => r.problem) ? "Some invoices need attention." : "";
+        if (!problem && Math.abs(sum - rem.total) > 0.005) problem = "The invoices add up to $" + sum.toFixed(2) + " but the remittance total is $" + rem.total.toFixed(2) + ".";
+        if (!problem && new Set(rows.map((r) => r.contact)).size > 1) problem = "The invoices belong to more than one customer.";
+        if (!problem && rows.length > 200) problem = "More than 200 invoices.";
+        // The bank account the deposit lands in.
+        const ac = await xeroFetch(env, "api.xro/2.0/Accounts?where=" + encodeURIComponent('Type=="BANK"'));
+        const banks = ac.ok ? ((await ac.json()).Accounts || []).filter((q) => q.Status === "ACTIVE" && q.CurrencyCode === "AUD" && q.EnablePaymentsToAccount !== false) : [];
+        const bank = (env.XERO_REMIT_ACCOUNT && banks.find((q) => q.AccountID === env.XERO_REMIT_ACCOUNT || q.Name === env.XERO_REMIT_ACCOUNT || q.Code === env.XERO_REMIT_ACCOUNT)) || (banks.length === 1 ? banks[0] : banks.find((q) => /nab/i.test(q.Name)));
+        if (!problem && !bank) problem = "Which bank account? Xero has: " + banks.map((q) => q.Name).join(", ") + ".";
+        const customer = rows[0] && rows[0].contact ? rows[0].contact : rem.payer;
+        const date = rem.date || new Date().toISOString().slice(0, 10);
+        if (!body.go) return reply(env, 200, { ok: true, customer, date, total: rem.total, sum, bank: bank ? bank.Name : "", rows: rows.map((r) => ({ number: r.number, pay: r.pay, problem: r.problem })), problem, worker: WORKER_BUILD });
+        if (problem) return fail(problem);
+        const ref = (customer + " remittance " + date.split("-").reverse().join(".")).slice(0, 255);
+        const pr = await xeroFetch(env, "api.xro/2.0/BatchPayments", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ BatchPayments: [{ Account: { AccountID: bank.AccountID }, Reference: ref, Date: date, Payments: rows.map((r) => ({ Invoice: { InvoiceID: r.id }, Amount: r.pay })) }] }) });
+        let pj = null; try { pj = await pr.json(); } catch (e) { pj = null; }
+        const bp = pj && (pj.BatchPayments || [])[0];
+        if (!pr.ok || !bp || !bp.BatchPaymentID) {
+          const ve = bp && (bp.ValidationErrors || []).map((q) => q.Message).join(" ") || (pj && (pj.Message || pj.Detail)) || "";
+          return fail("Xero would not create the batch. " + (ve || "Xero answered " + pr.status + ".") + " Nothing was changed.");
+        }
+        await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}`, "PATCH", { isRead: true });
+        const ar2 = await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}/move`, "POST", { destinationId: "archive" });
+        return reply(env, 200, { ok: true, done: true, count: rows.length, total: sum, newId: String((ar2.ok && ar2.json && ar2.json.id) || ""), archived: ar2.ok, worker: WORKER_BUILD });
       }
       if (act === "archive" && msg) { const ar = await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}/move`, "POST", { destinationId: "archive" }); return ar.ok ? reply(env, 200, { ok: true, newId: String((ar.json && ar.json.id) || ""), worker: WORKER_BUILD }) : done(ar); }
       if (act === "movefolder" && msg) {
@@ -4756,39 +4887,6 @@ async function mailRoutes(request, env, user, url) {
         for (let k = 0; k < bin.length; k++) bytes[k] = bin.charCodeAt(k);
         const up = await graphFetch(env, `/users/${encodeURIComponent(mailAddress(env, ob))}/contacts/${encodeURIComponent(ref.slice(i + 1))}/photo/$value`, { method: "PUT", headers: { "Content-Type": "image/jpeg" }, body: bytes });
         return up.ok ? reply(env, 200, { ok: true, worker: WORKER_BUILD }) : reply(env, 200, { ok: false, error: "Microsoft did not take the photo. It answered " + up.status + ".", worker: WORKER_BUILD });
-      }
-      if (act === "contactaudit") {
-        const isT = user.tier === "T1" && (/^tayler/i.test(String(user.email || "")) || /^tayler\b/i.test(String(user.name || "")));
-        if (!isT) return reply(env, 200, { ok: false, error: "Only Tayler can audit contacts.", worker: WORKER_BUILD });
-        const fix = body.fix === true;
-        const sys = (e) => /^(no-?reply|do-?not-?reply|donotreply|mailer-daemon|postmaster)/i.test(String(e).split("@")[0]) || /@(post\.xero\.com|xero\.com)$/i.test(String(e));
-        const report = [];
-        let scanned = 0;
-        for (const bx of MAILBOXES.filter((x) => mailAllowed(x, user))) {
-          const ad = mailAddress(env, bx); let all = [];
-          for (let skip = 0; skip < 4000; skip += 200) {
-            const r = await mailGraph(env, ad, `/contacts?$top=200&$skip=${skip}&$select=id,displayName,emailAddresses,companyName`);
-            const v = (r.ok && r.json && r.json.value) || [];
-            all = all.concat(v); if (v.length < 200) break;
-          }
-          scanned += all.length;
-          for (const c of all) {
-            const emails = (c.emailAddresses || []).map((e) => String(e.address || "")).filter(Boolean);
-            const bad = emails.filter(sys);
-            const empty = !String(c.displayName || "").trim() && !emails.length;
-            if (!bad.length && !empty) continue;
-            const wholly = empty || bad.length === emails.length;
-            const row = { box: bx.id, name: String(c.displayName || "").slice(0, 60), emails: emails.slice(0, 4), action: wholly ? "delete contact" : "remove " + bad.join(", ") };
-            if (fix) {
-              if (wholly) { const dl = await mailDo(env, ad, `/contacts/${encodeURIComponent(c.id)}`, "DELETE"); row.done = dl.ok || dl.status === 404; }
-              else { const keep = (c.emailAddresses || []).filter((e) => !sys(e.address)); const pr = await mailDo(env, ad, `/contacts/${encodeURIComponent(c.id)}`, "PATCH", { emailAddresses: keep }); row.done = pr.ok; }
-            }
-            report.push(row);
-          }
-        }
-        let logoFile = "";
-        try { logoIndex = { at: 0, map: null }; if (await logoLookup(env, "noreply@post.xero.com", true)) logoFile = logoIndex.lastName || ""; } catch (e) {}
-        return reply(env, 200, { ok: true, fixed: fix, scanned, found: report.slice(0, 60), foundCount: report.length, logoFile, worker: WORKER_BUILD });
       }
       if (act === "avatarsave") {
         const isT = user.tier === "T1" && (/^tayler/i.test(String(user.email || "")) || /^tayler\b/i.test(String(user.name || "")));
