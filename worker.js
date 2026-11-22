@@ -337,7 +337,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
   await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
 }
 
-const WORKER_BUILD = "Reservoir-Worker-2026.11.23-w272";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.23-w273";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -3618,6 +3618,25 @@ async function geelongAccessParse(bytes) {
   if (!/^\d{4,}$/.test(number) || !date || !(ex > 0)) return null;
   return { number, date, due: due || date, ex, gst, inc, order: /^\d{3,}$/.test(side("Purchase Order:")) ? side("Purchase Order:") : "" };
 }
+async function leaveplusParse(bytes) {
+  const items = await pdfTextRuns(bytes);
+  if (!items.length) return null;
+  const money = (t) => { const neg = /^\(|-/.test(String(t).trim()); const n = Number(String(t).replace(/[^0-9.]/g, "")); return neg ? -n : n; };
+  const lab = (name) => items.filter((i) => i.t.trim().toLowerCase() === name.toLowerCase()).sort((a, b) => a.page - b.page || b.y - a.y)[0];
+  const side = (name) => { const l = lab(name); if (!l) return ""; const v = items.filter((i) => i.page === l.page && Math.abs(i.y - l.y) < 4 && i.x > l.x + 20 && i.t.trim()).sort((a, b) => a.x - b.x)[0]; return v ? v.t.trim() : ""; };
+  const dateOf = (t) => { const m = String(t).trim().match(/(\d{1,2})\/(\d{1,2})\/(\d{4})/); return m ? `${m[3]}-${String(m[2]).padStart(2, "0")}-${String(m[1]).padStart(2, "0")}` : ""; };
+  if (items.some((i) => /credit note/i.test(i.t))) return { credit: true };
+  const number = side("Invoice Number");
+  const date = dateOf(side("Issued Date")), due = dateOf(side("Due Date"));
+  const incT = side("Balance Due");
+  const inc = money(incT);
+  const gl = items.find((i) => /^Total includes \$/.test(i.t.trim()));
+  const gst = gl ? money(items.filter((i) => i.page === gl.page && Math.abs(i.y - gl.y) < 4 && i.x > gl.x + 20 && /\d/.test(i.t)).sort((a, b) => a.x - b.x)[0]?.t || "0") : 0;
+  if (inc < 0) return { credit: true };
+  if (!/^\d{6,}$/.test(number) || !date || !(inc > 0)) return null;
+  const ex = Math.round((inc - gst) * 100) / 100;
+  return { number, date, due: due || undefined, ex, gst, inc, order: "" };
+}
 async function melbourneDrainParse(bytes) {
   const items = await pdfTextRuns(bytes);
   if (!items.length) return null;
@@ -3846,6 +3865,7 @@ const INVOICE_MAIL_RULES = [
   { name: "Apex", fromDomain: "apexsteel.com.au", subject: "invoice", contact: "apex", account: "", parse: (b) => apexParse(b) },
   { name: "Geelong Access Hire", from: "no-reply@latner.app", subject: "from geelong access hire", contact: "geelong access", account: "", parse: (b) => geelongAccessParse(b) },
   { name: "Melbourne Drain Relining", fromDomain: "inboundemail.aroflo.com", subject: "from melbourne drain relining", contact: "melbourne drain", account: "", forwardBack: "Invoice sent to Xero and AroFlo. Download the links in this email and upload them to AroFlo.", parse: (b) => melbourneDrainParse(b) },
+  { name: "LeavePlus", from: "noreply@leaveplus.com.au", subject: "leaveplus long service leave invoice", contact: "leaveplus", account: "", xeroOnly: true, parse: (b) => leaveplusParse(b) },
   { name: "Teleca", from: "cs@teleca.com.au", subject: "telephone billing", contact: "teleca", account: "", xeroOnly: true, parse: (b) => telecaParse(b) }
 ];
 const MAILBOXES = [
