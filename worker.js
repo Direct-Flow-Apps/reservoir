@@ -337,7 +337,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
   await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
 }
 
-const WORKER_BUILD = "Reservoir-Worker-2026.11.22-w269";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.22-w270";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -3884,8 +3884,11 @@ async function logoLookup(env, email, probe) {
   const parts = dom.toLowerCase().split(".");
   let id = logoIndex.map.get(String(email).toLowerCase().trim()) || "";
   for (let i = 0; i < parts.length - 1 && !id; i++) { const k = parts.slice(i).join("."); if (logoIndex.map.has(k)) id = logoIndex.map.get(k); }
-  if (!id) { const stem = parts.length > 2 && /^(com|net|org|co|gov|edu)$/.test(parts[parts.length - 2]) ? parts[parts.length - 3] : parts[parts.length - 2]; for (const [name, v] of logoIndex.map) if (name.split(".")[0] === stem) { id = v; break; } if (!id && stem && stem.length >= 4) { const nz = (x) => String(x).toLowerCase().replace(/[^a-z0-9]/g, ""); const st = nz(stem); for (const [name, v] of logoIndex.map) { const n = nz(name.replace(/\.(com|net|org|co|au|nz|gov|edu)\b/g, "")); if (n && (n === st || n.startsWith(st) || (n.length >= 4 && st.startsWith(n)))) { id = v; break; } } } }
+  // A mail system address (no reply, or a Xero sending address) only gets a logo from an exact web address file, never a guess from the name.
+  const sysSender = /^(no-?reply|do-?not-?reply|donotreply|mailer-daemon|postmaster)/i.test(String(email).split("@")[0]) || /(^|\.)xero\.com$/.test(dom.toLowerCase());
+  if (!id && !sysSender) { const stem = parts.length > 2 && /^(com|net|org|co|gov|edu)$/.test(parts[parts.length - 2]) ? parts[parts.length - 3] : parts[parts.length - 2]; for (const [name, v] of logoIndex.map) if (name.split(".")[0] === stem) { id = v; break; } if (!id && stem && stem.length >= 4) { const nz = (x) => String(x).toLowerCase().replace(/[^a-z0-9]/g, ""); const st = nz(stem); for (const [name, v] of logoIndex.map) { const n = nz(name.replace(/\.(com|net|org|co|au|nz|gov|edu)\b/g, "")); if (n && (n === st || n.startsWith(st) || (n.length >= 4 && st.startsWith(n)))) { id = v; break; } } } }
   if (!id) return null;
+  logoIndex.lastName = ""; for (const [nm, v] of logoIndex.map) if (v === id) { logoIndex.lastName = nm; break; }
   if (probe) return true;
   const res = await graphFetch(env, `/sites/${siteId(env)}/drive/items/${encodeURIComponent(id)}/content`);
   return res.ok ? res : null;
@@ -4594,7 +4597,7 @@ async function mailRoutes(request, env, user, url) {
       return reply(env, 200, { ok: true, contacts: out.slice(0, 8), worker: WORKER_BUILD });
     }
     if (url.pathname === "/api/mail/contactlist" && !post) {
-      const found = await Promise.all(mine.filter((x) => !x.only).map(async (bx) => {
+      const found = await Promise.all(mine.map(async (bx) => {
         const ad = mailAddress(env, bx); let all = [];
         for (let skip = 0; skip < 2000; skip += 200) {
           const r = await mailGraph(env, ad, `/contacts?$top=200&$skip=${skip}&$orderby=displayName&$select=id,displayName,emailAddresses,companyName,mobilePhone,businessPhones,businessAddress,homeAddress`);
@@ -4731,6 +4734,39 @@ async function mailRoutes(request, env, user, url) {
         for (let k = 0; k < bin.length; k++) bytes[k] = bin.charCodeAt(k);
         const up = await graphFetch(env, `/users/${encodeURIComponent(mailAddress(env, ob))}/contacts/${encodeURIComponent(ref.slice(i + 1))}/photo/$value`, { method: "PUT", headers: { "Content-Type": "image/jpeg" }, body: bytes });
         return up.ok ? reply(env, 200, { ok: true, worker: WORKER_BUILD }) : reply(env, 200, { ok: false, error: "Microsoft did not take the photo. It answered " + up.status + ".", worker: WORKER_BUILD });
+      }
+      if (act === "contactaudit") {
+        const isT = user.tier === "T1" && (/^tayler/i.test(String(user.email || "")) || /^tayler\b/i.test(String(user.name || "")));
+        if (!isT) return reply(env, 200, { ok: false, error: "Only Tayler can audit contacts.", worker: WORKER_BUILD });
+        const fix = body.fix === true;
+        const sys = (e) => /^(no-?reply|do-?not-?reply|donotreply|mailer-daemon|postmaster)/i.test(String(e).split("@")[0]) || /@(post\.xero\.com|xero\.com)$/i.test(String(e));
+        const report = [];
+        let scanned = 0;
+        for (const bx of MAILBOXES.filter((x) => mailAllowed(x, user))) {
+          const ad = mailAddress(env, bx); let all = [];
+          for (let skip = 0; skip < 4000; skip += 200) {
+            const r = await mailGraph(env, ad, `/contacts?$top=200&$skip=${skip}&$select=id,displayName,emailAddresses,companyName`);
+            const v = (r.ok && r.json && r.json.value) || [];
+            all = all.concat(v); if (v.length < 200) break;
+          }
+          scanned += all.length;
+          for (const c of all) {
+            const emails = (c.emailAddresses || []).map((e) => String(e.address || "")).filter(Boolean);
+            const bad = emails.filter(sys);
+            const empty = !String(c.displayName || "").trim() && !emails.length;
+            if (!bad.length && !empty) continue;
+            const wholly = empty || bad.length === emails.length;
+            const row = { box: bx.id, name: String(c.displayName || "").slice(0, 60), emails: emails.slice(0, 4), action: wholly ? "delete contact" : "remove " + bad.join(", ") };
+            if (fix) {
+              if (wholly) { const dl = await mailDo(env, ad, `/contacts/${encodeURIComponent(c.id)}`, "DELETE"); row.done = dl.ok || dl.status === 404; }
+              else { const keep = (c.emailAddresses || []).filter((e) => !sys(e.address)); const pr = await mailDo(env, ad, `/contacts/${encodeURIComponent(c.id)}`, "PATCH", { emailAddresses: keep }); row.done = pr.ok; }
+            }
+            report.push(row);
+          }
+        }
+        let logoFile = "";
+        try { logoIndex = { at: 0, map: null }; if (await logoLookup(env, "noreply@post.xero.com", true)) logoFile = logoIndex.lastName || ""; } catch (e) {}
+        return reply(env, 200, { ok: true, fixed: fix, scanned, found: report.slice(0, 60), foundCount: report.length, logoFile, worker: WORKER_BUILD });
       }
       if (act === "avatarsave") {
         const isT = user.tier === "T1" && (/^tayler/i.test(String(user.email || "")) || /^tayler\b/i.test(String(user.name || "")));
