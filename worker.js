@@ -337,7 +337,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
   await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
 }
 
-const WORKER_BUILD = "Reservoir-Worker-2026.11.23-w276";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.23-w277";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -3988,7 +3988,7 @@ async function approvalSeen(env, b, em, name, msgId) {
   if (!/^[^\s@'"<>]+@[^\s@'"<>]+$/.test(em) || /(@directflow\.com\.au$|aroflo)/.test(em) || /^(no-?reply|do-?not-?reply|mailer-daemon|postmaster)/.test(em)) return;
   await approvalsTable(env);
   const row = await env.DB.prepare("SELECT * FROM contact_approvals WHERE email = ?").bind(em).first();
-  const tell = (logo) => notify(env, { to: "tayler@directflow.com.au", kind: "info", title: "Contact approval", body: `${name || em} (${em}): ${logo ? "logo found" : "no logo found"}. Approve, change or skip it in Weir settings.`, link: "emailbox", by: "Reservoir" });
+  const tell = () => null; // Contact approval notices are off. Tayler approves contacts by hand.
   if (!row) {
     const owner = encodeURIComponent(mailAddress(env, b));
     const f = await graphFetch(env, `/users/${owner}/contacts?$filter=${encodeURIComponent(`emailAddresses/any(a:a/address eq '${em}')`)}&$select=id&$top=1`);
@@ -6203,6 +6203,13 @@ async function noticesTable(env) {
       await migMark(env, "tayler_notices_reset_v2", `${d && d.meta ? d.meta.changes : 0} notices removed`);
     } catch (e) { /* tried again on the next start */ }
   }
+  // One time, 23 November 2026: the contact approval notices go, Tayler approves contacts by hand.
+  if (!(await migDone(env, "contact_approval_notices_off_v1"))) {
+    try {
+      const d = await env.DB.prepare("DELETE FROM notices WHERE title = 'Contact approval'").run();
+      await migMark(env, "contact_approval_notices_off_v1", `${d && d.meta ? d.meta.changes : 0} notices removed`);
+    } catch (e) { /* tried again on the next start */ }
+  }
   // One time, 18 November 2026: Tayler's notices are cleared again, as he asked.
   if (!(await migDone(env, "tayler_notices_reset_v3"))) {
     try {
@@ -6562,10 +6569,11 @@ async function noticesRoutes(request, env, user, url) {
     else await env.DB.prepare(`UPDATE notices SET read_at = datetime('now') WHERE ${mine} AND read_at IS NULL AND todo = 0`).bind(email).run();
     return reply(env, 200, { ok: true });
   }
-  const m = url.pathname.match(/^\/api\/notices\/([0-9a-zA-Z-]{1,40})\/(read|done)$/);
+  const m = url.pathname.match(/^\/api\/notices\/([0-9a-zA-Z-]{1,40})\/(read|done|delete)$/);
   if (m && request.method === "POST") {
     const row = await env.DB.prepare(`SELECT * FROM notices WHERE id = ? AND ${mine}`).bind(m[1], email).first();
     if (!row) return reply(env, 404, { error: "That notice is not there any more." });
+    if (m[2] === "delete") { await env.DB.prepare("DELETE FROM notices WHERE id = ?").bind(row.id).run(); return reply(env, 200, { ok: true }); }
     if (m[2] === "read") await env.DB.prepare("UPDATE notices SET read_at = COALESCE(read_at, datetime('now')) WHERE id = ?").bind(row.id).run();
     else await env.DB.prepare("UPDATE notices SET done_at = COALESCE(done_at, datetime('now')), read_at = COALESCE(read_at, datetime('now')), done_by = COALESCE(done_by, ?) WHERE id = ?").bind(user.name || email, row.id).run();
     if (m[2] === "done" && row.kind === "vba") await vbaClear(env, row, user);
