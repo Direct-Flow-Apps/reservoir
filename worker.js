@@ -568,7 +568,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
   await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
 }
 
-const WORKER_BUILD = "Reservoir-Worker-2026.11.23-w298";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.23-w299";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -4538,20 +4538,21 @@ async function eomXeroMonth(env, contactId, from, to) {
 // Matches one month of statement lines to Xero by number. Same number and same amount is matched; same number with another amount is a difference; on the statement only is missing from Xero; in Xero only is not on the statement.
 function eomCompare(lines, xero, from, to) {
   const r2 = (n) => Math.round(n * 100) / 100;
-  const byNum = {};
-  for (const x of xero) (byNum[`${x.credit ? "C" : "I"}${x.number}`] = byNum[`${x.credit ? "C" : "I"}${x.number}`] || []).push(x);
   const used = new Set();
-  const matched = [], different = [], missing = [];
+  const matched = [], different = [], missing = [], stmtLines = [];
+  // A Xero number matches a statement line when it contains the statement's invoice number, whatever sits around it (colons, PO numbers, prefixes). Invoices and credits stay apart, each Xero item is used once, and an exact amount wins when several contain the number.
+  const digits = (v) => String(v || "").replace(/\D/g, "");
+  const fits = (x, l) => !!x.credit === !!l.credit && !used.has(x) && (String(x.number || "").includes(String(l.number)) || digits(x.number).includes(digits(l.number)));
   for (const l of lines) {
-    const k = `${l.credit ? "C" : "I"}${l.number}`;
-    const hit = (byNum[k] || [])[0];
-    if (!hit) { missing.push(l); continue; }
-    used.add(k);
-    if (Math.abs(hit.total - l.amount) < 0.005) matched.push({ ...l, xeroStatus: hit.status, xeroDue: hit.due });
-    else different.push({ ...l, xeroAmount: hit.total, difference: r2(l.amount - hit.total) });
+    const cands = xero.filter((x) => fits(x, l));
+    const hit = cands.find((x) => Math.abs(x.total - l.amount) < 0.005) || cands[0];
+    const out = { date: l.date, number: l.number, credit: l.credit, amount: l.amount };
+    if (!hit) { missing.push(l); stmtLines.push({ ...out, match: "missing" }); continue; }
+    used.add(hit);
+    if (Math.abs(hit.total - l.amount) < 0.005) { matched.push({ ...l, xeroStatus: hit.status, xeroDue: hit.due }); stmtLines.push({ ...out, match: "matched" }); }
+    else { different.push({ ...l, xeroAmount: hit.total, difference: r2(l.amount - hit.total) }); stmtLines.push({ ...out, match: "different", xeroAmount: hit.total }); }
   }
-  const notOnStatement = xero.filter((x) => !used.has(`${x.credit ? "C" : "I"}${x.number}`) && (!from || (x.date >= from && x.date <= to)));
-  const stmtLines = lines.map((l) => ({ date: l.date, number: l.number, credit: l.credit, amount: l.amount, match: matched.some((x) => x.number === l.number && x.credit === l.credit) ? "matched" : different.some((x) => x.number === l.number && x.credit === l.credit) ? "different" : "missing" }));
+  const notOnStatement = xero.filter((x) => !used.has(x) && (!from || (x.date >= from && x.date <= to)));
   const net = (arr, amt) => r2(arr.reduce((t, x) => t + (x.credit ? -amt(x) : amt(x)), 0));
   const stmtTotal = net(lines, (x) => x.amount);
   const inMonth = xero.filter((x) => !from || (x.date >= from && x.date <= to));
