@@ -445,20 +445,6 @@ async function paygBill(env, runId, status, replace) {
   const at = await xeroFetch(env, `api.xro/2.0/Invoices/${inv.InvoiceID}/Attachments/${encodeURIComponent(ref + ".pdf")}`, { method: "PUT", headers: { "Content-Type": "application/pdf" }, body: pdf });
   return { ok: true, status: inv.Status, id: inv.InvoiceID, note: `${ref} $${amount.toFixed(2)} ${inv.Status}${at.ok ? "" : ", PDF not attached (Xero " + at.status + ")"}` };
 }
-// Every Friday from 7:00am Melbourne time the notice for the latest filed pay run is issued and left as a draft bill in Xero, dated that day and due a week later.
-async function paygFriday(env) {
-  const now = tsMelbourne(new Date());
-  if (now.dow !== 5 || now.mins < 7 * 60) return;
-  await settingsTable(env);
-  const done = await env.DB.prepare("SELECT value FROM app_settings WHERE key = 'sweep.payg_last'").first();
-  if (done && done.value === now.date) return;
-  await payslipTables(env);
-  const run = await env.DB.prepare("SELECT run_id FROM payslip_runs WHERE filed = 1 AND payment_date <= ? ORDER BY payment_date DESC LIMIT 1").bind(now.date).first();
-  if (!run) return;
-  const r = await paygBill(env, run.run_id, "DRAFT");
-  if (r && r.ok) await env.DB.prepare("INSERT INTO app_settings (key, value, detail, by_name, at) VALUES ('sweep.payg_last', ?, ?, 'PAYG notice', datetime('now')) ON CONFLICT(key) DO UPDATE SET value = excluded.value, detail = excluded.detail, by_name = excluded.by_name, at = excluded.at").bind(now.date, String(r.note || r.status || "").slice(0, 300)).run();
-  else console.log("payg notice not made", r && r.note);
-}
 // Xero never replies to the bills inbox email, so Reservoir looks in the Xero Files inbox for the file it sent. Waiting for 10 minutes without finding it means Xero did not take it.
 let xeroVerifyAt = 0;
 async function xeroVerify(env) {
@@ -488,7 +474,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
   await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
 }
 
-const WORKER_BUILD = "Reservoir-Worker-2026.11.23-w294";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.23-w295";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -7386,6 +7372,8 @@ async function payrollSweep(env) {
   }
   await env.DB.prepare("UPDATE payslip_runs SET filed = 1, filed_at = datetime('now'), filed_by = 'Xero' WHERE run_id = ? AND filed = 0").bind(run.run_id).run();
   try { await timesheetSync(env); } catch (e) { /* banking is retried by the Pay Run Filed button */ }
+  // Filing the pay run issues the PAYG withholding notice as a draft bill in Xero.
+  try { await paygBill(env, run.run_id, "DRAFT"); } catch (e) { console.log("payg notice failed", String(e && e.message || e)); }
 }
 
 // ---- Incident reports. Any team member lodges one from the First Aid tile. The directors and managers (T1 and T2) get an urgent alert, open the report, and one of them presses Assign to Me. Nobody can assign it to anyone else. Until someone does, the alert repeats every half hour. ----
@@ -8489,7 +8477,6 @@ export default {
     // A five minute trigger, if one is added, only looks for new mail so pings arrive quickly.
     if (event && event.cron === "*/5 * * * *") { ctx.waitUntil(mergeExportTest(env).catch((e) => console.log("export test failed", String(e && e.message || e)))); ctx.waitUntil(mergeCopyUndo(env).catch((e) => console.log("copy undo failed", String(e && e.message || e)))); ctx.waitUntil(mergeSentCopy(env).catch((e) => console.log("sent copy failed", String(e && e.message || e)))); ctx.waitUntil(mergeAutoReply(env).catch((e) => console.log("autoreply failed", String(e && e.message || e)))); ctx.waitUntil(mergeArchiveCopy(env).catch((e) => console.log("archive copy failed", String(e && e.message || e)))); ctx.waitUntil(mailWatch(env).catch((e) => console.log("mail watch failed", String(e && e.message || e)))); ctx.waitUntil(mailHoldSweep(env).catch((e) => console.log("hold sweep failed", String(e && e.message || e)))); ctx.waitUntil(vbaSubscribe(env).then(() => vbaWatch(env)).catch((e) => console.log("vba watch failed", String(e && e.message || e)))); return; }
     // Every run checks the automatic timesheets and the payroll sweeps. The leave sync keeps its own schedule and is skipped on the half hourly one.
-    ctx.waitUntil(paygFriday(env).catch((e) => console.log("payg notice failed", String(e && e.message || e))));
     ctx.waitUntil(fuelDraftFix(env).catch((e) => console.log("fuel draft fix failed", String(e && e.message || e))));
     ctx.waitUntil(tsAutoRun(env).catch((e) => console.log("auto timesheets failed", String(e && e.message || e))));
     ctx.waitUntil(pushFlushHeld(env));
@@ -9345,6 +9332,7 @@ export default {
         // The one pull after a pay run is filed: the timesheets Xero now holds as processed are banked here as permanent history. A processed timesheet already stored is never overwritten again. A failure here does not undo the filing.
         let timesheets = { ok: false };
         try { const ts = await timesheetSync(env); timesheets = { ok: !!ts.ok, saved: ts.saved || 0, error: ts.ok ? "" : String(ts.error || "").slice(0, 200) }; } catch (e) { timesheets = { ok: false, error: String(e && e.message || e).slice(0, 200) }; }
+        try { await paygBill(env, run.run_id, "DRAFT"); } catch (e) { console.log("payg notice failed", String(e && e.message || e)); }
         return reply(env, 200, { filed: true, paymentDate: run.payment_date, timesheets, worker: WORKER_BUILD });
       } catch (e) {
         console.log("payslip filed error", String(e && e.message || e));
