@@ -385,7 +385,7 @@ function paygPdf(o) {
   text(60, y + 16, 12, `Total Tax for Week Ending ${o.end}`, true);
   right(540, y + 16, 12, `$${o.amount}`, true);
   rect(0, 0, 595, 40, "0.16 0.17 0.19");
-  text(40, 16, 9, `Prepared automatically by Reservoir  |  ${o.ref}`, false, "0.80 0.82 0.85");
+  text(297.5 - wid("Prepared automatically by Reservoir", 9) * 0.9 / 2, 16, 9, "Prepared automatically by Reservoir", false, "0.80 0.82 0.85");
   const stream = ops.join("\n");
   const logo = atob(PAYG_LOGO_B64);
   const objs = [
@@ -483,7 +483,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
   await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
 }
 
-const WORKER_BUILD = "Reservoir-Worker-2026.11.23-w292";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.23-w293";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
