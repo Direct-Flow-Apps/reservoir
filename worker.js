@@ -308,14 +308,16 @@ async function receiptRecordsTable(env) {
   try { await env.DB.prepare("UPDATE receipt_records SET xero_state = NULL").run(); } catch (e) { /* ignore */ }
 }
 
-// A fuel receipt Xero turns into a draft bill with no contact. When it reads as fuel, the contact becomes DFP Fuel and the bill is due on its own date.
+// A receipt Xero turns into a draft bill with no contact gets one. Fuel becomes DFP Fuel. A reimbursement takes the contact of the team member it was sent for, matched on the amount. Either way the bill is due on its own date. Drafts stay drafts.
 const FUEL_RE = /\b(fuel|diesel|unleaded|ulp|petrol|e10|premium|bp|shell|ampol|caltex|7[- ]?eleven|united petroleum|puma|viva energy|liberty|coles express|metro petroleum|reddy express|apco)\b/i;
 async function fuelDraftFix(env) {
   await xeroContactsTable(env);
-  const row = await env.DB.prepare("SELECT contact_id, name FROM xero_contacts WHERE name_lc LIKE '%dfp fuel%' LIMIT 1").first();
-  if (!row) return;
-  const since = new Date(Date.now() - 14 * 86400000).toUTCString();
-  const res = await xeroFetch(env, `api.xro/2.0/Invoices?where=${encodeURIComponent('Type=="ACCPAY" AND Status=="DRAFT"')}&order=${encodeURIComponent("UpdatedDateUTC DESC")}&page=1`, { headers: { "If-Modified-Since": since } });
+  await receiptRecordsTable(env);
+  const find = async (like) => await env.DB.prepare("SELECT contact_id, name FROM xero_contacts WHERE name_lc LIKE ? LIMIT 1").bind(like).first();
+  const fuelRow = await find("%dfp fuel%");
+  const since = new Date(Date.now() - 14 * 86400000).toISOString();
+  const recs = ((await env.DB.prepare("SELECT by_name, amount, xero_at FROM receipt_records WHERE type = 'reimbursement' AND xero_at IS NOT NULL AND xero_at > ?").bind(since).all()).results) || [];
+  const res = await xeroFetch(env, `api.xro/2.0/Invoices?where=${encodeURIComponent('Type=="ACCPAY" AND Status=="DRAFT"')}&order=${encodeURIComponent("UpdatedDateUTC DESC")}&page=1`, { headers: { "If-Modified-Since": new Date(since).toUTCString() } });
   if (!res.ok) return;
   const list = ((await res.json()).Invoices) || [];
   for (const d of list) {
@@ -325,14 +327,22 @@ async function fuelDraftFix(env) {
     if (!one.ok) continue;
     const inv = (((await one.json()).Invoices) || [])[0] || {};
     if ((inv.Contact || {}).ContactID) continue;
+    let contact = null;
     const text = [inv.Reference, ...(inv.LineItems || []).map((l) => l.Description)].filter(Boolean).join(" ");
-    if (!FUEL_RE.test(text)) continue;
+    const total = Number(inv.Total) || 0;
+    const hit = recs.filter((r) => { const amt = Number(String(r.amount || "").replace(/[^0-9.]/g, "")) || 0; return amt && Math.abs(amt - total) < 0.005; }).sort((x, y) => String(y.xero_at).localeCompare(String(x.xero_at)))[0];
+    if (hit) {
+      const w = String(hit.by_name || "").toLowerCase().replace(/[^a-z\s]/g, "").split(/\s+/).filter(Boolean);
+      if (w.length) contact = await find(`%${w[0]}%${w.length > 1 ? w[w.length - 1] : ""}%`);
+    }
+    if (!contact && FUEL_RE.test(text)) contact = fuelRow;
+    if (!contact) continue;
     // A date Xero misread (2021, or in the future) falls back to today, so the bill is never dated years back.
     const today = new Date(Date.now() + 11 * 3600000).toISOString().slice(0, 10);
     const read = String(inv.DateString || "").slice(0, 10);
     const age = read ? (Date.parse(today) - Date.parse(read)) / 86400000 : 9999;
     const date = age >= 0 && age <= 90 ? read : today;
-    const body = { Invoices: [{ InvoiceID: inv.InvoiceID, Contact: { ContactID: row.contact_id }, Date: date, DueDate: date }] };
+    const body = { Invoices: [{ InvoiceID: inv.InvoiceID, Contact: { ContactID: contact.contact_id }, Date: date, DueDate: date }] };
     await xeroFetch(env, "api.xro/2.0/Invoices", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
   }
 }
@@ -365,7 +375,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
   await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
 }
 
-const WORKER_BUILD = "Reservoir-Worker-2026.11.23-w286";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.23-w287";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -10259,6 +10269,8 @@ export default {
         if (!meta) return reply(env, 404, { error: "not found", detail: "the file is no longer in SharePoint or its id is not valid", worker: WORKER_BUILD });
         if (meta.folder.startsWith("Receipts/Reimbursements") && user.tier !== "T1") return reply(env, 403, { error: "forbidden" });
         await sendToXero(env, user, meta);
+        // Remember when and for whom a reimbursement went, so the draft bill Xero makes can be given that person as its contact.
+        try { await receiptRecordsTable(env); await env.DB.prepare("UPDATE receipt_records SET xero_at = ? WHERE item_id = ?").bind(new Date().toISOString(), xm[1]).run(); } catch (e) { /* the send already worked */ }
         return reply(env, 200, { ok: true });
       } catch (e) {
         return reply(env, e.message === "too large" ? 413 : 502, { error: "send failed", detail: String(e.message || "").slice(0, 200) });
