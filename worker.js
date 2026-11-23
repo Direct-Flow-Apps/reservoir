@@ -337,7 +337,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
   await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
 }
 
-const WORKER_BUILD = "Reservoir-Worker-2026.11.23-w278";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.23-w279";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -3690,6 +3690,9 @@ async function remittanceParse(bytes) {
     const hd = r.cells.find((c) => /^(amount paid|paid|payment( amount)?|amount)$/i.test(String(c.t).trim()));
     if (hd && !money.length) { payX = hd.x; continue; }
     if (!money.length) continue;
+    const isDate = (t) => !!dmy(t) && /\b(19|20)\d\d\b/.test(t) && t.length < 16;
+    const emb = r.cells.map((c) => String(c.t).trim()).filter((t) => !moneyRe.test(t) && !isDate(t)).map((t) => t.match(/\bINV[-\s#]*(\d{3,})\b/i) || t.match(/(?:^|[-\u2013#\s])(\d{4,})\s*$/)).find((q) => q);
+    if (emb && !r.cells.some((c) => invRe.test(String(c.t).trim()) && !moneyRe.test(String(c.t).trim()))) { let pc2 = money[money.length - 1]; if (payX !== null) pc2 = money.slice().sort((a, b) => Math.abs(a.x - payX) - Math.abs(b.x - payX))[0]; lines.push({ number: "INV-" + emb[1], pay: num(pc2.t) }); continue; }
     const idCell = r.cells.find((c) => invRe.test(String(c.t).trim()) && !moneyRe.test(String(c.t).trim())) || (texts.length >= 3 && plainRe.test(texts[0]) && !moneyRe.test(texts[0]) ? r.cells[0] : null);
     if (!idCell) continue;
     let pc = money[money.length - 1];
