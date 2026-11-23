@@ -568,7 +568,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
   await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
 }
 
-const WORKER_BUILD = "Reservoir-Worker-2026.11.23-w296";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.23-w297";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -4483,6 +4483,100 @@ async function accessRoutes(request, env, user, url) {
       return reply(env, 200, { ok: true, off: ids, worker: WORKER_BUILD });
     }
     return reply(env, 404, { error: "not found" });
+  } catch (e) {
+    return reply(env, 200, { ok: false, error: String(e && e.message || e).slice(0, 240) });
+  }
+}
+// ---- End of Month. Reads a supplier statement PDF (Samios first), takes the lines for one month, and matches each invoice number and amount against the bills and supplier credit notes in Xero. T1 and T2 only. Reads only, nothing is written to Xero. ----
+async function eomSamiosStatement(bytes) {
+  const items = await pdfTextRuns(bytes);
+  const money = (t) => { const n = Number(String(t).replace(/[^0-9.]/g, "")); return /^\(.*\)$|^-|-$|CR$/i.test(String(t).trim()) ? -n : n; };
+  const left = items.filter((i) => i.x < 400);
+  const rows = {};
+  for (const i of left) {
+    const key = `${i.page}|${Math.round(i.y / 3)}`;
+    (rows[key] = rows[key] || []).push(i);
+  }
+  const lines = [];
+  let closing = null;
+  for (const k of Object.keys(rows)) {
+    const r = rows[k].sort((a, b) => a.x - b.x);
+    const date = r.find((i) => /^\d{2}\/\d{2}\/\d{2}$/.test(i.t.trim()) && i.x < 60);
+    const tr = r.find((i) => /^(Invoice|Cr\/Note:?)\s+\d{5,}$/i.test(i.t.trim()));
+    if (!date || !tr) continue;
+    const credit = /^Cr/i.test(tr.t.trim());
+    const number = tr.t.trim().match(/(\d{5,})$/)[1];
+    const amounts = r.filter((i) => i.x > 255 && i.x < 360 && /\d/.test(i.t));
+    const amt = amounts.length ? Math.abs(money(amounts[0].t)) : 0;
+    const d = date.t.trim().match(/^(\d{2})\/(\d{2})\/(\d{2})$/);
+    lines.push({ date: `20${d[3]}-${d[2]}-${d[1]}`, number, credit, amount: Math.round(amt * 100) / 100 });
+  }
+  const dueItem = items.find((i) => /^Amount Due$/i.test(i.t.trim()));
+  if (dueItem) { const v = items.filter((i) => i.page === dueItem.page && Math.abs(i.y - dueItem.y) < 4 && i.x > dueItem.x && /\d/.test(i.t)).sort((a, b) => a.x - b.x)[0]; if (v) closing = money(v.t); }
+  const acct = (items.map((i) => i.t.match(/Account:\s*(\d+)/)).find((m) => m) || [])[1] || "";
+  lines.sort((a, b) => a.date < b.date ? -1 : a.date > b.date ? 1 : a.number < b.number ? -1 : 1);
+  return { account: acct, closing, lines };
+}
+async function eomXeroMonth(env, contactId, from, to) {
+  const wh = (type) => encodeURIComponent(`Type=="${type}" AND Contact.ContactID==Guid("${contactId}") AND Date>=DateTime(${from.slice(0, 4)}, ${Number(from.slice(5, 7))}, ${Number(from.slice(8, 10))}) AND Date<=DateTime(${to.slice(0, 4)}, ${Number(to.slice(5, 7))}, ${Number(to.slice(8, 10))})`);
+  const out = [];
+  for (const [path, type, numKey, credit] of [["Invoices", "ACCPAY", "InvoiceNumber", false], ["CreditNotes", "ACCPAYCREDIT", "CreditNoteNumber", true]]) {
+    for (let page = 1; page <= 10; page++) {
+      const res = await xeroFetch(env, `api.xro/2.0/${path}?where=${wh(type)}&page=${page}`);
+      if (!res.ok) throw new Error(`Xero ${res.status}`);
+      const j = await res.json();
+      const list = (credit ? j.CreditNotes : j.Invoices) || [];
+      for (const x of list) {
+        if (x.Status === "DELETED" || x.Status === "VOIDED") continue;
+        out.push({ number: String(x[numKey] || ""), credit, total: Math.round(Number(x.Total) * 100) / 100, status: x.Status, date: xeroDate(x.DateString || x.Date), due: xeroDate(x.DueDateString || x.DueDate), amountDue: Math.round(Number(x.AmountDue) * 100) / 100 });
+      }
+      if (list.length < 100) break;
+    }
+  }
+  return out;
+}
+// Matches one month of statement lines to Xero by number. Same number and same amount is matched; same number with another amount is a difference; on the statement only is missing from Xero; in Xero only is not on the statement.
+function eomCompare(lines, xero) {
+  const r2 = (n) => Math.round(n * 100) / 100;
+  const byNum = {};
+  for (const x of xero) (byNum[`${x.credit ? "C" : "I"}${x.number}`] = byNum[`${x.credit ? "C" : "I"}${x.number}`] || []).push(x);
+  const used = new Set();
+  const matched = [], different = [], missing = [];
+  for (const l of lines) {
+    const k = `${l.credit ? "C" : "I"}${l.number}`;
+    const hit = (byNum[k] || [])[0];
+    if (!hit) { missing.push(l); continue; }
+    used.add(k);
+    if (Math.abs(hit.total - l.amount) < 0.005) matched.push({ ...l, xeroStatus: hit.status, xeroDue: hit.due });
+    else different.push({ ...l, xeroAmount: hit.total, difference: r2(l.amount - hit.total) });
+  }
+  const notOnStatement = xero.filter((x) => !used.has(`${x.credit ? "C" : "I"}${x.number}`));
+  const net = (arr, amt) => r2(arr.reduce((t, x) => t + (x.credit ? -amt(x) : amt(x)), 0));
+  const stmtTotal = net(lines, (x) => x.amount);
+  const xeroTotal = net(xero, (x) => x.total);
+  return { stmtTotal, xeroTotal, difference: r2(stmtTotal - xeroTotal), balanced: Math.abs(stmtTotal - xeroTotal) < 0.005 && !missing.length && !different.length && !notOnStatement.length, counts: { statement: lines.length, matched: matched.length, different: different.length, missing: missing.length, notOnStatement: notOnStatement.length }, different, missing, notOnStatement };
+}
+async function eomRoutes(request, env, user, url) {
+  if (url.pathname !== "/api/eom/check") return null;
+  if (user.tier !== "T1" && user.tier !== "T2") return reply(env, 403, { error: "forbidden" });
+  if (request.method !== "POST") return reply(env, 404, { error: "not found" });
+  try {
+    const b = await request.json();
+    const month = /^\d{4}-\d{2}$/.test(String(b.month || "")) ? b.month : "";
+    if (!month || !b.pdf) return reply(env, 400, { error: "month (YYYY-MM) and pdf (base64) needed" });
+    const raw = atob(String(b.pdf)), bytes = new Uint8Array(raw.length);
+    for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
+    const stmt = await eomSamiosStatement(bytes.buffer);
+    if (!stmt.lines.length) return reply(env, 200, { ok: false, error: "no statement lines read" });
+    const lines = stmt.lines.filter((l) => l.date.slice(0, 7) === month);
+    if (!lines.length) return reply(env, 200, { ok: false, error: `no lines dated ${month} on the statement` });
+    await xeroContactsTable(env);
+    const rows = ((await env.DB.prepare("SELECT contact_id, name FROM xero_contacts WHERE REPLACE(REPLACE(name_lc, char(8217), ''), char(39), '') LIKE ?").bind("%samios%").all()).results) || [];
+    if (rows.length !== 1) return reply(env, 200, { ok: false, error: rows.length ? `${rows.length} Xero contacts match Samios` : "no Xero contact matches Samios" });
+    const [y, m] = month.split("-").map(Number);
+    const from = `${month}-01`, to = new Date(Date.UTC(y, m, 0)).toISOString().slice(0, 10);
+    const xero = await eomXeroMonth(env, rows[0].contact_id, from, to);
+    return reply(env, 200, { ok: true, supplier: rows[0].name, account: stmt.account, month, ...eomCompare(lines, xero), worker: WORKER_BUILD });
   } catch (e) {
     return reply(env, 200, { ok: false, error: String(e && e.message || e).slice(0, 240) });
   }
@@ -8734,6 +8828,8 @@ export default {
     if (accessReply) return accessReply;
     const budgetReply = await budgetRoutes(request, env, user, url);
     if (budgetReply) return budgetReply;
+    const eomReply = await eomRoutes(request, env, user, url);
+    if (eomReply) return eomReply;
     const mailReply = await mailRoutes(request, env, user, url);
     if (mailReply) return mailReply;
     const arofloReply = await arofloRoutes(request, env, user, url);
