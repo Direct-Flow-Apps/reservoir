@@ -568,7 +568,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
   await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
 }
 
-const WORKER_BUILD = "Reservoir-Worker-2026.11.23-w297";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.23-w298";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -4536,7 +4536,7 @@ async function eomXeroMonth(env, contactId, from, to) {
   return out;
 }
 // Matches one month of statement lines to Xero by number. Same number and same amount is matched; same number with another amount is a difference; on the statement only is missing from Xero; in Xero only is not on the statement.
-function eomCompare(lines, xero) {
+function eomCompare(lines, xero, from, to) {
   const r2 = (n) => Math.round(n * 100) / 100;
   const byNum = {};
   for (const x of xero) (byNum[`${x.credit ? "C" : "I"}${x.number}`] = byNum[`${x.credit ? "C" : "I"}${x.number}`] || []).push(x);
@@ -4550,11 +4550,13 @@ function eomCompare(lines, xero) {
     if (Math.abs(hit.total - l.amount) < 0.005) matched.push({ ...l, xeroStatus: hit.status, xeroDue: hit.due });
     else different.push({ ...l, xeroAmount: hit.total, difference: r2(l.amount - hit.total) });
   }
-  const notOnStatement = xero.filter((x) => !used.has(`${x.credit ? "C" : "I"}${x.number}`));
+  const notOnStatement = xero.filter((x) => !used.has(`${x.credit ? "C" : "I"}${x.number}`) && (!from || (x.date >= from && x.date <= to)));
+  const stmtLines = lines.map((l) => ({ date: l.date, number: l.number, credit: l.credit, amount: l.amount, match: matched.some((x) => x.number === l.number && x.credit === l.credit) ? "matched" : different.some((x) => x.number === l.number && x.credit === l.credit) ? "different" : "missing" }));
   const net = (arr, amt) => r2(arr.reduce((t, x) => t + (x.credit ? -amt(x) : amt(x)), 0));
   const stmtTotal = net(lines, (x) => x.amount);
-  const xeroTotal = net(xero, (x) => x.total);
-  return { stmtTotal, xeroTotal, difference: r2(stmtTotal - xeroTotal), balanced: Math.abs(stmtTotal - xeroTotal) < 0.005 && !missing.length && !different.length && !notOnStatement.length, counts: { statement: lines.length, matched: matched.length, different: different.length, missing: missing.length, notOnStatement: notOnStatement.length }, different, missing, notOnStatement };
+  const inMonth = xero.filter((x) => !from || (x.date >= from && x.date <= to));
+  const xeroTotal = net(inMonth, (x) => x.total);
+  return { stmtTotal, xeroTotal, difference: r2(stmtTotal - xeroTotal), balanced: Math.abs(stmtTotal - xeroTotal) < 0.005 && !missing.length && !different.length && !notOnStatement.length, counts: { statement: lines.length, matched: matched.length, different: different.length, missing: missing.length, notOnStatement: notOnStatement.length }, lines: stmtLines, different, missing, notOnStatement };
 }
 async function eomRoutes(request, env, user, url) {
   if (url.pathname !== "/api/eom/check") return null;
@@ -4574,9 +4576,11 @@ async function eomRoutes(request, env, user, url) {
     const rows = ((await env.DB.prepare("SELECT contact_id, name FROM xero_contacts WHERE REPLACE(REPLACE(name_lc, char(8217), ''), char(39), '') LIKE ?").bind("%samios%").all()).results) || [];
     if (rows.length !== 1) return reply(env, 200, { ok: false, error: rows.length ? `${rows.length} Xero contacts match Samios` : "no Xero contact matches Samios" });
     const [y, m] = month.split("-").map(Number);
+    const day = (iso, n) => new Date(Date.parse(iso + "T00:00:00Z") + n * 86400000).toISOString().slice(0, 10);
     const from = `${month}-01`, to = new Date(Date.UTC(y, m, 0)).toISOString().slice(0, 10);
-    const xero = await eomXeroMonth(env, rows[0].contact_id, from, to);
-    return reply(env, 200, { ok: true, supplier: rows[0].name, account: stmt.account, month, ...eomCompare(lines, xero), worker: WORKER_BUILD });
+    // Xero's bill date can differ from the statement date, so look 60 days either side and match by number; only bills dated in the month count as missing from the statement.
+    const all = await eomXeroMonth(env, rows[0].contact_id, day(from, -60), day(to, 60));
+    return reply(env, 200, { ok: true, supplier: rows[0].name, account: stmt.account, month, ...eomCompare(lines, all, from, to), worker: WORKER_BUILD });
   } catch (e) {
     return reply(env, 200, { ok: false, error: String(e && e.message || e).slice(0, 240) });
   }
