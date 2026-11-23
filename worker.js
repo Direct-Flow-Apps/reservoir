@@ -375,7 +375,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
   await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
 }
 
-const WORKER_BUILD = "Reservoir-Worker-2026.11.23-w287";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.23-w288";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -6293,6 +6293,14 @@ async function noticesTable(env) {
       await receiptRecordsTable(env);
       const d = await env.DB.prepare("UPDATE receipt_records SET status = 'submitted', done_date = '' WHERE type = 'reimbursement' AND lower(by_email) LIKE 'mitch%' AND sent_date = '2026-11-16'").run();
       await migMark(env, "mitch_reimb_reopen_v1", `${d && d.meta ? d.meta.changes : 0} reimbursements reopened`);
+    } catch (e) { /* tried again on the next start */ }
+  }
+  // One time, 23 November 2026: reimbursements already sent to Xero today (before the send time was kept) are stamped now, so their draft bills get the team member as contact.
+  if (!(await migDone(env, "reimb_xero_at_v1"))) {
+    try {
+      await receiptRecordsTable(env);
+      const d = await env.DB.prepare("UPDATE receipt_records SET xero_at = ? WHERE type = 'reimbursement' AND xero_at IS NULL AND sent_date >= '2026-11-22'").bind(new Date().toISOString()).run();
+      await migMark(env, "reimb_xero_at_v1", `${d && d.meta ? d.meta.changes : 0} reimbursements stamped`);
     } catch (e) { /* tried again on the next start */ }
   }
   // One time, 17 November 2026: second try, matching Mitch by first name or email, so his two reimbursements from 16 November are waiting again.
