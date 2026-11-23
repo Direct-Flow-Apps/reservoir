@@ -337,7 +337,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
   await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
 }
 
-const WORKER_BUILD = "Reservoir-Worker-2026.11.23-w282";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.23-w283";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -6234,6 +6234,13 @@ async function noticesTable(env) {
       const d = await env.DB.prepare("DELETE FROM notices WHERE title = 'Contact approval'").run();
       await migMark(env, "contact_approval_notices_off_v1", `${d && d.meta ? d.meta.changes : 0} notices removed`);
     } catch (e) { /* tried again on the next start */ }
+  }
+  // One time, 23 November 2026: a push asking Tayler to complete his timesheet.
+  if (!(await migDone(env, "timesheet_push_tayler_v1"))) {
+    try {
+      await migMark(env, "timesheet_push_tayler_v1", "sent");
+      await notify(env, { to: "tayler@directflow.com.au", kind: "info", title: "Timesheet", body: "Please complete your timesheet.", by: "Reservoir" });
+    } catch (e) { /* not sent */ }
   }
   // One time, 18 November 2026: Tayler's notices are cleared again, as he asked.
   if (!(await migDone(env, "tayler_notices_reset_v3"))) {
