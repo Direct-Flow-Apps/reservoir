@@ -365,7 +365,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
   await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
 }
 
-const WORKER_BUILD = "Reservoir-Worker-2026.11.23-w285";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.23-w286";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -6688,7 +6688,7 @@ async function tsOfficeRoute(env, user) {
     const out = tsRowOut(r);
     const state = r.status === "pending" ? "pending" : (/^(APPROVED|SALARIED)$/.test(String(r.xero_status || "").toUpperCase()) ? "approved" : "xerodraft");
     const auto = r.decided_by === "auto" ? "Automatic approval" : r.decided_by === "auto trade school" ? "Five days trade school, automatic approval" : "";
-    return { id: out.id, name: out.name, email: r.email, state, total: out.total, days: out.days, auto, error: out.error };
+    return { id: out.id, name: out.name, email: r.email, state, total: out.total, days: out.days, auto, error: out.error, at: r.created_at || "" };
   };
   const build = (week) => {
     const rows = byWeek.get(week) || [];
