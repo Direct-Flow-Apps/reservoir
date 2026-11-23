@@ -347,45 +347,56 @@ async function fuelDraftFix(env) {
   }
 }
 // PAYG withholding bill. Once a pay run is filed, the tax withheld for that run becomes a bill to the Australian Taxation Office in Xero (PAYG Withholdings Payable, BAS Excluded) with a one page payment advice attached as the PDF.
+const PAYG_ATO_REF = "002966266109001660";
+const PAYG_LOGO_B64 = "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";
 function paygPdf(o) {
   const esc = (s) => String(s).replace(/[^\x20-\x7e]/g, "").replace(/[\\()]/g, (m) => "\\" + m);
   const ops = [];
   const rect = (x, y, w, h, rgb) => ops.push(`${rgb} rg ${x} ${y} ${w} ${h} re f`);
   const text = (x, y, size, s, bold, rgb) => ops.push(`BT /${bold ? "F2" : "F1"} ${size} Tf ${rgb || "0.13 0.13 0.13"} rg ${x} ${y} Td (${esc(s)}) Tj ET`);
+  const wid = (s, size) => String(s).split("").reduce((n, c) => n + (/[0-9$]/.test(c) ? 0.556 : c === "," || c === "." ? 0.278 : 0.55), 0) * size;
+  const right = (xr, y, size, s, bold, rgb) => text(xr - wid(s, size), y, size, s, bold, rgb);
+  const grey = "0.45 0.47 0.50";
   rect(0, 742, 595, 100, "0.16 0.17 0.19");
-  rect(40, 782, 36, 36, "0.30 0.78 0.55");
-  text(52, 793, 18, "$", true, "0.16 0.17 0.19");
-  text(90, 800, 20, "PAYG Withholding", true, "1 1 1");
-  text(90, 782, 11, "Payment advice for the Australian Taxation Office", false, "0.80 0.82 0.85");
-  text(40, 700, 10, "FROM", true, "0.45 0.47 0.50");
-  text(40, 684, 13, "Direct Flow Plumbing Pty Ltd", true);
-  text(40, 668, 10, "Trading as Direct Flow Plumbing (DFP)");
-  text(320, 700, 10, "TO", true, "0.45 0.47 0.50");
-  text(320, 684, 13, "Australian Taxation Office", true);
-  text(320, 668, 10, "PAYG withholding payable");
-  rect(40, 610, 515, 1, "0.85 0.86 0.88");
-  const row = (y, k, v) => { text(40, y, 10, k, true, "0.45 0.47 0.50"); text(220, y, 12, v); };
-  row(580, "REFERENCE", o.ref);
-  row(552, "PAY PERIOD", `${o.start} to ${o.end}`);
-  row(524, "WEEK ENDING", o.end);
-  row(496, "PAYMENT DATE", o.pay);
-  row(468, "EMPLOYEES PAID", String(o.people));
-  rect(40, 380, 515, 70, "0.94 0.97 0.95");
-  rect(40, 380, 6, 70, "0.30 0.78 0.55");
-  text(64, 424, 10, "TAX WITHHELD, PAYABLE TO THE ATO", true, "0.45 0.47 0.50");
-  text(64, 394, 26, `$${o.amount}`, true);
-  text(40, 340, 10, "Account: PAYG Withholdings Payable. Tax rate: BAS Excluded. No GST applies.");
-  text(40, 322, 10, "Raised automatically by Reservoir from the filed Xero pay run.");
+  ops.push("q 44 0 0 44 40 770 cm /Im1 Do Q");
+  text(96, 796, 20, "Payment Notice", true, "1 1 1");
+  text(96, 778, 11, "PAYG tax withheld  |  This is not a tax invoice", false, "0.80 0.82 0.85");
+  text(40, 700, 10, "PAYABLE TO", true, grey);
+  text(40, 684, 13, "Australian Taxation Office", true);
+  text(40, 668, 10, "PAYG withholding");
+  rect(40, 640, 515, 1, "0.85 0.86 0.88");
+  const row = (y, k, v) => { text(40, y, 10, k, true, grey); text(220, y, 12, v); };
+  row(610, "WEEK ENDING", o.end);
+  row(584, "DFP REFERENCE", o.ref);
+  row(558, "ATO REFERENCE", o.ato);
+  let y = 520;
+  text(40, y, 10, "EMPLOYEE", true, grey);
+  right(540, y, 10, "TAX WITHHELD", true, grey);
+  y -= 10;
+  rect(40, y, 515, 1, "0.85 0.86 0.88");
+  for (const r of o.rows) {
+    y -= 22;
+    text(40, y, 12, r.name);
+    right(540, y, 12, `$${r.tax}`);
+    rect(40, y - 8, 515, 0.5, "0.92 0.93 0.94");
+  }
+  y -= 62;
+  rect(40, y, 515, 44, "0.99 0.95 0.92");
+  rect(40, y, 6, 44, "0.96 0.42 0.20");
+  text(60, y + 16, 12, `Total Tax for Week Ending ${o.end}`, true);
+  right(540, y + 16, 12, `$${o.amount}`, true);
   rect(0, 0, 595, 40, "0.16 0.17 0.19");
-  text(40, 16, 9, `Reservoir  |  ${o.ref}`, false, "0.80 0.82 0.85");
+  text(40, 16, 9, `Prepared automatically by Reservoir  |  ${o.ref}`, false, "0.80 0.82 0.85");
   const stream = ops.join("\n");
+  const logo = atob(PAYG_LOGO_B64);
   const objs = [
     "<</Type/Catalog/Pages 2 0 R>>",
     "<</Type/Pages/Kids[3 0 R]/Count 1>>",
-    "<</Type/Page/Parent 2 0 R/MediaBox[0 0 595 842]/Contents 4 0 R/Resources<</Font<</F1 5 0 R/F2 6 0 R>>>>>>",
+    "<</Type/Page/Parent 2 0 R/MediaBox[0 0 595 842]/Contents 4 0 R/Resources<</Font<</F1 5 0 R/F2 6 0 R>>/XObject<</Im1 7 0 R>>>>>>",
     `<</Length ${stream.length}>>\nstream\n${stream}\nendstream`,
     "<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>",
     "<</Type/Font/Subtype/Type1/BaseFont/Helvetica-Bold>>",
+    `<</Type/XObject/Subtype/Image/Width 144/Height 144/ColorSpace/DeviceRGB/BitsPerComponent 8/Filter/FlateDecode/Length ${logo.length}>>\nstream\n${logo}\nendstream`,
   ];
   let out = "%PDF-1.4\n";
   const offs = [];
@@ -408,6 +419,7 @@ async function paygBill(env, runId, status) {
   const tot = await env.DB.prepare("SELECT COUNT(*) AS n, SUM(tax) AS t FROM payslip_store WHERE run_id = ?").bind(run.run_id).first();
   const amount = Math.round((Number(tot && tot.t) || 0) * 100) / 100;
   if (!(amount > 0)) return { ok: false, note: "no tax withheld on that run" };
+  const rows = ((await env.DB.prepare("SELECT name, tax FROM payslip_store WHERE run_id = ? AND tax > 0 ORDER BY name").bind(run.run_id).all()).results || []).map((r) => ({ name: String(r.name || ""), tax: (Math.round(Number(r.tax) * 100) / 100).toLocaleString("en-AU", { minimumFractionDigits: 2, maximumFractionDigits: 2 }) }));
   const dots = (iso) => String(iso || "").slice(0, 10).split("-").reverse().join(".");
   const ref = `PAYG-${String(run.period_end).slice(0, 10).replace(/-/g, "")}`;
   let crow = await env.DB.prepare("SELECT contact_id, name FROM xero_contacts WHERE name_lc LIKE '%australian taxation office%' LIMIT 1").first();
@@ -420,14 +432,28 @@ async function paygBill(env, runId, status) {
   const acc = (((await ar.json()).Accounts) || []).find((a) => /payg\s*withholding/i.test(String(a.Name || "")) && a.Status !== "ARCHIVED");
   if (!acc) return { ok: false, note: "no PAYG Withholdings Payable account in Xero" };
   const line = { Description: `PAYG withheld, week ending ${dots(run.period_end)}`, Quantity: 1, UnitAmount: amount, AccountCode: acc.Code, TaxType: "BASEXCLUDED" };
-  const body = { Invoices: [{ Type: "ACCPAY", Contact: { ContactID: crow.contact_id }, InvoiceNumber: ref, Reference: ref, Date: String(run.payment_date).slice(0, 10), DueDate: String(run.payment_date).slice(0, 10), LineAmountTypes: "Exclusive", Status: status || "DRAFT", LineItems: [line] }] };
+  const body = { Invoices: [{ Type: "ACCPAY", Contact: { ContactID: crow.contact_id }, InvoiceNumber: ref, Reference: ref, Date: today, DueDate: new Date(Date.parse(today) + 7 * 86400000).toISOString().slice(0, 10), LineAmountTypes: "Exclusive", Status: status || "DRAFT", LineItems: [line] }] };
   const res = await xeroFetch(env, "api.xro/2.0/Invoices?summarizeErrors=false", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
   if (!res.ok) return { ok: false, note: `Xero ${res.status}: ${String(await res.text()).slice(0, 200)}` };
   const inv = (((await res.json()).Invoices) || [])[0] || {};
   if (!inv.InvoiceID || /^0+(-0+)*$/.test(inv.InvoiceID) || inv.StatusAttributeString === "ERROR") return { ok: false, note: ([...(inv.ValidationErrors || [])].map((e) => e.Message).join("; ") || "Xero did not save the bill").slice(0, 200) };
-  const pdf = paygPdf({ ref, start: dots(run.period_start), end: dots(run.period_end), pay: dots(run.payment_date), people: Number(tot.n) || 0, amount: amount.toFixed(2) });
+  const pdf = paygPdf({ ref, end: dots(run.period_end), ato: PAYG_ATO_REF, amount: amount.toLocaleString("en-AU", { minimumFractionDigits: 2, maximumFractionDigits: 2 }), rows });
   const at = await xeroFetch(env, `api.xro/2.0/Invoices/${inv.InvoiceID}/Attachments/${encodeURIComponent(ref + ".pdf")}`, { method: "PUT", headers: { "Content-Type": "application/pdf" }, body: pdf });
   return { ok: true, status: inv.Status, id: inv.InvoiceID, note: `${ref} $${amount.toFixed(2)} ${inv.Status}${at.ok ? "" : ", PDF not attached (Xero " + at.status + ")"}` };
+}
+// Every Friday from 7:00am Melbourne time the notice for the latest filed pay run is issued and left as a draft bill in Xero, dated that day and due a week later.
+async function paygFriday(env) {
+  const now = tsMelbourne(new Date());
+  if (now.dow !== 5 || now.mins < 7 * 60) return;
+  await settingsTable(env);
+  const done = await env.DB.prepare("SELECT value FROM app_settings WHERE key = 'sweep.payg_last'").first();
+  if (done && done.value === now.date) return;
+  await payslipTables(env);
+  const run = await env.DB.prepare("SELECT run_id FROM payslip_runs WHERE filed = 1 AND payment_date <= ? ORDER BY payment_date DESC LIMIT 1").bind(now.date).first();
+  if (!run) return;
+  const r = await paygBill(env, run.run_id, "DRAFT");
+  if (r && r.ok) await env.DB.prepare("INSERT INTO app_settings (key, value, detail, by_name, at) VALUES ('sweep.payg_last', ?, ?, 'PAYG notice', datetime('now')) ON CONFLICT(key) DO UPDATE SET value = excluded.value, detail = excluded.detail, by_name = excluded.by_name, at = excluded.at").bind(now.date, String(r.note || r.status || "").slice(0, 300)).run();
+  else console.log("payg notice not made", r && r.note);
 }
 // Xero never replies to the bills inbox email, so Reservoir looks in the Xero Files inbox for the file it sent. Waiting for 10 minutes without finding it means Xero did not take it.
 let xeroVerifyAt = 0;
@@ -458,7 +484,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
   await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
 }
 
-const WORKER_BUILD = "Reservoir-Worker-2026.11.23-w289";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.23-w290";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -7354,7 +7380,6 @@ async function payrollSweep(env) {
   }
   await env.DB.prepare("UPDATE payslip_runs SET filed = 1, filed_at = datetime('now'), filed_by = 'Xero' WHERE run_id = ? AND filed = 0").bind(run.run_id).run();
   try { await timesheetSync(env); } catch (e) { /* banking is retried by the Pay Run Filed button */ }
-  try { await paygBill(env, run.run_id, "DRAFT"); } catch (e) { console.log("payg bill failed", String(e && e.message || e)); }
 }
 
 // ---- Incident reports. Any team member lodges one from the First Aid tile. The directors and managers (T1 and T2) get an urgent alert, open the report, and one of them presses Assign to Me. Nobody can assign it to anyone else. Until someone does, the alert repeats every half hour. ----
@@ -8458,6 +8483,7 @@ export default {
     // A five minute trigger, if one is added, only looks for new mail so pings arrive quickly.
     if (event && event.cron === "*/5 * * * *") { ctx.waitUntil(mergeExportTest(env).catch((e) => console.log("export test failed", String(e && e.message || e)))); ctx.waitUntil(mergeCopyUndo(env).catch((e) => console.log("copy undo failed", String(e && e.message || e)))); ctx.waitUntil(mergeSentCopy(env).catch((e) => console.log("sent copy failed", String(e && e.message || e)))); ctx.waitUntil(mergeAutoReply(env).catch((e) => console.log("autoreply failed", String(e && e.message || e)))); ctx.waitUntil(mergeArchiveCopy(env).catch((e) => console.log("archive copy failed", String(e && e.message || e)))); ctx.waitUntil(mailWatch(env).catch((e) => console.log("mail watch failed", String(e && e.message || e)))); ctx.waitUntil(mailHoldSweep(env).catch((e) => console.log("hold sweep failed", String(e && e.message || e)))); ctx.waitUntil(vbaSubscribe(env).then(() => vbaWatch(env)).catch((e) => console.log("vba watch failed", String(e && e.message || e)))); return; }
     // Every run checks the automatic timesheets and the payroll sweeps. The leave sync keeps its own schedule and is skipped on the half hourly one.
+    ctx.waitUntil(paygFriday(env).catch((e) => console.log("payg notice failed", String(e && e.message || e))));
     ctx.waitUntil(fuelDraftFix(env).catch((e) => console.log("fuel draft fix failed", String(e && e.message || e))));
     ctx.waitUntil(tsAutoRun(env).catch((e) => console.log("auto timesheets failed", String(e && e.message || e))));
     ctx.waitUntil(pushFlushHeld(env));
