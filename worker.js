@@ -423,7 +423,17 @@ async function paygBill(env, runId, status, replace) {
   const ref = `PAYG-${String(run.period_end).slice(0, 10).replace(/-/g, "")}`;
   let crow = await env.DB.prepare("SELECT contact_id, name FROM xero_contacts WHERE name_lc LIKE '%australian taxation office%' LIMIT 1").first();
   if (!crow) crow = await env.DB.prepare("SELECT contact_id, name FROM xero_contacts WHERE name_lc LIKE '%taxation office%' OR name_lc = 'ato' LIMIT 1").first();
-  if (!crow) return { ok: false, note: "no Australian Taxation Office contact in Xero" };
+  if (!crow) crow = await env.DB.prepare("SELECT contact_id, name FROM xero_contacts WHERE name_lc LIKE '%australian tax%' OR name_lc LIKE '%tax office%' OR name_lc LIKE '%taxation%' OR name_lc LIKE 'ato %' OR name_lc LIKE '% ato' OR name_lc LIKE '%(ato)%' LIMIT 1").first();
+  if (!crow) {
+    // The saved contacts list may be out of date, so ask Xero directly.
+    for (const term of ["Australian Tax", "Taxation Office", "ATO"]) {
+      const cr = await xeroFetch(env, `api.xro/2.0/Contacts?searchTerm=${encodeURIComponent(term)}`);
+      if (!cr.ok) continue;
+      const hit = (((await cr.json()).Contacts) || []).find((c) => /australian tax|tax(ation)? office|^ato\b/i.test(String(c.Name || "")) && c.ContactStatus !== "ARCHIVED");
+      if (hit) { crow = { contact_id: hit.ContactID, name: hit.Name }; break; }
+    }
+  }
+  if (!crow) return { ok: false, note: "no Australian Tax Office contact in Xero" };
   const dup = await xeroFetch(env, `api.xro/2.0/Invoices?where=${encodeURIComponent(`Type=="ACCPAY" AND InvoiceNumber=="${ref}" AND Contact.ContactID==Guid("${crow.contact_id}")`)}`);
   if (dup.ok) {
     const live = (((await dup.json()).Invoices) || []).filter((i) => i.Status !== "DELETED" && i.Status !== "VOIDED");
