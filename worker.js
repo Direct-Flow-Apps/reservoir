@@ -337,7 +337,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
   await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
 }
 
-const WORKER_BUILD = "Reservoir-Worker-2026.11.23-w281";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.23-w282";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -4793,6 +4793,7 @@ async function mailRoutes(request, env, user, url) {
         if (body.both && !env.AROFLO_BILLS_EMAIL) return reply(env, 200, { ok: false, error: "The AroFlo bills address is not set up.", worker: WORKER_BUILD });
         const fw = await mailDraftSend(env, addr, msg, "createForward", "", [{ emailAddress: { address: env.XERO_BILLS_EMAIL } }].concat(body.both ? [{ emailAddress: { address: env.AROFLO_BILLS_EMAIL } }] : []), { trail: "none" });
         if (!fw.ok) return done(fw);
+        await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}`, "PATCH", { isRead: true });
         const ar = await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}/move`, "POST", { destinationId: "archive" });
         return ar.ok ? reply(env, 200, { ok: true, newId: String((ar.json && ar.json.id) || ""), worker: WORKER_BUILD }) : reply(env, 200, { ok: false, error: "Sent to Xero, but the email could not be archived.", worker: WORKER_BUILD });
       }
@@ -4858,7 +4859,7 @@ async function mailRoutes(request, env, user, url) {
         const ar2 = await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}/move`, "POST", { destinationId: "archive" });
         return reply(env, 200, { ok: true, done: true, count: rows.length, total: sum, newId: String((ar2.ok && ar2.json && ar2.json.id) || ""), archived: ar2.ok, worker: WORKER_BUILD });
       }
-      if (act === "archive" && msg) { const ar = await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}/move`, "POST", { destinationId: "archive" }); return ar.ok ? reply(env, 200, { ok: true, newId: String((ar.json && ar.json.id) || ""), worker: WORKER_BUILD }) : done(ar); }
+      if (act === "archive" && msg) { await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}`, "PATCH", { isRead: true }); const ar = await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}/move`, "POST", { destinationId: "archive" }); return ar.ok ? reply(env, 200, { ok: true, newId: String((ar.json && ar.json.id) || ""), worker: WORKER_BUILD }) : done(ar); }
       if (act === "movefolder" && msg) {
         const dest = mailFolderId(body.folder);
         if (!dest) return reply(env, 200, { ok: false, error: "Choose a folder to move it to.", worker: WORKER_BUILD });
