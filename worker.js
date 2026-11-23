@@ -327,8 +327,11 @@ async function fuelDraftFix(env) {
     if ((inv.Contact || {}).ContactID) continue;
     const text = [inv.Reference, ...(inv.LineItems || []).map((l) => l.Description)].filter(Boolean).join(" ");
     if (!FUEL_RE.test(text)) continue;
-    const date = String(inv.DateString || "").slice(0, 10);
-    if (!date) continue;
+    // A date Xero misread (2021, or in the future) falls back to today, so the bill is never dated years back.
+    const today = new Date(Date.now() + 11 * 3600000).toISOString().slice(0, 10);
+    const read = String(inv.DateString || "").slice(0, 10);
+    const age = read ? (Date.parse(today) - Date.parse(read)) / 86400000 : 9999;
+    const date = age >= 0 && age <= 90 ? read : today;
     const body = { Invoices: [{ InvoiceID: inv.InvoiceID, Contact: { ContactID: row.contact_id }, Date: date, DueDate: date }] };
     await xeroFetch(env, "api.xro/2.0/Invoices", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
   }
@@ -362,7 +365,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
   await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
 }
 
-const WORKER_BUILD = "Reservoir-Worker-2026.11.23-w284";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.23-w285";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
