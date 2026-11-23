@@ -568,7 +568,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
   await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
 }
 
-const WORKER_BUILD = "Reservoir-Worker-2026.11.23-w299";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.23-w300";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -4517,6 +4517,41 @@ async function eomSamiosStatement(bytes) {
   lines.sort((a, b) => a.date < b.date ? -1 : a.date > b.date ? 1 : a.number < b.number ? -1 : 1);
   return { account: acct, closing, lines };
 }
+// Any supplier's statement: every row that has a date, an invoice number and an amount becomes a line. Samios keeps its own exact reader and is tried first.
+async function eomGenericStatement(bytes) {
+  const items = await pdfTextRuns(bytes);
+  const MON = { jan: 1, feb: 2, mar: 3, apr: 4, may: 5, jun: 6, jul: 7, aug: 8, sep: 9, oct: 10, nov: 11, dec: 12 };
+  const moneyRe = /^[-(]?\$?[\d,]+\.\d{2}\)?(CR|DR)?-?$/i;
+  const toDate = (t) => {
+    t = t.trim();
+    let m = t.match(/^(\d{1,2})[\/.\-](\d{1,2})[\/.\-](\d{2}|\d{4})$/);
+    if (m) return `${m[3].length === 2 ? "20" + m[3] : m[3]}-${m[2].padStart(2, "0")}-${m[1].padStart(2, "0")}`;
+    m = t.match(/^(\d{1,2})[ \-]([A-Za-z]{3})[a-z]*[ \-,]*(\d{2}|\d{4})$/);
+    if (m && MON[m[2].toLowerCase()]) return `${m[3].length === 2 ? "20" + m[3] : m[3]}-${String(MON[m[2].toLowerCase()]).padStart(2, "0")}-${m[1].padStart(2, "0")}`;
+    return "";
+  };
+  const rows = {};
+  for (const i of items) (rows[`${i.page}|${Math.round(i.y / 3)}`] = rows[`${i.page}|${Math.round(i.y / 3)}`] || []).push(i);
+  const lines = [];
+  for (const k of Object.keys(rows)) {
+    const r = rows[k].sort((a, b) => a.x - b.x);
+    const dateItem = r.find((i) => toDate(i.t));
+    if (!dateItem) continue;
+    const amounts = r.filter((i) => moneyRe.test(i.t.trim()));
+    if (!amounts.length) continue;
+    const numItem = r.find((i) => i !== dateItem && !moneyRe.test(i.t.trim()) && !toDate(i.t) && /\d{4,}/.test(i.t));
+    if (!numItem) continue;
+    const number = numItem.t.match(/\d{4,}/)[0];
+    const first = amounts[0].t.trim();
+    const rowText = r.map((i) => i.t).join(" ");
+    const credit = /cr\/?note|credit/i.test(rowText) || /^[-(]|-$/.test(first);
+    const amt = Math.abs(Number(first.replace(/[^0-9.]/g, "")));
+    lines.push({ date: toDate(dateItem.t), number, credit, amount: Math.round(amt * 100) / 100 });
+  }
+  lines.sort((a, b) => a.date < b.date ? -1 : a.date > b.date ? 1 : a.number < b.number ? -1 : 1);
+  const text = items.map((i) => i.t).join(" ").toLowerCase().replace(/[’']/g, "");
+  return { account: "", closing: null, lines, text };
+}
 async function eomXeroMonth(env, contactId, from, to) {
   const wh = (type) => encodeURIComponent(`Type=="${type}" AND Contact.ContactID==Guid("${contactId}") AND Date>=DateTime(${from.slice(0, 4)}, ${Number(from.slice(5, 7))}, ${Number(from.slice(8, 10))}) AND Date<=DateTime(${to.slice(0, 4)}, ${Number(to.slice(5, 7))}, ${Number(to.slice(8, 10))})`);
   const out = [];
@@ -4565,23 +4600,43 @@ async function eomRoutes(request, env, user, url) {
   if (request.method !== "POST") return reply(env, 404, { error: "not found" });
   try {
     const b = await request.json();
-    const month = /^\d{4}-\d{2}$/.test(String(b.month || "")) ? b.month : "";
-    if (!month || !b.pdf) return reply(env, 400, { error: "month (YYYY-MM) and pdf (base64) needed" });
+    if (!b.pdf) return reply(env, 400, { error: "pdf (base64) needed" });
     const raw = atob(String(b.pdf)), bytes = new Uint8Array(raw.length);
     for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
-    const stmt = await eomSamiosStatement(bytes.buffer);
-    if (!stmt.lines.length) return reply(env, 200, { ok: false, error: "no statement lines read" });
+    const gen = await eomGenericStatement(bytes.buffer);
+    let stmt = await eomSamiosStatement(bytes.buffer);
+    if (!stmt.lines.length) stmt = gen;
+    if (!stmt.lines.length) return reply(env, 200, { ok: false, error: "No statement lines could be read from that PDF." });
+    const text = gen.text || "";
+    // The month is the one most of the lines fall in, unless one was sent.
+    let month = /^\d{4}-\d{2}$/.test(String(b.month || "")) ? b.month : "";
+    if (!month) {
+      const cnt = {};
+      for (const l of stmt.lines) cnt[l.date.slice(0, 7)] = (cnt[l.date.slice(0, 7)] || 0) + 1;
+      month = Object.keys(cnt).sort((x, y) => cnt[y] - cnt[x] || (x < y ? 1 : -1))[0];
+    }
     const lines = stmt.lines.filter((l) => l.date.slice(0, 7) === month);
-    if (!lines.length) return reply(env, 200, { ok: false, error: `no lines dated ${month} on the statement` });
     await xeroContactsTable(env);
-    const rows = ((await env.DB.prepare("SELECT contact_id, name FROM xero_contacts WHERE REPLACE(REPLACE(name_lc, char(8217), ''), char(39), '') LIKE ?").bind("%samios%").all()).results) || [];
-    if (rows.length !== 1) return reply(env, 200, { ok: false, error: rows.length ? `${rows.length} Xero contacts match Samios` : "no Xero contact matches Samios" });
+    const all0 = ((await env.DB.prepare("SELECT contact_id, name, name_lc FROM xero_contacts").all()).results) || [];
+    // Who it is from: contact names that appear in the statement text (never DFP itself), longest first.
+    const clean = (n) => String(n || "").toLowerCase().replace(/[’']/g, "").replace(/\b(pty|ltd|limited|the|t\/a|trading as|and|&)\b/g, " ").replace(/[^a-z0-9 ]/g, " ").replace(/\s+/g, " ").trim();
+    const hay = ` ${clean(text)} `;
+    const ok = (c) => !/direct flow|dfp/.test(clean(c.name));
+    let cands = all0.filter((c) => { const n = clean(c.name_lc || c.name); return n.length >= 4 && ok(c) && hay.includes(` ${n} `); }).sort((x, y) => clean(y.name).length - clean(x.name).length).slice(0, 3);
+    // Statements often print a shorter name than Xero holds, so fall back to the contact's first word.
+    if (!cands.length) cands = all0.filter((c) => { const w = clean(c.name).split(" ")[0]; return w.length >= 5 && ok(c) && hay.includes(` ${w} `); }).slice(0, 6);
+    if (!cands.length) return reply(env, 200, { ok: false, error: "Could not tell who that statement is from." });
     const [y, m] = month.split("-").map(Number);
     const day = (iso, n) => new Date(Date.parse(iso + "T00:00:00Z") + n * 86400000).toISOString().slice(0, 10);
     const from = `${month}-01`, to = new Date(Date.UTC(y, m, 0)).toISOString().slice(0, 10);
-    // Xero's bill date can differ from the statement date, so look 60 days either side and match by number; only bills dated in the month count as missing from the statement.
-    const all = await eomXeroMonth(env, rows[0].contact_id, day(from, -60), day(to, 60));
-    return reply(env, 200, { ok: true, supplier: rows[0].name, account: stmt.account, month, ...eomCompare(lines, all, from, to), worker: WORKER_BUILD });
+    let best = null;
+    for (const c of cands) {
+      // Xero's bill date can differ from the statement date, so look 60 days either side and match by number; only bills dated in the month count as missing from the statement.
+      const all = await eomXeroMonth(env, c.contact_id, day(from, -60), day(to, 60));
+      const cmp = eomCompare(lines, all, from, to);
+      if (!best || cmp.counts.matched + cmp.counts.different > best.cmp.counts.matched + best.cmp.counts.different) best = { c, cmp };
+    }
+    return reply(env, 200, { ok: true, supplier: best.c.name, account: stmt.account, month, ...best.cmp, worker: WORKER_BUILD });
   } catch (e) {
     return reply(env, 200, { ok: false, error: String(e && e.message || e).slice(0, 240) });
   }
