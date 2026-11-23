@@ -337,7 +337,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
   await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
 }
 
-const WORKER_BUILD = "Reservoir-Worker-2026.11.23-w279";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.23-w280";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -4829,6 +4829,8 @@ async function mailRoutes(request, env, user, url) {
           return { number: l.number, pay: l.pay, id: inv ? inv.InvoiceID : "", contact: inv && inv.Contact ? inv.Contact.Name : "", due: inv ? inv.AmountDue : 0, problem };
         });
         const sum = Math.round(rows.reduce((a, r) => a + r.pay, 0) * 100) / 100;
+        // If any invoice number is not in Xero, or the invoices do not add up to the remittance total, Reservoir does not guess.
+        if (rows.some((r) => !r.id) || Math.abs(sum - rem.total) > 0.005) return fail("Reservoir could not match this remittance to Xero" + (rows.some((r) => !r.id) ? " (" + rows.filter((r) => !r.id).map((r) => r.number).join(", ") + " not found)" : " (the invoices do not add up to the total)") + ". Please process it manually.");
         let problem = rows.find((r) => r.problem) ? "Some invoices need attention." : "";
         if (!problem && Math.abs(sum - rem.total) > 0.005) problem = "The invoices add up to $" + sum.toFixed(2) + " but the remittance total is $" + rem.total.toFixed(2) + ".";
         if (!problem && new Set(rows.map((r) => r.contact)).size > 1) problem = "The invoices belong to more than one customer.";
