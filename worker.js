@@ -346,6 +346,89 @@ async function fuelDraftFix(env) {
     await xeroFetch(env, "api.xro/2.0/Invoices", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
   }
 }
+// PAYG withholding bill. Once a pay run is filed, the tax withheld for that run becomes a bill to the Australian Taxation Office in Xero (PAYG Withholdings Payable, BAS Excluded) with a one page payment advice attached as the PDF.
+function paygPdf(o) {
+  const esc = (s) => String(s).replace(/[^\x20-\x7e]/g, "").replace(/[\\()]/g, (m) => "\\" + m);
+  const ops = [];
+  const rect = (x, y, w, h, rgb) => ops.push(`${rgb} rg ${x} ${y} ${w} ${h} re f`);
+  const text = (x, y, size, s, bold, rgb) => ops.push(`BT /${bold ? "F2" : "F1"} ${size} Tf ${rgb || "0.13 0.13 0.13"} rg ${x} ${y} Td (${esc(s)}) Tj ET`);
+  rect(0, 742, 595, 100, "0.16 0.17 0.19");
+  rect(40, 782, 36, 36, "0.30 0.78 0.55");
+  text(52, 793, 18, "$", true, "0.16 0.17 0.19");
+  text(90, 800, 20, "PAYG Withholding", true, "1 1 1");
+  text(90, 782, 11, "Payment advice for the Australian Taxation Office", false, "0.80 0.82 0.85");
+  text(40, 700, 10, "FROM", true, "0.45 0.47 0.50");
+  text(40, 684, 13, "Direct Flow Plumbing Pty Ltd", true);
+  text(40, 668, 10, "Trading as Direct Flow Plumbing (DFP)");
+  text(320, 700, 10, "TO", true, "0.45 0.47 0.50");
+  text(320, 684, 13, "Australian Taxation Office", true);
+  text(320, 668, 10, "PAYG withholding payable");
+  rect(40, 610, 515, 1, "0.85 0.86 0.88");
+  const row = (y, k, v) => { text(40, y, 10, k, true, "0.45 0.47 0.50"); text(220, y, 12, v); };
+  row(580, "REFERENCE", o.ref);
+  row(552, "PAY PERIOD", `${o.start} to ${o.end}`);
+  row(524, "WEEK ENDING", o.end);
+  row(496, "PAYMENT DATE", o.pay);
+  row(468, "EMPLOYEES PAID", String(o.people));
+  rect(40, 380, 515, 70, "0.94 0.97 0.95");
+  rect(40, 380, 6, 70, "0.30 0.78 0.55");
+  text(64, 424, 10, "TAX WITHHELD, PAYABLE TO THE ATO", true, "0.45 0.47 0.50");
+  text(64, 394, 26, `$${o.amount}`, true);
+  text(40, 340, 10, "Account: PAYG Withholdings Payable. Tax rate: BAS Excluded. No GST applies.");
+  text(40, 322, 10, "Raised automatically by Reservoir from the filed Xero pay run.");
+  rect(0, 0, 595, 40, "0.16 0.17 0.19");
+  text(40, 16, 9, `Reservoir  |  ${o.ref}`, false, "0.80 0.82 0.85");
+  const stream = ops.join("\n");
+  const objs = [
+    "<</Type/Catalog/Pages 2 0 R>>",
+    "<</Type/Pages/Kids[3 0 R]/Count 1>>",
+    "<</Type/Page/Parent 2 0 R/MediaBox[0 0 595 842]/Contents 4 0 R/Resources<</Font<</F1 5 0 R/F2 6 0 R>>>>>>",
+    `<</Length ${stream.length}>>\nstream\n${stream}\nendstream`,
+    "<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>",
+    "<</Type/Font/Subtype/Type1/BaseFont/Helvetica-Bold>>",
+  ];
+  let out = "%PDF-1.4\n";
+  const offs = [];
+  objs.forEach((b, i) => { offs.push(out.length); out += `${i + 1} 0 obj\n${b}\nendobj\n`; });
+  const xref = out.length;
+  out += `xref\n0 ${objs.length + 1}\n0000000000 65535 f \n` + offs.map((n) => String(n).padStart(10, "0") + " 00000 n \n").join("");
+  out += `trailer\n<</Size ${objs.length + 1}/Root 1 0 R>>\nstartxref\n${xref}\n%%EOF`;
+  const b = new Uint8Array(out.length);
+  for (let i = 0; i < out.length; i++) b[i] = out.charCodeAt(i) & 255;
+  return b;
+}
+async function paygBill(env, runId, status) {
+  await payslipTables(env);
+  await xeroContactsTable(env);
+  const today = new Date(Date.now() + 11 * 3600000).toISOString().slice(0, 10);
+  const run = runId
+    ? await env.DB.prepare("SELECT run_id, payment_date, period_start, period_end FROM payslip_runs WHERE run_id = ?").bind(runId).first()
+    : await env.DB.prepare("SELECT run_id, payment_date, period_start, period_end FROM payslip_runs WHERE payment_date <= ? AND EXISTS (SELECT 1 FROM payslip_store s WHERE s.run_id = payslip_runs.run_id) ORDER BY payment_date DESC LIMIT 1").bind(today).first();
+  if (!run) return { ok: false, note: "no pay run found" };
+  const tot = await env.DB.prepare("SELECT COUNT(*) AS n, SUM(tax) AS t FROM payslip_store WHERE run_id = ?").bind(run.run_id).first();
+  const amount = Math.round((Number(tot && tot.t) || 0) * 100) / 100;
+  if (!(amount > 0)) return { ok: false, note: "no tax withheld on that run" };
+  const dots = (iso) => String(iso || "").slice(0, 10).split("-").reverse().join(".");
+  const ref = `PAYG-${String(run.period_end).slice(0, 10).replace(/-/g, "")}`;
+  let crow = await env.DB.prepare("SELECT contact_id, name FROM xero_contacts WHERE name_lc LIKE '%australian taxation office%' LIMIT 1").first();
+  if (!crow) crow = await env.DB.prepare("SELECT contact_id, name FROM xero_contacts WHERE name_lc LIKE '%taxation office%' OR name_lc = 'ato' LIMIT 1").first();
+  if (!crow) return { ok: false, note: "no Australian Taxation Office contact in Xero" };
+  const dup = await xeroFetch(env, `api.xro/2.0/Invoices?where=${encodeURIComponent(`Type=="ACCPAY" AND InvoiceNumber=="${ref}" AND Contact.ContactID==Guid("${crow.contact_id}")`)}`);
+  if (dup.ok && (((await dup.json()).Invoices) || []).some((i) => i.Status !== "DELETED" && i.Status !== "VOIDED")) return { ok: true, status: "EXISTS", note: "already in Xero" };
+  const ar = await xeroFetch(env, "api.xro/2.0/Accounts");
+  if (!ar.ok) return { ok: false, note: `Xero accounts ${ar.status}` };
+  const acc = (((await ar.json()).Accounts) || []).find((a) => /payg\s*withholding/i.test(String(a.Name || "")) && a.Status !== "ARCHIVED");
+  if (!acc) return { ok: false, note: "no PAYG Withholdings Payable account in Xero" };
+  const line = { Description: `PAYG withheld, week ending ${dots(run.period_end)}`, Quantity: 1, UnitAmount: amount, AccountCode: acc.Code, TaxType: "BASEXCLUDED" };
+  const body = { Invoices: [{ Type: "ACCPAY", Contact: { ContactID: crow.contact_id }, InvoiceNumber: ref, Reference: ref, Date: String(run.payment_date).slice(0, 10), DueDate: String(run.payment_date).slice(0, 10), LineAmountTypes: "Exclusive", Status: status || "DRAFT", LineItems: [line] }] };
+  const res = await xeroFetch(env, "api.xro/2.0/Invoices?summarizeErrors=false", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  if (!res.ok) return { ok: false, note: `Xero ${res.status}: ${String(await res.text()).slice(0, 200)}` };
+  const inv = (((await res.json()).Invoices) || [])[0] || {};
+  if (!inv.InvoiceID || /^0+(-0+)*$/.test(inv.InvoiceID) || inv.StatusAttributeString === "ERROR") return { ok: false, note: ([...(inv.ValidationErrors || [])].map((e) => e.Message).join("; ") || "Xero did not save the bill").slice(0, 200) };
+  const pdf = paygPdf({ ref, start: dots(run.period_start), end: dots(run.period_end), pay: dots(run.payment_date), people: Number(tot.n) || 0, amount: amount.toFixed(2) });
+  const at = await xeroFetch(env, `api.xro/2.0/Invoices/${inv.InvoiceID}/Attachments/${encodeURIComponent(ref + ".pdf")}`, { method: "PUT", headers: { "Content-Type": "application/pdf" }, body: pdf });
+  return { ok: true, status: inv.Status, id: inv.InvoiceID, note: `${ref} $${amount.toFixed(2)} ${inv.Status}${at.ok ? "" : ", PDF not attached (Xero " + at.status + ")"}` };
+}
 // Xero never replies to the bills inbox email, so Reservoir looks in the Xero Files inbox for the file it sent. Waiting for 10 minutes without finding it means Xero did not take it.
 let xeroVerifyAt = 0;
 async function xeroVerify(env) {
@@ -375,7 +458,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
   await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
 }
 
-const WORKER_BUILD = "Reservoir-Worker-2026.11.23-w288";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.23-w289";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -6303,6 +6386,14 @@ async function noticesTable(env) {
       await migMark(env, "reimb_xero_at_v1", `${d && d.meta ? d.meta.changes : 0} reimbursements stamped`);
     } catch (e) { /* tried again on the next start */ }
   }
+  // One time, 23 November 2026: a test PAYG withholding bill for last week's pay run, left as a draft in Xero.
+  if (!(await migDone(env, "payg_bill_test_v1"))) {
+    try {
+      const r = await paygBill(env, null, "DRAFT");
+      if (r && r.ok) await migMark(env, "payg_bill_test_v1", String(r.note || r.status || "done").slice(0, 200));
+      else console.log("payg test bill not made", r && r.note);
+    } catch (e) { console.log("payg test bill failed", String(e && e.message || e)); }
+  }
   // One time, 17 November 2026: second try, matching Mitch by first name or email, so his two reimbursements from 16 November are waiting again.
   if (!(await migDone(env, "mitch_reimb_reopen_v2"))) {
     try {
@@ -7263,6 +7354,7 @@ async function payrollSweep(env) {
   }
   await env.DB.prepare("UPDATE payslip_runs SET filed = 1, filed_at = datetime('now'), filed_by = 'Xero' WHERE run_id = ? AND filed = 0").bind(run.run_id).run();
   try { await timesheetSync(env); } catch (e) { /* banking is retried by the Pay Run Filed button */ }
+  try { await paygBill(env, run.run_id, "DRAFT"); } catch (e) { console.log("payg bill failed", String(e && e.message || e)); }
 }
 
 // ---- Incident reports. Any team member lodges one from the First Aid tile. The directors and managers (T1 and T2) get an urgent alert, open the report, and one of them presses Assign to Me. Nobody can assign it to anyone else. Until someone does, the alert repeats every half hour. ----
