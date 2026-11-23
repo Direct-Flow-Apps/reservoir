@@ -407,7 +407,7 @@ function paygPdf(o) {
   for (let i = 0; i < out.length; i++) b[i] = out.charCodeAt(i) & 255;
   return b;
 }
-async function paygBill(env, runId, status) {
+async function paygBill(env, runId, status, replace) {
   await payslipTables(env);
   await xeroContactsTable(env);
   const today = new Date(Date.now() + 11 * 3600000).toISOString().slice(0, 10);
@@ -425,7 +425,12 @@ async function paygBill(env, runId, status) {
   if (!crow) crow = await env.DB.prepare("SELECT contact_id, name FROM xero_contacts WHERE name_lc LIKE '%taxation office%' OR name_lc = 'ato' LIMIT 1").first();
   if (!crow) return { ok: false, note: "no Australian Taxation Office contact in Xero" };
   const dup = await xeroFetch(env, `api.xro/2.0/Invoices?where=${encodeURIComponent(`Type=="ACCPAY" AND InvoiceNumber=="${ref}" AND Contact.ContactID==Guid("${crow.contact_id}")`)}`);
-  if (dup.ok && (((await dup.json()).Invoices) || []).some((i) => i.Status !== "DELETED" && i.Status !== "VOIDED")) return { ok: true, status: "EXISTS", note: "already in Xero" };
+  if (dup.ok) {
+    const live = (((await dup.json()).Invoices) || []).filter((i) => i.Status !== "DELETED" && i.Status !== "VOIDED");
+    if (live.length && !(replace && live.every((i) => i.Status === "DRAFT"))) return { ok: true, status: "EXISTS", note: "already in Xero" };
+    // A test draft is replaced with the current design.
+    for (const i of live) await xeroFetch(env, `api.xro/2.0/Invoices/${i.InvoiceID}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ Invoices: [{ InvoiceID: i.InvoiceID, Status: "DELETED" }] }) });
+  }
   const ar = await xeroFetch(env, "api.xro/2.0/Accounts");
   if (!ar.ok) return { ok: false, note: `Xero accounts ${ar.status}` };
   const acc = (((await ar.json()).Accounts) || []).find((a) => /payg\s*withholding/i.test(String(a.Name || "")) && a.Status !== "ARCHIVED");
@@ -483,7 +488,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
   await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
 }
 
-const WORKER_BUILD = "Reservoir-Worker-2026.11.23-w293";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.23-w294";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -6411,11 +6416,13 @@ async function noticesTable(env) {
       await migMark(env, "reimb_xero_at_v1", `${d && d.meta ? d.meta.changes : 0} reimbursements stamped`);
     } catch (e) { /* tried again on the next start */ }
   }
-  // One time, 23 November 2026: a test PAYG withholding bill for last week's pay run, left as a draft in Xero.
-  if (!(await migDone(env, "payg_bill_test_v1"))) {
+  // One time, 23 November 2026: the PAYG notice for the pay run ending 15 November, as a draft bill in Xero (any earlier test draft is replaced).
+  if (!(await migDone(env, "payg_bill_test_v2"))) {
     try {
-      const r = await paygBill(env, null, "DRAFT");
-      if (r && r.ok) await migMark(env, "payg_bill_test_v1", String(r.note || r.status || "done").slice(0, 200));
+      await payslipTables(env);
+      const pr = await env.DB.prepare("SELECT run_id FROM payslip_runs WHERE period_end LIKE '2026-11-15%' LIMIT 1").first();
+      const r = pr ? await paygBill(env, pr.run_id, "DRAFT", true) : { ok: false, note: "no pay run ending 15 November" };
+      if (r && r.ok) await migMark(env, "payg_bill_test_v2", String(r.note || r.status || "done").slice(0, 200));
       else console.log("payg test bill not made", r && r.note);
     } catch (e) { console.log("payg test bill failed", String(e && e.message || e)); }
   }
