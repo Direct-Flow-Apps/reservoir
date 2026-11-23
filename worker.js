@@ -308,6 +308,31 @@ async function receiptRecordsTable(env) {
   try { await env.DB.prepare("UPDATE receipt_records SET xero_state = NULL").run(); } catch (e) { /* ignore */ }
 }
 
+// A fuel receipt Xero turns into a draft bill with no contact. When it reads as fuel, the contact becomes DFP Fuel and the bill is due on its own date.
+const FUEL_RE = /\b(fuel|diesel|unleaded|ulp|petrol|e10|premium|bp|shell|ampol|caltex|7[- ]?eleven|united petroleum|puma|viva energy|liberty|coles express|metro petroleum|reddy express|apco)\b/i;
+async function fuelDraftFix(env) {
+  await xeroContactsTable(env);
+  const row = await env.DB.prepare("SELECT contact_id, name FROM xero_contacts WHERE name_lc LIKE '%dfp fuel%' LIMIT 1").first();
+  if (!row) return;
+  const since = new Date(Date.now() - 14 * 86400000).toUTCString();
+  const res = await xeroFetch(env, `api.xro/2.0/Invoices?where=${encodeURIComponent('Type=="ACCPAY" AND Status=="DRAFT"')}&order=${encodeURIComponent("UpdatedDateUTC DESC")}&page=1`, { headers: { "If-Modified-Since": since } });
+  if (!res.ok) return;
+  const list = ((await res.json()).Invoices) || [];
+  for (const d of list) {
+    const c = d.Contact || {};
+    if (c.ContactID && c.Name) continue;
+    const one = await xeroFetch(env, `api.xro/2.0/Invoices/${d.InvoiceID}`);
+    if (!one.ok) continue;
+    const inv = (((await one.json()).Invoices) || [])[0] || {};
+    if ((inv.Contact || {}).ContactID) continue;
+    const text = [inv.Reference, ...(inv.LineItems || []).map((l) => l.Description)].filter(Boolean).join(" ");
+    if (!FUEL_RE.test(text)) continue;
+    const date = String(inv.DateString || "").slice(0, 10);
+    if (!date) continue;
+    const body = { Invoices: [{ InvoiceID: inv.InvoiceID, Contact: { ContactID: row.contact_id }, Date: date, DueDate: date }] };
+    await xeroFetch(env, "api.xro/2.0/Invoices", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  }
+}
 // Xero never replies to the bills inbox email, so Reservoir looks in the Xero Files inbox for the file it sent. Waiting for 10 minutes without finding it means Xero did not take it.
 let xeroVerifyAt = 0;
 async function xeroVerify(env) {
@@ -337,7 +362,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
   await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
 }
 
-const WORKER_BUILD = "Reservoir-Worker-2026.11.23-w283";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.23-w284";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -8320,6 +8345,7 @@ export default {
     // A five minute trigger, if one is added, only looks for new mail so pings arrive quickly.
     if (event && event.cron === "*/5 * * * *") { ctx.waitUntil(mergeExportTest(env).catch((e) => console.log("export test failed", String(e && e.message || e)))); ctx.waitUntil(mergeCopyUndo(env).catch((e) => console.log("copy undo failed", String(e && e.message || e)))); ctx.waitUntil(mergeSentCopy(env).catch((e) => console.log("sent copy failed", String(e && e.message || e)))); ctx.waitUntil(mergeAutoReply(env).catch((e) => console.log("autoreply failed", String(e && e.message || e)))); ctx.waitUntil(mergeArchiveCopy(env).catch((e) => console.log("archive copy failed", String(e && e.message || e)))); ctx.waitUntil(mailWatch(env).catch((e) => console.log("mail watch failed", String(e && e.message || e)))); ctx.waitUntil(mailHoldSweep(env).catch((e) => console.log("hold sweep failed", String(e && e.message || e)))); ctx.waitUntil(vbaSubscribe(env).then(() => vbaWatch(env)).catch((e) => console.log("vba watch failed", String(e && e.message || e)))); return; }
     // Every run checks the automatic timesheets and the payroll sweeps. The leave sync keeps its own schedule and is skipped on the half hourly one.
+    ctx.waitUntil(fuelDraftFix(env).catch((e) => console.log("fuel draft fix failed", String(e && e.message || e))));
     ctx.waitUntil(tsAutoRun(env).catch((e) => console.log("auto timesheets failed", String(e && e.message || e))));
     ctx.waitUntil(pushFlushHeld(env));
     ctx.waitUntil(dailyOpsAlert(env).catch((e) => console.log("daily ops alert failed", String(e && e.message || e))));
