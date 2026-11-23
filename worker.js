@@ -337,7 +337,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
   await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
 }
 
-const WORKER_BUILD = "Reservoir-Worker-2026.11.23-w277";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.23-w278";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -3257,7 +3257,7 @@ async function pdfTextRuns(bytes, opts = {}) {
       const nums = [];
       const tok = /\[((?:\((?:\\.|[^\\)])*\)|[^\]])*)\]|\(((?:\\.|[^\\)])*)\)|<([0-9A-Fa-f\s]+)>|\/([A-Za-z0-9_.+-]+)|(-?[\d.]+)|([A-Za-z*'"]+)/g;
       let t, last = null;
-      const emit = async (str, hex) => {
+      const emit = async (str, hex, mapped) => {
         if (hex) {
           // Hex strings are glyph numbers, two bytes each, turned into text by the font's ToUnicode map.
           const cm = await cmapOf(font);
@@ -3268,7 +3268,7 @@ async function pdfTextRuns(bytes, opts = {}) {
           str = o.replace(/\t/g, " ");
         }
         // Literal strings in a font with a ToUnicode map: two byte glyph codes (CID fonts) or one byte codes (simple fonts) translated through the map.
-        if (!hex && font && str) {
+        if (!hex && !mapped && font && str) {
           const cm1 = await cmapOf(font);
           if (cm1) {
             let o = "";
@@ -3282,8 +3282,8 @@ async function pdfTextRuns(bytes, opts = {}) {
         // One glyph per Tj (Odoo): glyphs on the same line a short way apart belong to the same word or phrase.
         if (hex && last && last.page === page && Math.abs(last.y - y) < 0.5 && x >= last.lastX && x - last.lastX < 25) { last.t += str; last.lastX = x; return; }
         if (!str.trim()) return;
-        if (last && last.x === x && last.y === y && last.page === page) last.t += str;
-        else { last = { x, y, t: str, page, lastX: x, size: fsize }; items.push(last); }
+        if (last && last.x === x && last.y === y && last.page === page && last.blk === b.index) last.t += str;
+        else { last = { x, y, t: str, page, lastX: x, size: fsize, blk: b.index }; items.push(last); }
       };
       while ((t = tok.exec(b[1]))) {
         if (t[5] !== undefined) { nums.push(Number(t[5])); continue; }
@@ -3306,11 +3306,13 @@ async function pdfTextRuns(bytes, opts = {}) {
           else if (a && a.hex !== undefined) await emit(a.hex, true);
           else if (a && a.arr !== undefined) {
             let out = "";
-            for (const p of a.arr.matchAll(/\(((?:\\.|[^\\)])*)\)|(-?[\d.]+)/g)) {
+            const hcm = /<[0-9A-Fa-f\s]+>/.test(a.arr) ? await cmapOf(font) : null;
+            for (const p of a.arr.matchAll(/\(((?:\\.|[^\\)])*)\)|<([0-9A-Fa-f\s]+)>|(-?[\d.]+)/g)) {
               if (p[1] !== undefined) out += unesc(p[1]);
-              else if (Number(p[2]) <= -250) out += " ";
+              else if (p[2] !== undefined) { const h = p[2].replace(/\s+/g, ""); if (hcm) { for (let k = 0; k + 3 < h.length; k += 4) out += hcm[parseInt(h.slice(k, k + 4), 16)] || ""; } else for (let k = 0; k + 1 < h.length; k += 2) out += String.fromCharCode(parseInt(h.slice(k, k + 2), 16)); }
+              else if (Number(p[3]) <= -250) out += " ";
             }
-            await emit(out);
+            await emit(out, false, !!hcm || /<[0-9A-Fa-f\s]+>/.test(a.arr));
           }
         }
         nums.length = 0;
@@ -3666,17 +3668,33 @@ async function remittanceParse(bytes) {
     if (r) r.cells.push(it); else rows.push({ page: it.page, y: it.y, cells: [it] });
   }
   for (const r of rows) r.cells.sort((a, b) => a.x - b.x);
+  const mon = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+  const dmy = (t) => { const x = String(t).match(/(\d{1,2})\/(\d{1,2})\/(\d{4})/); if (x) return `${x[3]}-${String(x[2]).padStart(2, "0")}-${String(x[1]).padStart(2, "0")}`; const y = String(t).match(/(\d{1,2})\s+([A-Za-z]{3})[a-z]*\.?,?\s+(\d{4})/); const mi = y ? mon.indexOf(y[2].toLowerCase()) : -1; return y && mi >= 0 ? `${y[3]}-${String(mi + 1).padStart(2, "0")}-${String(y[1]).padStart(2, "0")}` : ""; };
   const first = rows[0] && rows[0].cells[0] ? String(rows[0].cells[0].t).trim() : "";
-  const payer = first.replace(/\s*-\s*NEW$/i, "").slice(0, 60);
-  let total = 0, date = "";
+  let payer = first.replace(/\s*-\s*NEW$/i, "").slice(0, 60);
+  const co = rows.flatMap((r) => r.cells).map((c) => String(c.t).trim()).find((t) => /\b(pty|ltd|limited)\b/i.test(t) && !/direct\s*flow/i.test(t) && t.length < 70);
+  if (co) payer = co.replace(/\s*-\s*NEW$/i, "");
+  let total = 0, date = "", payX = null;
   const lines = [];
-  for (const r of rows) {
+  const invRe = /^[A-Za-z]{2,6}[-#\s]?\d{3,}[A-Za-z0-9-]*$/;
+  const plainRe = /^[A-Za-z]{0,6}[-#\s]?\d{3,}[A-Za-z0-9-]*$/;
+  for (let ri = 0; ri < rows.length; ri++) {
+    const r = rows[ri];
     const texts = r.cells.map((c) => String(c.t).trim());
     const joined = texts.join(" ");
-    if (/Payment Amount/i.test(joined)) { const m = texts.filter((t) => moneyRe.test(t)); if (m.length) total = num(m[m.length - 1]); }
-    if (/^Date:?$/i.test(texts[0]) || /^Date:/i.test(texts[0])) { const m = joined.match(/(\d{1,2})\/(\d{1,2})\/(\d{4})/); if (m) date = `${m[3]}-${String(m[2]).padStart(2, "0")}-${String(m[1]).padStart(2, "0")}`; }
-    const money = texts.filter((t) => moneyRe.test(t));
-    if (money.length >= 1 && texts.length >= 3 && /^[A-Za-z]{0,6}[-#\s]?\d{3,}[A-Za-z0-9-]*$/.test(texts[0]) && !moneyRe.test(texts[0])) lines.push({ number: texts[0].toUpperCase(), pay: num(money[money.length - 1]) });
+    const money = r.cells.filter((c) => moneyRe.test(String(c.t).trim()));
+    if (/Payment Amount|Total\s+(AUD\s+)?paid|Amount Paid\s*:?\s*\$|Total Paid/i.test(joined) && money.length) total = num(money[money.length - 1].t);
+    if (!date && (/^Date:?/i.test(texts[0]) || /Payment Date/i.test(joined))) {
+      date = dmy(joined) || (rows[ri + 1] ? dmy(rows[ri + 1].cells.map((c) => c.t).join(" ")) : "");
+    }
+    const hd = r.cells.find((c) => /^(amount paid|paid|payment( amount)?|amount)$/i.test(String(c.t).trim()));
+    if (hd && !money.length) { payX = hd.x; continue; }
+    if (!money.length) continue;
+    const idCell = r.cells.find((c) => invRe.test(String(c.t).trim()) && !moneyRe.test(String(c.t).trim())) || (texts.length >= 3 && plainRe.test(texts[0]) && !moneyRe.test(texts[0]) ? r.cells[0] : null);
+    if (!idCell) continue;
+    let pc = money[money.length - 1];
+    if (payX !== null) pc = money.slice().sort((a, b) => Math.abs(a.x - payX) - Math.abs(b.x - payX))[0];
+    lines.push({ number: String(idCell.t).trim().toUpperCase(), pay: num(pc.t) });
   }
   if (!lines.length) return null;
   const sum = Math.round(lines.reduce((a, l) => a + l.pay, 0) * 100) / 100;
