@@ -445,6 +445,90 @@ async function paygBill(env, runId, status, replace) {
   const at = await xeroFetch(env, `api.xro/2.0/Invoices/${inv.InvoiceID}/Attachments/${encodeURIComponent(ref + ".pdf")}`, { method: "PUT", headers: { "Content-Type": "application/pdf" }, body: pdf });
   return { ok: true, status: inv.Status, id: inv.InvoiceID, note: `${ref} $${amount.toFixed(2)} ${inv.Status}${at.ok ? "" : ", PDF not attached (Xero " + at.status + ")"}` };
 }
+// Monday Finance Report for Andrew, read from Xero: bills due this week and the rest of the month, and the invoices that are overdue.
+async function xeroAwaiting(env, type) {
+  const out = [];
+  for (let page = 1; page <= 30; page++) {
+    const r = await xeroFetch(env, `api.xro/2.0/Invoices?where=${encodeURIComponent(`Type=="${type}" AND Status=="AUTHORISED"`)}&page=${page}`);
+    if (!r.ok) throw new Error(`Xero ${r.status}`);
+    const list = ((await r.json()).Invoices) || [];
+    out.push(...list);
+    if (list.length < 100) break;
+  }
+  return out;
+}
+async function financeMonday(env) {
+  const now = tsMelbourne(new Date());
+  const day = (iso, n) => new Date(Date.parse(iso + "T00:00:00Z") + n * 86400000).toISOString().slice(0, 10);
+  const mon = day(now.date, -((now.dow + 6) % 7));
+  const sun = day(mon, 6);
+  const [y, m] = now.date.split("-").map(Number);
+  const monthEnd = new Date(Date.UTC(y, m, 0)).toISOString().slice(0, 10);
+  const restFrom = day(sun, 1);
+  const sum = (list, ok) => { let n = 0, t = 0; for (const i of list) { const d = String(i.DueDateString || "").slice(0, 10); const a = Number(i.AmountDue) || 0; if (d && a > 0 && ok(d)) { n++; t += a; } } return { n, total: Math.round(t * 100) / 100 }; };
+  const bills = await xeroAwaiting(env, "ACCPAY");
+  const invs = await xeroAwaiting(env, "ACCREC");
+  return {
+    ok: true, today: now.date, weekStart: mon, weekEnd: sun, monthEnd, restFrom,
+    billsWeek: sum(bills, (d) => d >= mon && d <= sun),
+    billsRest: restFrom <= monthEnd ? sum(bills, (d) => d >= restFrom && d <= monthEnd) : { n: 0, total: 0 },
+    overdue: sum(invs, (d) => d < now.date),
+  };
+}
+function financePdf(o) {
+  const esc = (s) => String(s).replace(/[^\x20-\x7e]/g, "").replace(/[\\()]/g, (m) => "\\" + m);
+  const ops = [];
+  const rect = (x, y, w, h, rgb) => ops.push(`${rgb} rg ${x} ${y} ${w} ${h} re f`);
+  const text = (x, y, size, s, bold, rgb) => ops.push(`BT /${bold ? "F2" : "F1"} ${size} Tf ${rgb || "0.13 0.13 0.13"} rg ${x} ${y} Td (${esc(s)}) Tj ET`);
+  const wid = (s, size) => String(s).split("").reduce((n, c) => n + (/[0-9$]/.test(c) ? 0.556 : c === "," || c === "." ? 0.278 : 0.55), 0) * size;
+  const right = (xr, y, size, s, bold, rgb) => text(xr - wid(s, size), y, size, s, bold, rgb);
+  const grey = "0.45 0.47 0.50";
+  const money = (n) => "$" + Number(n).toLocaleString("en-AU", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  rect(0, 742, 595, 100, "0.16 0.17 0.19");
+  ops.push("q 44 0 0 44 40 770 cm /Im1 Do Q");
+  text(96, 796, 20, "Monday Finance Report", true, "1 1 1");
+  text(96, 778, 11, `Week of ${o.week}`, false, "0.80 0.82 0.85");
+  text(40, 700, 10, "PREPARED FOR", true, grey);
+  text(40, 684, 13, "Andrew Wowk", true);
+  rect(40, 660, 515, 1, "0.85 0.86 0.88");
+  const head = (y, a) => { text(40, y, 10, a, true, grey); right(400, y, 10, "COUNT", true, grey); right(540, y, 10, "AMOUNT", true, grey); rect(40, y - 10, 515, 1, "0.85 0.86 0.88"); };
+  const row = (y, label, r, bold) => { text(40, y, 12, label, bold); right(400, y, 12, String(r.n), bold); right(540, y, 12, money(r.total), bold); rect(40, y - 8, 515, 0.5, "0.92 0.93 0.94"); };
+  head(625, "BILLS TO PAY");
+  row(603, `Due this week (${o.wk})`, o.billsWeek);
+  row(581, o.rest ? `Due rest of month (${o.rest})` : "Due rest of month", o.billsRest);
+  const both = { n: o.billsWeek.n + o.billsRest.n, total: o.billsWeek.total + o.billsRest.total };
+  rect(40, 530, 515, 38, "0.99 0.95 0.92");
+  rect(40, 530, 6, 38, "0.96 0.42 0.20");
+  text(60, 545, 12, "Total bills due this month", true);
+  right(400, 545, 12, String(both.n), true);
+  right(540, 545, 12, money(both.total), true);
+  head(490, "INVOICES OWING TO DFP");
+  row(468, "Overdue", o.overdue, true);
+  rect(0, 0, 595, 40, "0.16 0.17 0.19");
+  text(297.5 - wid("Prepared automatically by Reservoir", 9) * 0.9 / 2, 16, 9, "Prepared automatically by Reservoir", false, "0.80 0.82 0.85");
+  const stream = ops.join("\n");
+  const logo = atob(PAYG_LOGO_B64);
+  const objs = [
+    "<</Type/Catalog/Pages 2 0 R>>",
+    "<</Type/Pages/Kids[3 0 R]/Count 1>>",
+    "<</Type/Page/Parent 2 0 R/MediaBox[0 0 595 842]/Contents 4 0 R/Resources<</Font<</F1 5 0 R/F2 6 0 R>>/XObject<</Im1 7 0 R>>>>>>",
+    `<</Length ${stream.length}>>\nstream\n${stream}\nendstream`,
+    "<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>",
+    "<</Type/Font/Subtype/Type1/BaseFont/Helvetica-Bold>>",
+    `<</Type/XObject/Subtype/Image/Width 144/Height 144/ColorSpace/DeviceRGB/BitsPerComponent 8/Filter/FlateDecode/Length ${logo.length}>>\nstream\n${logo}\nendstream`,
+  ];
+  let out = "%PDF-1.4\n";
+  const offs = [];
+  objs.forEach((b, i) => { offs.push(out.length); out += `${i + 1} 0 obj\n${b}\nendobj\n`; });
+  const xref = out.length;
+  out += `xref\n0 ${objs.length + 1}\n0000000000 65535 f \n` + offs.map((n) => String(n).padStart(10, "0") + " 00000 n \n").join("");
+  out += `trailer\n<</Size ${objs.length + 1}/Root 1 0 R>>\nstartxref\n${xref}\n%%EOF`;
+  const b = new Uint8Array(out.length);
+  for (let i = 0; i < out.length; i++) b[i] = out.charCodeAt(i) & 255;
+  return b;
+}
+const financeDots = (iso) => String(iso).split("-").reverse().join(".");
+const financeShort = (iso) => financeDots(iso).slice(0, 5);
 // Xero never replies to the bills inbox email, so Reservoir looks in the Xero Files inbox for the file it sent. Waiting for 10 minutes without finding it means Xero did not take it.
 let xeroVerifyAt = 0;
 async function xeroVerify(env) {
@@ -474,7 +558,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
   await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
 }
 
-const WORKER_BUILD = "Reservoir-Worker-2026.11.23-w295";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.23-w296";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -9431,6 +9515,19 @@ export default {
       } catch (e) {
         console.log("passkey error", String(e && e.message || e));
         return reply(env, 502, { error: String(e && e.message || e).slice(0, 200) });
+      }
+    }
+    if (url.pathname === "/api/finance/monday" || url.pathname === "/api/finance/monday.pdf") {
+      if (user.tier !== "T1" && user.tier !== "T2") return reply(env, 403, { error: "This report is for the office." });
+      try {
+        const d = await financeMonday(env);
+        if (url.pathname.endsWith(".pdf")) {
+          const pdf = financePdf({ week: financeDots(d.weekStart), wk: `${financeShort(d.weekStart)} to ${financeShort(d.weekEnd)}`, rest: d.restFrom <= d.monthEnd ? `${financeShort(d.restFrom)} to ${financeShort(d.monthEnd)}` : "", billsWeek: d.billsWeek, billsRest: d.billsRest, overdue: d.overdue });
+          return new Response(pdf, { status: 200, headers: { "Content-Type": "application/pdf", "Content-Disposition": `inline; filename="Monday Finance Report ${financeDots(d.weekStart)}.pdf"`, ...cors(env), "Cache-Control": "no-store" } });
+        }
+        return reply(env, 200, d);
+      } catch (e) {
+        return reply(env, 200, { ok: false, error: String(e && e.message || e).slice(0, 200) });
       }
     }
     if (url.pathname === "/api/xero/pay" && request.method === "GET") {
