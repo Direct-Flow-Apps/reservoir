@@ -651,7 +651,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
   await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
 }
 
-const WORKER_BUILD = "Reservoir-Worker-2026.11.25-w307";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.25-w308";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -4826,9 +4826,38 @@ function mailAtts(list) {
 }
 const mailWhenOk = (v) => { const t = Date.parse(String(v || "")); return t && t > Date.now() + 30000 ? new Date(t).toISOString() : ""; };
 // Reply and forward: make the draft, put the typed words (in Calibri 11) above the quoted mail, then send it. extra can carry the formatted body, attachments, importance, a send time, or noSend to keep it as a draft.
+// An email moved in from another mailbox can arrive as a draft, and Microsoft refuses to reply to or forward a draft (ErrorInvalidReferenceItem). So the reply is built by hand from the message itself, the way Outlook would: from the new mailbox, to whoever sent it, with the trail underneath.
+const mailEsc = (v) => String(v == null ? "" : v).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+async function mailManualDraft(env, addr, msg, op, to) {
+  const src = await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}?$select=subject,from,replyTo,toRecipients,ccRecipients,body,sentDateTime`, "GET");
+  if (!src.ok || !src.json) return src;
+  const m = src.json;
+  const own = String(addr || "").toLowerCase();
+  const who = (r) => r && r.emailAddress ? { emailAddress: { address: r.emailAddress.address, name: r.emailAddress.name || r.emailAddress.address } } : null;
+  const line = (r) => r && r.emailAddress ? (r.emailAddress.name && r.emailAddress.name !== r.emailAddress.address ? `${mailEsc(r.emailAddress.name)} &lt;${mailEsc(r.emailAddress.address)}&gt;` : mailEsc(r.emailAddress.address)) : "";
+  const fwd = op === "createForward";
+  const subj0 = String(m.subject || "");
+  const subject = fwd ? (/^fw:/i.test(subj0) ? subj0 : "FW: " + subj0) : (/^re:/i.test(subj0) ? subj0 : "RE: " + subj0);
+  let toR = [], ccR = [];
+  if (!fwd) {
+    const first = (Array.isArray(m.replyTo) && m.replyTo.length ? m.replyTo : [m.from]).map(who).filter(Boolean);
+    toR = first;
+    if (op === "createReplyAll") {
+      const seen = new Set(first.map((r) => r.emailAddress.address.toLowerCase()).concat([own]));
+      const more = (list) => (list || []).map(who).filter((r) => r && !seen.has(String(r.emailAddress.address).toLowerCase()) && seen.add(String(r.emailAddress.address).toLowerCase()));
+      toR = first.concat(more(m.toRecipients));
+      ccR = more(m.ccRecipients);
+    }
+  } else if (Array.isArray(to)) toR = to;
+  const when = m.sentDateTime ? new Date(m.sentDateTime).toUTCString() : "";
+  const trail = `<hr style="border:0;border-top:1px solid #B5C4DF;margin:12px 0"><div style="font-family:Calibri,Arial,sans-serif;font-size:11pt"><b>From:</b> ${line(m.from)}<br><b>Sent:</b> ${mailEsc(when)}<br><b>To:</b> ${(m.toRecipients || []).map(line).join("; ")}<br>${(m.ccRecipients || []).length ? `<b>Cc:</b> ${(m.ccRecipients || []).map(line).join("; ")}<br>` : ""}<b>Subject:</b> ${mailEsc(subj0)}</div><br>`;
+  const quoted = trail + String((m.body && m.body.content) || "").replace(/^[\s\S]*?<body[^>]*>/i, "").replace(/<\/body>[\s\S]*$/i, "");
+  return mailDo(env, addr, "/messages", "POST", { subject, toRecipients: toR, ccRecipients: ccR, body: { contentType: "HTML", content: "<html><body>" + quoted + "</body></html>" } });
+}
 async function mailDraftSend(env, addr, msg, op, text, to, extra) {
   const x = extra || {};
-  const made = await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}/${op}`, "POST", {});
+  let made = await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}/${op}`, "POST", {});
+  if (!made.ok && /ErrorInvalidReferenceItem/i.test(String(made.text || ""))) made = await mailManualDraft(env, addr, msg, op, to);
   if (!made.ok || !made.json || !made.json.id) return made;
   const id = made.json.id;
   // A forward carries the original's attachments. The ones taken off in the editor are removed from the draft before it goes.
@@ -5403,7 +5432,12 @@ async function mailRoutes(request, env, user, url) {
         const put = await graphFetch(env, `/users/${encodeURIComponent(mailAddress(env, tb))}/mailFolders/inbox/messages`, { method: "POST", headers: { "Content-Type": "text/plain" }, body: btoa(bin) });
         if (!put.ok) return reply(env, 200, { ok: false, error: "The copy into " + tb.label + " failed. Microsoft answered " + put.status + ". Nothing was changed.", worker: WORKER_BUILD });
         let created = null; try { created = await put.json(); } catch (e) { created = null; }
-        if (created && created.id && created.isDraft) await mailDo(env, mailAddress(env, tb), `/messages/${encodeURIComponent(created.id)}`, "PATCH", { isRead: !!body.read });
+        if (created && created.id && created.isDraft) {
+          await mailDo(env, mailAddress(env, tb), `/messages/${encodeURIComponent(created.id)}`, "PATCH", { isRead: !!body.read });
+          // Clear the unsent flag so the copy is a normal received email that can be replied to.
+          const fl = await mailDo(env, mailAddress(env, tb), `/messages/${encodeURIComponent(created.id)}`, "PATCH", { singleValueExtendedProperties: [{ id: "Integer 0x0E07", value: body.read ? "1" : "0" }] });
+          if (!fl.ok) console.log("moved copy flag clear failed", fl.status);
+        }
         const gone = await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}/move`, "POST", { destinationId: "archive" });
         // newId is the original now in Archive and copyId is the copy in the other mailbox, so the move can be undone.
         return reply(env, 200, { ok: true, label: tb.label, archived: gone.ok, newId: String((gone.ok && gone.json && gone.json.id) || ""), copyId: String((created && created.id) || ""), worker: WORKER_BUILD });
