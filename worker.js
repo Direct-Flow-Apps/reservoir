@@ -568,7 +568,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
   await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
 }
 
-const WORKER_BUILD = "Reservoir-Worker-2026.11.23-w300";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.24-w304";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -4894,6 +4894,28 @@ async function mailRoutes(request, env, user, url) {
     const box = b || (body && mine.find((x) => x.id === body.id));
     if (!box) return reply(env, 403, { error: "forbidden" });
     const addr = mailAddress(env, box);
+    if (url.pathname === "/api/mail/count" && !post) {
+      // How many emails this mailbox holds and a rough guess at the space a searchable copy of the text would take. Read only.
+      const top = await mailGraph(env, addr, "/mailFolders?$top=100&$select=displayName,totalItemCount,childFolderCount");
+      if (!top.ok) return reply(env, 200, { ok: false, error: mailWhy(top), worker: WORKER_BUILD });
+      let total = 0, skipped = 0, level = [];
+      const take = (f) => { const n = Number(f.totalItemCount || 0); if (/^(deleted items|junk email|conversation history|sync issues|conflicts|local failures|server failures|outbox|rss feeds|clutter)/i.test(String(f.displayName || ""))) skipped += n; else total += n; if (Number(f.childFolderCount || 0) > 0) level.push(f); };
+      ((top.json && top.json.value) || []).forEach(take);
+      for (let depth = 0; depth < 8 && level.length; depth++) {
+        const cur = level; level = [];
+        const kids = await Promise.all(cur.map((f) => mailGraph(env, addr, `/mailFolders/${encodeURIComponent(f.id)}/childFolders?$top=100&$select=displayName,totalItemCount,childFolderCount`)));
+        kids.forEach((k) => ((k && k.ok && k.json && k.json.value) || []).forEach(take));
+      }
+      let avg = 0;
+      try {
+        const r = await graphFetch(env, `/users/${encodeURIComponent(addr)}/messages?$top=50&$select=subject,body`, { headers: { Prefer: 'outlook.body-content-type="text"' } });
+        const j = r.ok ? await r.json() : null;
+        const rows = (j && j.value) || [];
+        if (rows.length) avg = Math.round(rows.reduce((t, m) => t + String(m.subject || "").length + String((m.body && m.body.content) || "").length, 0) / rows.length);
+      } catch (e) {}
+      const estMb = Math.round((total * (avg + 300) * 2) / 1048576);
+      return reply(env, 200, { ok: true, total, skipped, avgBytes: avg, estMb, worker: WORKER_BUILD });
+    }
     if (url.pathname === "/api/mail/folders" && !post) {
       const top = await mailGraph(env, addr, "/mailFolders?$top=100&$select=displayName,unreadItemCount,totalItemCount,childFolderCount");
       if (!top.ok) return reply(env, 200, { ok: false, error: mailWhy(top), worker: WORKER_BUILD });
@@ -4933,6 +4955,7 @@ async function mailRoutes(request, env, user, url) {
       const filter = url.searchParams.get("filter") || "";
       const q = String(url.searchParams.get("q") || "").replace(/["\\]/g, " ").trim().slice(0, 100);
       const fields = "$select=subject,from,toRecipients,receivedDateTime,isRead,bodyPreview,hasAttachments,categories,flag,parentFolderId,internetMessageId&$expand=singleValueExtendedProperties($filter=id eq 'Integer 0x1081')";
+      const cursorGiven = !!String(url.searchParams.get("cursor") || "");
       const where = new Map();
       const loadWhere = async () => {
         if (!q) return;
@@ -4956,7 +4979,10 @@ async function mailRoutes(request, env, user, url) {
           } catch (e) {}
         }
       };
-      const whereP = q ? loadWhere() : null;
+      // A search limited to one folder already knows its folder name, so the folder walk is not needed. A search of every folder starts the walk but does not make the first page wait for it.
+      const oneFolder = !!q && url.searchParams.get("scope") === "folder";
+      const oneName = oneFolder ? (/^archive$/i.test(String(folder)) ? "Archive" : /^sentitems$/i.test(String(folder)) ? "Sent Items" : "") : "";
+      const whereP = q && !oneFolder ? loadWhere() : null;
       let rows = [];
       let searchNext = "";
       if (!q && /^outbox$/i.test(String(folder))) {
@@ -4968,7 +4994,7 @@ async function mailRoutes(request, env, user, url) {
       } else if (q) {
         // A search is read a page at a time so the first results show straight away. The first page is small and quick, and each answer carries a cursor for the next page, which the app keeps asking for until Graph has no more (Graph itself stops a message search at 1,000 results).
         const cur = String(url.searchParams.get("cursor") || "");
-        const start = cur && cur.startsWith(GRAPH + "/") && cur.length < 4000 ? cur : `/messages?$top=${MAIL_SEARCH_FIRST}&${fields}&$search=${encodeURIComponent('"' + q + '"')}`;
+        const start = cur && cur.startsWith(GRAPH + "/") && cur.length < 4000 ? cur : `${oneFolder ? "/mailFolders/" + encodeURIComponent(folder) : ""}/messages?$top=${MAIL_SEARCH_FIRST}&${fields}&$search=${encodeURIComponent('"' + q + '"')}`;
         const r = await mailGraph(env, addr, start);
         if (!r.ok) return reply(env, 200, { ok: false, error: mailWhy(r), worker: WORKER_BUILD });
         rows = ((r.json && r.json.value) || []).filter((m) => m && m.id);
@@ -4986,8 +5012,8 @@ async function mailRoutes(request, env, user, url) {
       }
       if (!q && /^drafts$/i.test(String(folder))) { const hid = new Set((await mailHoldIds(env, addr)).map((h) => h.draft_id)); if (hid.size) rows = rows.filter((m) => !hid.has(m.id)); }
       // A search covers every folder, so each result says which folder it is in.
-      await whereP;
-      const list = rows.map((m) => ({ id: m.id, pf: String(m.parentFolderId || ""), ...(q && where.get(m.parentFolderId) ? { folder: where.get(m.parentFolderId).slice(0, 40) } : null), from: mailShow(m.from).slice(0, 80), fromAddr: mailPart(m.from).address.toLowerCase(), to: ((m.toRecipients || []).map(mailShow).join(", ")).slice(0, 120), toAddr: String((((m.toRecipients || [])[0] || {}).emailAddress || {}).address || "").toLowerCase().slice(0, 120), subject: String(m.subject || "(no subject)").slice(0, 160), at: m.receivedDateTime || "", read: !!m.isRead, attach: !!m.hasAttachments, categories: (m.categories || []).slice(0, 6).map((c) => String(c).slice(0, 40)), flag: mailFlag(m.flag), ans: mailAns(m), preview: String(m.bodyPreview || "").replace(/\s+/g, " ").slice(0, 140) }));
+      if (whereP) await Promise.race([whereP, new Promise((r) => setTimeout(r, cursorGiven ? 30000 : 1200))]);
+      const list = rows.map((m) => ({ id: m.id, pf: String(m.parentFolderId || ""), ...(q && oneName ? { folder: oneName } : q && where.get(m.parentFolderId) ? { folder: where.get(m.parentFolderId).slice(0, 40) } : null), from: mailShow(m.from).slice(0, 80), fromAddr: mailPart(m.from).address.toLowerCase(), to: ((m.toRecipients || []).map(mailShow).join(", ")).slice(0, 120), toAddr: String((((m.toRecipients || [])[0] || {}).emailAddress || {}).address || "").toLowerCase().slice(0, 120), subject: String(m.subject || "(no subject)").slice(0, 160), at: m.receivedDateTime || "", read: !!m.isRead, attach: !!m.hasAttachments, categories: (m.categories || []).slice(0, 6).map((c) => String(c).slice(0, 40)), flag: mailFlag(m.flag), ans: mailAns(m), preview: String(m.bodyPreview || "").replace(/\s+/g, " ").slice(0, 140) }));
       const extra = await mailExtraFor(env, box.id, rows.map((m) => m.internetMessageId));
       list.forEach((it, i) => { const imid = rows[i] && rows[i].internetMessageId; if (!imid) return; it.imid = String(imid).slice(0, 300); const x = extra.get(it.imid); if (x) { if (x.note) it.note = true; if (x.urgent_off) it.uoff = true; if (x.marker) it.marker = String(x.marker).slice(0, 20); } });
       if (box.id === "jobs") list.forEach((it, i) => { if (it.marker) return; const tos = ((rows[i] && rows[i].toRecipients) || []).map((x) => String((x.emailAddress && x.emailAddress.address) || "").toLowerCase()); if (tos.includes(mailAddress(env, MAILBOXES.find((b) => b.id === "maintenance")).toLowerCase())) it.marker = "Maintenance"; else if (tos.includes(String(env.MAILBOX_ENQUIRIES || ENQUIRIES_ADDR).toLowerCase())) it.marker = "Enquiries"; });
@@ -6801,9 +6827,9 @@ async function pushForNotice(env, n, id) {
     const muted = (r) => !!n.box && String(r.mail_off || "").split(",").includes(String(n.box));
     const sendTo = String(n.kind || "") === "mail" ? (hasWeir ? rows.filter((r) => r.app === "mail" && r.mail_on !== 0 && !muted(r)) : rows.filter((r) => r.mail_on !== 0 && !muted(r))) : rows.filter((r) => r.app !== "mail");
     if (!sendTo.length) return;
-    const payload = { title: String(n.title || "Reservoir").slice(0, 120), body: n.kind === "request" ? String(n.body || "Open Reservoir to read it").slice(0, 160) : n.kind === "mail" ? (n.preview ? String(n.body || "").slice(0, 160) : "") : "Open Reservoir to read it", tag: `n-${id || Date.now()}`, open: /^[a-z]+$/.test(String(n.link || "")) ? String(n.link) : "notices" };
+    const payload = { title: String(n.title || "Reservoir").slice(0, 120), body: n.kind === "request" ? String(n.body || "Open Reservoir to read it").slice(0, 160) : n.kind === "mail" ? (n.preview ? String(n.body || "").slice(0, 160) : "") : "Open Reservoir to read it", tag: `n-${id || Date.now()}`, open: /^[a-z]+(:[a-z0-9]+){0,2}$/.test(String(n.link || "")) ? String(n.link) : "notices", ...(n.kind === "mail" && /^[a-z0-9]{1,20}$/.test(String(n.box || "")) ? { box: String(n.box) } : null) };
     await Promise.allSettled(sendTo.map(async (r) => {
-      const pl = String(n.kind || "") === "mail" ? { ...payload, ...(r.app === "mail" ? { url: "/mail" } : {}), ...(r.mail_sound === 0 ? { silent: true } : {}) } : payload;
+      const pl = String(n.kind || "") === "mail" ? { ...payload, ...(r.app === "mail" ? { url: /^[a-z0-9]{1,20}$/.test(String(n.box || "")) ? `/mail?open=emailbox&box=${n.box}` : "/mail" } : {}), ...(r.mail_sound === 0 ? { silent: true } : {}) } : payload;
       if (pushInHours(pushModeOf(r))) return pushSendOne(env, r, pl);
       await env.DB.prepare("INSERT INTO push_held (endpoint) VALUES (?)").bind(r.endpoint).run();
     }));
@@ -9418,7 +9444,7 @@ export default {
           await env.DB.prepare("UPDATE profile_requests SET status = 'processed', processed_by = ?, processed_at = datetime('now'), seen_at = NULL WHERE id = ?").bind(user.email || "unknown", row.id).run();
           const doneRow = await env.DB.prepare("SELECT * FROM profile_requests WHERE id = ?").bind(row.id).first();
           await profileAudit(env, "processed", doneRow, user.name || user.email || "unknown", vals.address !== undefined || vals.mobile !== undefined ? "Written to Xero and read back" : "Saved");
-          { const what = vals.address !== undefined ? "Address" : vals.mobile !== undefined ? "Mobile" : row.section === "emergency" ? "Emergency contact" : "Profile"; await notify(env, { to: row.email, kind: "request", title: `${what} change confirmed`, body: "Your profile has been updated.", link: "profile", by: user.name || "Reservoir" }); }
+          { const what = vals.address !== undefined ? "Address" : vals.mobile !== undefined ? "Mobile" : row.section === "emergency" ? "Emergency contact" : "Profile"; await notify(env, { to: row.email, kind: "request", title: `${what} change confirmed`, body: "Your profile has been updated.", link: "myfile", by: user.name || "Reservoir" }); }
           return reply(env, 200, { request: profileRequestOut(doneRow), xero: vals.address !== undefined || vals.mobile !== undefined });
         }
         if (row.section === "bank" || row.section === "super") {
@@ -9447,7 +9473,7 @@ export default {
           await env.DB.prepare("UPDATE profile_requests SET status = 'processed', processed_by = ?, processed_at = datetime('now'), seen_at = NULL WHERE id = ?").bind(user.email || "unknown", row.id).run();
           const doneRow = await env.DB.prepare("SELECT * FROM profile_requests WHERE id = ?").bind(row.id).first();
           await profileAudit(env, "processed", doneRow, user.name || user.email || "unknown", row.section === "super" ? "Pulled from Xero" : "Written to Xero");
-          await notify(env, { to: row.email, kind: "request", title: `${row.section === "super" ? "Super" : "Bank details"} change confirmed`, body: "Your profile has been updated.", link: "profile", by: user.name || "Reservoir" });
+          await notify(env, { to: row.email, kind: "request", title: `${row.section === "super" ? "Super" : "Bank details"} change confirmed`, body: "Your profile has been updated.", link: "myfile", by: user.name || "Reservoir" });
           return reply(env, 200, { request: profileRequestOut(doneRow), xero: true });
         }
         let values = {};

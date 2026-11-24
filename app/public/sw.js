@@ -20,18 +20,23 @@ self.addEventListener("push", (e) => {
     silent: d.silent === true,
     icon: "icon-192.png",
     badge: "icon-192.png",
-    data: { open: d.open || "notices", url: typeof d.url === "string" && d.url.charAt(0) === "/" ? d.url : "" }
+    data: { open: d.open || "notices", box: typeof d.box === "string" ? d.box : "", url: typeof d.url === "string" && d.url.charAt(0) === "/" ? d.url : "" }
   }));
 });
 self.addEventListener("notificationclick", (e) => {
   e.notification.close();
   const open = e.notification.data && e.notification.data.open || "notices";
+  const box = e.notification.data && e.notification.data.box || "";
   e.waitUntil((async () => {
     const all = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
-    for (const c of all) {
-      try { await c.focus(); c.postMessage({ type: "push-open", open }); return; } catch (err) {}
-    }
     const go = e.notification.data && e.notification.data.url;
-    await self.clients.openWindow(go || "./?open=" + open);
+    const wantMail = !!go && go.indexOf("/mail") === 0;
+    for (const c of all) {
+      let isMail = false;
+      try { isMail = new URL(c.url).pathname.indexOf("/mail") === 0; } catch (err) {}
+      if (isMail !== wantMail) continue;
+      try { await c.focus(); c.postMessage({ type: "push-open", open, box }); return; } catch (err) {}
+    }
+    await self.clients.openWindow(go || "./?open=" + open + (box ? "&box=" + encodeURIComponent(box) : ""));
   })());
 });
