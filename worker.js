@@ -286,6 +286,27 @@ async function voiceUpload(env, home, tile, ext, bytes, contentType) {
   return { id: item.id, name: item.name || `${base}${ext}`, kept: version };
 }
 
+// ---- Header Text: card headlines Tayler and Andrey have edited. Kept in Development / Header Text / headers.json. ----
+const HEADS_SEGS = ["Development", "Header Text"];
+let headsCache = { at: 0, map: null };
+async function headsRead(env, fresh) {
+  if (!fresh && headsCache.map && Date.now() - headsCache.at < 30000) return headsCache.map;
+  let map = {};
+  const dl = await graphFetch(env, `/sites/${siteId(env)}/drive/root:/${pathOf([...HEADS_SEGS, "headers.json"])}:/content`, { redirect: "manual" });
+  if (dl.status !== 404) {
+    const loc = dl.headers.get("Location");
+    const file = loc ? await fetch(loc) : dl;
+    if (file.ok) { try { map = JSON.parse(await file.text()) || {}; } catch (e) { map = {}; } }
+  }
+  headsCache = { at: Date.now(), map };
+  return map;
+}
+async function headsWrite(env, map) {
+  const bytes = new TextEncoder().encode(JSON.stringify(map, null, 1)).buffer;
+  await uploadToSharePoint(env, HEADS_SEGS, "headers.json", bytes, "application/json", true);
+  headsCache = { at: Date.now(), map };
+}
+
 async function driveBytes(env, id) {
   const dl = await graphFetch(env, `/sites/${siteId(env)}/drive/items/${id}/content`, { redirect: "manual" });
   const loc = dl.headers.get("Location");
@@ -630,7 +651,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
   await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
 }
 
-const WORKER_BUILD = "Reservoir-Worker-2026.11.25-w306";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.25-w307";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -10598,6 +10619,25 @@ export default {
         return reply(env, 200, { last: await lastOf() });
       }
       return reply(env, 405, { error: "method not allowed" });
+    }
+
+    if (url.pathname === "/api/headers" && request.method === "GET") {
+      try { return reply(env, 200, { heads: await headsRead(env, false), worker: WORKER_BUILD }); }
+      catch (e) { return reply(env, 200, { heads: {}, worker: WORKER_BUILD }); }
+    }
+    if (url.pathname === "/api/headers" && request.method === "PUT") {
+      if (user.tier !== "T1") return reply(env, 403, { error: "forbidden" });
+      let body = {};
+      try { body = await request.json(); } catch (e) { return reply(env, 400, { error: "bad request" }); }
+      const key = String(body.key || "").slice(0, 200);
+      const text = String(body.text || "").slice(0, 200);
+      if (!key) return reply(env, 400, { error: "key needed" });
+      try {
+        const map = { ...(await headsRead(env, true)) };
+        if (text.trim()) map[key] = text; else delete map[key];
+        await headsWrite(env, map);
+        return reply(env, 200, { heads: map, worker: WORKER_BUILD });
+      } catch (e) { return reply(env, 502, { error: "save failed", worker: WORKER_BUILD }); }
     }
 
     if (url.pathname === "/api/voice/list" && request.method === "GET") {
