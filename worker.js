@@ -224,6 +224,68 @@ async function driveMeta(env, id) {
   return m;
 }
 
+// ---- Voice Guides: spoken explanations kept in Development / Voice Guides, one folder per home screen and one audio file per tile. A replaced file is moved into that folder's Previous folder as v1, v2 and so on. ----
+const VOICE_ROOT = ["Development", "Voice Guides"];
+const VOICE_EXT = /\.(mp3|m4a|wav)$/i;
+const voiceNorm = (s) => String(s || "").toLowerCase().replace(/\.(mp3|m4a|wav)$/i, "").replace(/&/g, " and ").replace(/[^a-z0-9]+/g, "");
+let voiceCache = { at: 0, list: null };
+async function voiceChildren(env, segs) {
+  const out = [];
+  let next = `/sites/${siteId(env)}/drive/root:/${pathOf(segs)}:/children?$top=999&$select=id,name,size,file,folder,lastModifiedDateTime`;
+  for (let n = 0; next && n < 10; n++) {
+    const r = await graphFetch(env, next);
+    if (r.status === 404) return null;
+    if (!r.ok) throw new Error("voice list " + r.status);
+    const j = await r.json();
+    out.push(...(j.value || []));
+    next = j["@odata.nextLink"] || "";
+  }
+  return out;
+}
+async function voiceList(env, fresh) {
+  if (!fresh && voiceCache.list && Date.now() - voiceCache.at < 30000) return voiceCache.list;
+  const guides = [];
+  const homes = (await voiceChildren(env, VOICE_ROOT)) || [];
+  for (const h of homes.filter((x) => x.folder)) {
+    const files = (await voiceChildren(env, [...VOICE_ROOT, h.name])) || [];
+    for (const f of files.filter((x) => x.file && VOICE_EXT.test(x.name))) guides.push({ id: f.id, home: h.name, tile: f.name.replace(VOICE_EXT, ""), name: f.name, size: f.size || 0, modified: f.lastModifiedDateTime || "" });
+  }
+  voiceCache = { at: Date.now(), list: guides };
+  return guides;
+}
+async function voiceUpload(env, home, tile, ext, bytes, contentType) {
+  const homes = (await voiceChildren(env, VOICE_ROOT)) || [];
+  const homeFolder = homes.find((x) => x.folder && voiceNorm(x.name) === voiceNorm(home));
+  const homeName = homeFolder ? homeFolder.name : cleanName(home);
+  const segs = [...VOICE_ROOT, homeName];
+  const files = homeFolder ? ((await voiceChildren(env, segs)) || []) : [];
+  const old = files.find((x) => x.file && VOICE_EXT.test(x.name) && voiceNorm(x.name) === voiceNorm(tile));
+  const base = old ? old.name.replace(VOICE_EXT, "") : cleanName(tile);
+  let version = 0;
+  if (old) {
+    let prev = (await voiceChildren(env, [...segs, "Previous"]));
+    let prevId = "";
+    if (prev === null) {
+      const mk = await graphFetch(env, `/sites/${siteId(env)}/drive/root:/${pathOf(segs)}:/children`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: "Previous", folder: {}, "@microsoft.graph.conflictBehavior": "fail" }) });
+      if (mk.ok) prevId = (await mk.json()).id;
+      else { const again = await graphFetch(env, `/sites/${siteId(env)}/drive/root:/${pathOf([...segs, "Previous"])}?select=id`); if (again.ok) prevId = (await again.json()).id; }
+      prev = [];
+    } else {
+      const look = await graphFetch(env, `/sites/${siteId(env)}/drive/root:/${pathOf([...segs, "Previous"])}?select=id`);
+      if (look.ok) prevId = (await look.json()).id;
+    }
+    if (!prevId) throw new Error("previous folder");
+    const have = prev.map((x) => { const m = String(x.name).match(/ v(\d+)\.[A-Za-z0-9]+$/); return m && voiceNorm(String(x.name).replace(/ v\d+\.[A-Za-z0-9]+$/, "")) === voiceNorm(base) ? Number(m[1]) : 0; });
+    version = Math.max(0, ...have) + 1;
+    const oldExt = (old.name.match(VOICE_EXT) || [".mp3"])[0];
+    const mv = await graphFetch(env, `/sites/${siteId(env)}/drive/items/${old.id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: `${base} v${version}${oldExt}`, parentReference: { id: prevId } }) });
+    if (!mv.ok) throw new Error("keep previous " + mv.status);
+  }
+  const item = await uploadToSharePoint(env, segs, `${base}${ext}`, bytes, contentType, true);
+  voiceCache = { at: 0, list: null };
+  return { id: item.id, name: item.name || `${base}${ext}`, kept: version };
+}
+
 async function driveBytes(env, id) {
   const dl = await graphFetch(env, `/sites/${siteId(env)}/drive/items/${id}/content`, { redirect: "manual" });
   const loc = dl.headers.get("Location");
@@ -568,7 +630,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
   await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
 }
 
-const WORKER_BUILD = "Reservoir-Worker-2026.11.24-w305";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.25-w306";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -10536,6 +10598,55 @@ export default {
         return reply(env, 200, { last: await lastOf() });
       }
       return reply(env, 405, { error: "method not allowed" });
+    }
+
+    if (url.pathname === "/api/voice/list" && request.method === "GET") {
+      // Every signed in person can hear the guides, so the list is open to all.
+      try {
+        return reply(env, 200, { guides: await voiceList(env, url.searchParams.get("fresh") === "1"), worker: WORKER_BUILD });
+      } catch (e) {
+        return reply(env, 502, { error: "voice guides could not be read", worker: WORKER_BUILD });
+      }
+    }
+
+    const vf = url.pathname.match(/^\/api\/voice\/file\/([A-Za-z0-9!_-]{1,200})$/);
+    if (vf && request.method === "GET") {
+      try {
+        const metaRes = await graphFetch(env, `/sites/${siteId(env)}/drive/items/${vf[1]}?select=id,name,file,parentReference`);
+        if (!metaRes.ok) return reply(env, 404, { error: "not found", worker: WORKER_BUILD });
+        const meta = await metaRes.json();
+        let path = (meta.parentReference && meta.parentReference.path) || "";
+        try { path = decodeURIComponent(path); } catch (e) { /* keep as is */ }
+        if (!meta.file || !VOICE_EXT.test(meta.name || "") || !path.includes("root:/" + VOICE_ROOT.join("/"))) return reply(env, 404, { error: "not found", worker: WORKER_BUILD });
+        const dl = await graphFetch(env, `/sites/${siteId(env)}/drive/items/${vf[1]}/content`, { redirect: "manual" });
+        const loc = dl.headers.get("Location");
+        const file = loc ? await fetch(loc) : dl;
+        if (!file.ok) return reply(env, 502, { error: "download failed" });
+        const ext = (meta.name.match(VOICE_EXT) || [".mp3"])[0].toLowerCase();
+        const type = ext === ".m4a" ? "audio/mp4" : ext === ".wav" ? "audio/wav" : "audio/mpeg";
+        return new Response(file.body, { status: 200, headers: { ...cors(env), "Content-Type": type, "Cache-Control": "private, max-age=300" } });
+      } catch (e) {
+        return reply(env, 502, { error: "download failed" });
+      }
+    }
+
+    if (url.pathname === "/api/voice/upload" && request.method === "POST") {
+      // Put a new voice guide into its tile's folder. The old one is kept as the next version. T1 only.
+      if (user.tier !== "T1") return reply(env, 403, { error: "forbidden" });
+      const home = String(url.searchParams.get("home") || "").slice(0, 80);
+      const tile = String(url.searchParams.get("tile") || "").slice(0, 80);
+      if (!voiceNorm(home) || !voiceNorm(tile)) return reply(env, 400, { error: "home screen and tile are needed" });
+      const given = String(url.searchParams.get("name") || "");
+      const ext = (given.match(VOICE_EXT) || [""])[0].toLowerCase() || ((request.headers.get("Content-Type") || "").includes("wav") ? ".wav" : (request.headers.get("Content-Type") || "").includes("mp4") ? ".m4a" : ".mp3");
+      const bytes = await request.arrayBuffer();
+      if (!bytes.byteLength) return reply(env, 400, { error: "empty file" });
+      if (bytes.byteLength > MAX_UPLOAD) return reply(env, 413, { error: "file too large" });
+      try {
+        const done = await voiceUpload(env, home, tile, ext, bytes, request.headers.get("Content-Type"));
+        return reply(env, 200, { ...done, worker: WORKER_BUILD });
+      } catch (e) {
+        return reply(env, 502, { error: "upload failed: " + String(e && e.message || e).slice(0, 120), worker: WORKER_BUILD });
+      }
     }
 
     const dm = url.pathname.match(/^\/api\/fleet\/([A-Za-z0-9_-]{1,64})\/docs$/);
