@@ -568,7 +568,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
   await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
 }
 
-const WORKER_BUILD = "Reservoir-Worker-2026.11.24-w304";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.24-w305";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -5179,6 +5179,38 @@ async function mailRoutes(request, env, user, url) {
       }
       if (["send", "reply", "replyall", "forward", "savedraft"].includes(act)) await mailEmbedLogo(env, body);
       const done = (r) => r.ok ? reply(env, 200, { ok: true, worker: WORKER_BUILD }) : reply(env, 200, { ok: false, error: mailWhy(r, true), worker: WORKER_BUILD });
+      // Writing check on Send (Tayler only for now). Own rules for capitals and full stops, then LanguageTool's free public service in Australian English. If LanguageTool cannot be reached the email is allowed through.
+      if (act === "grammar") {
+        const txt = String(body && body.text || "").slice(0, 15000);
+        const problems = [];
+        for (const line of txt.split(/\n+/)) {
+          const t = line.trim();
+          if (!t || /@|https?:\/\//i.test(t)) continue;
+          const words = t.split(/\s+/).length;
+          if (words >= 4 && !/[.!?:;,)"'\u201d]$/.test(t)) problems.push({ message: "No full stop at the end of this line", text: t.slice(0, 60) });
+          if (/^[a-z]/.test(t)) problems.push({ message: "Starts without a capital letter", text: t.slice(0, 60) });
+        }
+        let skipped = false;
+        try {
+          const ctl = new AbortController();
+          const timer = setTimeout(() => ctl.abort(), 5000);
+          const lt = await fetch("https://api.languagetool.org/v2/check", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json" }, body: "language=en-AU&text=" + encodeURIComponent(txt), signal: ctl.signal });
+          clearTimeout(timer);
+          if (!lt.ok) skipped = true;
+          else {
+            const j = await lt.json();
+            for (const m of (j.matches || [])) {
+              const cat = String(m.rule && m.rule.category && m.rule.category.id || "");
+              if (/STYLE|REDUNDANCY|PLAIN_ENGLISH|COLLOQUIALISMS|WIKIPEDIA/.test(cat)) continue;
+              const bit = txt.substr(m.offset, m.length);
+              if (/SPELL|MORFOLOGIK/i.test(String(m.rule && m.rule.id || "")) && (/^[A-Z]/.test(bit) || /\d/.test(bit))) continue;
+              const fix = (m.replacements || []).slice(0, 2).map((r) => r.value).filter(Boolean).join(" or ");
+              problems.push({ message: String(m.shortMessage || m.message || "Check this").slice(0, 80), text: bit.slice(0, 40), fix });
+            }
+          }
+        } catch (e) { skipped = true; }
+        return reply(env, 200, { ok: true, problems: problems.slice(0, 8), total: problems.length, skipped, worker: WORKER_BUILD });
+      }
       if (act === "catadd") {
         const nm = String(body.name || "").replace(/\s+/g, " ").trim().slice(0, 40);
         if (!nm) return reply(env, 200, { ok: false, error: "Give the category a name.", worker: WORKER_BUILD });
