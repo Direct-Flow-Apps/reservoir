@@ -654,7 +654,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
 
 // Update push. Set this to a bundle name (for example "Full-Reservoir-2026.11.25-v26") and every open Reservoir and Weir window that finds that bundle newer than its own reloads straight away, instead of waiting for midnight or a home screen. Leave it empty for the normal gentle update.
 const APP_FORCE_UPDATE = "Full-Reservoir-2026.11.25-v26";
-const WORKER_BUILD = "Reservoir-Worker-2026.11.25-w320";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.25-w321";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -5215,35 +5215,16 @@ async function mailRoutes(request, env, user, url) {
     if (url.pathname === "/api/mail/contacts" && !post) {
       const q = String(url.searchParams.get("q") || "").replace(/['"\\]/g, " ").trim().slice(0, 60);
       if (q.length < 1) return reply(env, 200, { ok: true, contacts: [], worker: WORKER_BUILD });
-      const f = encodeURIComponent(`startswith(displayName,'${q}') or startswith(givenName,'${q}') or startswith(surname,'${q}') or startswith(companyName,'${q}')`);
-      // The sent mail lookup starts at the same time as the contacts lookup, and is kept for five minutes per mailbox, so typing stays quick.
-      globalThis.__sentRcpt = globalThis.__sentRcpt || new Map();
-      const sentP = Promise.all(mine.map(async (bx) => {
-        const hit = globalThis.__sentRcpt.get(bx.id);
-        if (hit && Date.now() - hit.t < 300000) return hit.v;
-        const r = await mailGraph(env, mailAddress(env, bx), "/mailFolders/sentitems/messages?$top=100&$select=toRecipients,ccRecipients,bccRecipients");
-        const v = (r.ok && r.json && r.json.value) || [];
-        if (r.ok) globalThis.__sentRcpt.set(bx.id, { t: Date.now(), v });
-        return v;
-      }));
-      const found = await Promise.all(mine.map(async (bx) => {
-        const ad = mailAddress(env, bx);
-        const r = await mailGraph(env, ad, `/contacts?$top=8&$select=id,displayName,emailAddresses,companyName,photo&$filter=${f}`);
-        return ((r.ok && r.json && r.json.value) || []).map((c) => ({ id: c.id, box: bx.id, name: String(c.displayName || "").slice(0, 80), company: String(c.companyName || "").slice(0, 60), emails: (c.emailAddresses || []).map((e) => String(e.address || "")).filter(Boolean).slice(0, 4) }));
-      }));
+      // Served from the saved address index in the database. A mailbox with no copy yet gets one made on its first look.
+      await env.DB.prepare("CREATE TABLE IF NOT EXISTS rcpt_index (box TEXT, cid TEXT, name TEXT, company TEXT, emails TEXT, src TEXT, PRIMARY KEY (box, cid))").run();
+      const have = new Set((((await env.DB.prepare("SELECT DISTINCT box FROM rcpt_index").all()).results) || []).map((x) => x.box));
+      const missing = mine.filter((b) => !have.has(b.id));
+      if (missing.length) await rcptRefresh(env, missing, "all");
+      const like = q.toLowerCase().replace(/[%_]/g, " ");
+      const ids = mine.map((b) => b.id);
+      const rs = ((await env.DB.prepare(`SELECT box, cid, name, company, emails, src FROM rcpt_index WHERE box IN (${ids.map(() => "?").join(",")}) AND (lower(name) LIKE ? OR lower(name) LIKE ? OR lower(company) LIKE ? OR lower(company) LIKE ? OR lower(emails) LIKE ?) ORDER BY src, name LIMIT 60`).bind(...ids, like + "%", "% " + like + "%", like + "%", "% " + like + "%", "%" + like + "%").all()).results) || [];
       const seen = new Set(), out = [];
-      for (const c of found.flat()) { const k = (c.emails[0] || c.name).toLowerCase(); if (seen.has(k) || !c.emails.length) continue; seen.add(k); out.push(c); }
-      // Addresses already used in sent mail are remembered too, even when nobody saved them as a contact.
-      if (out.length < 8 && url.searchParams.get("fast") !== "1") {
-        const ql = q.toLowerCase();
-        const sent = await sentP;
-        for (const m of sent.flat()) for (const x of [...(m.toRecipients || []), ...(m.ccRecipients || []), ...(m.bccRecipients || [])]) {
-          const ea = x && x.emailAddress; const addr = String((ea && ea.address) || "").trim(); const nm = String((ea && ea.name) || "").trim();
-          if (!addr || seen.has(addr.toLowerCase())) continue;
-          if (!(addr.toLowerCase().includes(ql) || nm.toLowerCase().startsWith(ql))) continue;
-          seen.add(addr.toLowerCase()); out.push({ id: "sent:" + addr.toLowerCase(), box: mine[0] ? mine[0].id : "", name: (nm && nm.toLowerCase() !== addr.toLowerCase() ? nm : "").slice(0, 80), company: "", emails: [addr.slice(0, 120)] });
-        }
-      }
+      for (const c of rs) { const em = String(c.emails || "").split("|").filter(Boolean); const k = (em[0] || c.name).toLowerCase(); if (seen.has(k) || !em.length) continue; seen.add(k); out.push({ id: c.src === "s" ? c.cid : c.cid, box: c.box, name: c.name, company: c.company, emails: em }); }
       return reply(env, 200, { ok: true, contacts: out.slice(0, 8), worker: WORKER_BUILD });
     }
     if (url.pathname === "/api/mail/contactlist" && !post) {
@@ -5556,6 +5537,7 @@ async function mailRoutes(request, env, user, url) {
         if (act === "contactdelete") {
           if (!cid) return reply(env, 200, { ok: false, error: "Choose a contact to delete.", worker: WORKER_BUILD });
           const dl = await mailDo(env, cAddr, `/contacts/${encodeURIComponent(cid)}`, "DELETE");
+          if (dl.ok || dl.status === 404) { try { const rb = MAILBOXES.find((x) => mailAddress(env, x) === cAddr); if (rb) await rcptRefresh(env, [rb], "contacts"); } catch (e) { } }
           return dl.ok || dl.status === 404 ? reply(env, 200, { ok: true, worker: WORKER_BUILD }) : done(dl);
         }
         const nm = String(body.name || "").replace(/\s+/g, " ").trim().slice(0, 80), em = String(body.email || "").trim().slice(0, 120);
@@ -5565,6 +5547,7 @@ async function mailRoutes(request, env, user, url) {
         const data = { displayName: nm || em, companyName: String(body.company || "").trim().slice(0, 60), emailAddresses: em ? [{ address: em, name: nm || em }] : [], mobilePhone: ph, businessAddress: { street: String(body.address || "").trim().slice(0, 160) } };
         const sv = await mailDo(env, cAddr, cid ? `/contacts/${encodeURIComponent(cid)}` : "/contacts", cid ? "PATCH" : "POST", data);
         if (!sv.ok) return reply(env, 200, { ok: false, error: mailWhy(sv, true), worker: WORKER_BUILD });
+        try { const rb = MAILBOXES.find((x) => mailAddress(env, x) === cAddr); if (rb) await rcptRefresh(env, [rb], "contacts"); } catch (e) { }
         return reply(env, 200, { ok: true, contact: { id: (cid ? ref.slice(0, ref.indexOf(":")) : (box.only ? (MAILBOXES.find((x) => !x.only && mailAllowed(x, user)) || box).id : box.id)) + ":" + String((sv.json && sv.json.id) || cid), name: data.displayName, company: data.companyName, emails: em ? [em] : [], phone: ph, address: String(body.address || "").trim().slice(0, 160) }, worker: WORKER_BUILD });
       }
       if (act === "contactphoto") {
@@ -5822,6 +5805,41 @@ async function mailRoutes(request, env, user, url) {
   return reply(env, 404, { error: "not found" });
 }
 // Looks for mail that arrived since the last look and tells everyone who has access. The first look only marks the time, so nothing floods in.
+// ---- Suggested addresses are kept in the database, so typing a name never waits on Microsoft. Contacts and sent mail recipients are copied in every few minutes, and again straight after a contact is saved or deleted.
+async function rcptRefresh(env, boxes, what) {
+  await env.DB.prepare("CREATE TABLE IF NOT EXISTS rcpt_index (box TEXT, cid TEXT, name TEXT, company TEXT, emails TEXT, src TEXT, PRIMARY KEY (box, cid))").run();
+  for (const bx of boxes) {
+    const ad = mailAddress(env, bx);
+    const rows = [];
+    const keep = new Set();
+    if (what !== "sent") {
+      let ok = true;
+      for (let skip = 0; skip < 2000; skip += 200) {
+        const r = await mailGraph(env, ad, `/contacts?$top=200&$skip=${skip}&$select=id,displayName,emailAddresses,companyName`);
+        if (!r.ok) { ok = false; break; }
+        const v = (r.json && r.json.value) || [];
+        for (const c of v) { const em = (c.emailAddresses || []).map((e) => String(e.address || "")).filter(Boolean).slice(0, 4); if (!em.length) continue; keep.add(em[0].toLowerCase()); rows.push([bx.id, String(c.id), String(c.displayName || "").slice(0, 80), String(c.companyName || "").slice(0, 60), em.join("|"), "c"]); }
+        if (v.length < 200) break;
+      }
+      if (!ok) rows.length = 0;
+      else await env.DB.prepare("DELETE FROM rcpt_index WHERE box = ? AND src = 'c'").bind(bx.id).run();
+    }
+    if (what !== "contacts") {
+      const r = await mailGraph(env, ad, "/mailFolders/sentitems/messages?$top=200&$select=toRecipients,ccRecipients,bccRecipients");
+      if (r.ok) {
+        const seen = new Set();
+        for (const m of ((r.json && r.json.value) || [])) for (const x of [...(m.toRecipients || []), ...(m.ccRecipients || []), ...(m.bccRecipients || [])]) {
+          const ea = x && x.emailAddress; const a = String((ea && ea.address) || "").trim().toLowerCase(); const nm = String((ea && ea.name) || "").trim();
+          if (!a || seen.has(a)) continue; seen.add(a);
+          rows.push([bx.id, "sent:" + a, (nm && nm.toLowerCase() !== a ? nm : "").slice(0, 80), "", a.slice(0, 120), "s"]);
+        }
+        await env.DB.prepare("DELETE FROM rcpt_index WHERE box = ? AND src = 's'").bind(bx.id).run();
+      } else { for (let i = rows.length - 1; i >= 0; i--) if (rows[i][5] === "s") rows.splice(i, 1); }
+    }
+    for (let i = 0; i < rows.length; i += 80) await env.DB.batch(rows.slice(i, i + 80).map((x) => env.DB.prepare("INSERT OR REPLACE INTO rcpt_index (box, cid, name, company, emails, src) VALUES (?, ?, ?, ?, ?, ?)").bind(...x)));
+    try { await env.DB.prepare("INSERT OR REPLACE INTO app_settings (key, value, detail, by_name, at) VALUES (?, ?, '', 'system', ?)").bind("rcpt_at_" + bx.id, String(Date.now()), Date.now()).run(); } catch (e) { }
+  }
+}
 // ---- Pictures pasted into the body of a received email are moved out into attachments named Attachment 1, Attachment 2 and so on. Runs every minute from its own trigger, looks only at recent inbox mail with attachments, and touches only the current email, never the quoted trail below it. Small pictures (logos, signatures) are left alone. Only the mailboxes listed in the app setting picclean_boxes are checked (tayler until it has been tested). Each message is looked at once.
 async function picClean(env) {
   await env.DB.prepare("CREATE TABLE IF NOT EXISTS pic_done (id TEXT PRIMARY KEY, at INTEGER, result TEXT)").run();
@@ -9067,7 +9085,7 @@ export default {
     // A one minute trigger only tidies pictures out of the body of received email, and nothing else.
     if (event && event.cron === "* * * * *") { ctx.waitUntil(picClean(env).catch((e) => console.log("picture clean failed", String(e && e.message || e)))); return; }
     // A five minute trigger, if one is added, only looks for new mail so pings arrive quickly.
-    if (event && event.cron === "*/5 * * * *") { ctx.waitUntil(mergeExportTest(env).catch((e) => console.log("export test failed", String(e && e.message || e)))); ctx.waitUntil(mergeCopyUndo(env).catch((e) => console.log("copy undo failed", String(e && e.message || e)))); ctx.waitUntil(mergeSentCopy(env).catch((e) => console.log("sent copy failed", String(e && e.message || e)))); ctx.waitUntil(mergeAutoReply(env).catch((e) => console.log("autoreply failed", String(e && e.message || e)))); ctx.waitUntil(mergeArchiveCopy(env).catch((e) => console.log("archive copy failed", String(e && e.message || e)))); ctx.waitUntil(mailWatch(env).catch((e) => console.log("mail watch failed", String(e && e.message || e)))); ctx.waitUntil(mailHoldSweep(env).catch((e) => console.log("hold sweep failed", String(e && e.message || e)))); ctx.waitUntil(vbaSubscribe(env).then(() => vbaWatch(env)).catch((e) => console.log("vba watch failed", String(e && e.message || e)))); return; }
+    if (event && event.cron === "*/5 * * * *") { ctx.waitUntil(mergeExportTest(env).catch((e) => console.log("export test failed", String(e && e.message || e)))); ctx.waitUntil(mergeCopyUndo(env).catch((e) => console.log("copy undo failed", String(e && e.message || e)))); ctx.waitUntil(mergeSentCopy(env).catch((e) => console.log("sent copy failed", String(e && e.message || e)))); ctx.waitUntil(mergeAutoReply(env).catch((e) => console.log("autoreply failed", String(e && e.message || e)))); ctx.waitUntil(mergeArchiveCopy(env).catch((e) => console.log("archive copy failed", String(e && e.message || e)))); ctx.waitUntil(mailWatch(env).catch((e) => console.log("mail watch failed", String(e && e.message || e)))); ctx.waitUntil(mailHoldSweep(env).catch((e) => console.log("hold sweep failed", String(e && e.message || e)))); ctx.waitUntil(rcptRefresh(env, MAILBOXES, (Math.floor(Date.now() / 300000) % 6 === 0) ? "all" : "sent").catch((e) => console.log("address index failed", String(e && e.message || e)))); ctx.waitUntil(vbaSubscribe(env).then(() => vbaWatch(env)).catch((e) => console.log("vba watch failed", String(e && e.message || e)))); return; }
     // Every run checks the automatic timesheets and the payroll sweeps. The leave sync keeps its own schedule and is skipped on the half hourly one.
     ctx.waitUntil(fuelDraftFix(env).catch((e) => console.log("fuel draft fix failed", String(e && e.message || e))));
     ctx.waitUntil(tsAutoRun(env).catch((e) => console.log("auto timesheets failed", String(e && e.message || e))));
