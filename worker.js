@@ -504,7 +504,7 @@ async function paygBill(env, runId, status, replace) {
   if (!(amount > 0)) return { ok: false, note: "no tax withheld on that run" };
   const rows = ((await env.DB.prepare("SELECT name, tax FROM payslip_store WHERE run_id = ? AND tax > 0 ORDER BY name").bind(run.run_id).all()).results || []).map((r) => ({ name: String(r.name || ""), tax: (Math.round(Number(r.tax) * 100) / 100).toLocaleString("en-AU", { minimumFractionDigits: 2, maximumFractionDigits: 2 }) }));
   const dots = (iso) => String(iso || "").slice(0, 10).split("-").reverse().join(".");
-  const ref = `PAYG-${String(run.period_end).slice(0, 10).replace(/-/g, "")}`;
+  const ref = `PAYG WE ${dots(run.period_end)}`;
   let crow = await env.DB.prepare("SELECT contact_id, name FROM xero_contacts WHERE name_lc LIKE '%australian taxation office%' LIMIT 1").first();
   if (!crow) crow = await env.DB.prepare("SELECT contact_id, name FROM xero_contacts WHERE name_lc LIKE '%taxation office%' OR name_lc = 'ato' LIMIT 1").first();
   if (!crow) crow = await env.DB.prepare("SELECT contact_id, name FROM xero_contacts WHERE name_lc LIKE '%australian tax%' OR name_lc LIKE '%tax office%' OR name_lc LIKE '%taxation%' OR name_lc LIKE 'ato %' OR name_lc LIKE '% ato' OR name_lc LIKE '%(ato)%' LIMIT 1").first();
@@ -654,7 +654,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
 
 // Update push. Set this to a bundle name (for example "Full-Reservoir-2026.11.25-v26") and every open Reservoir and Weir window that finds that bundle newer than its own reloads straight away, instead of waiting for midnight or a home screen. Leave it empty for the normal gentle update.
 const APP_FORCE_UPDATE = "Full-Reservoir-2026.11.25-v26";
-const WORKER_BUILD = "Reservoir-Worker-2026.11.26-w322";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.26-w323";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -7019,6 +7019,16 @@ async function noticesTable(env) {
       const d = await env.DB.prepare("UPDATE receipt_records SET xero_at = ? WHERE type = 'reimbursement' AND xero_at IS NULL AND sent_date >= '2026-11-22'").bind(new Date().toISOString()).run();
       await migMark(env, "reimb_xero_at_v1", `${d && d.meta ? d.meta.changes : 0} reimbursements stamped`);
     } catch (e) { /* tried again on the next start */ }
+  }
+  // One time, 26 November 2026: the PAYG notice for the pay run ending 22 November again, as a draft bill in Xero with the new reference (the approved one was voided).
+  if (!(await migDone(env, "payg_bill_we22_v1"))) {
+    try {
+      await payslipTables(env);
+      const pr = await env.DB.prepare("SELECT run_id FROM payslip_runs WHERE period_end LIKE '2026-11-22%' LIMIT 1").first();
+      const r = pr ? await paygBill(env, pr.run_id, "DRAFT", true) : { ok: false, note: "no pay run ending 22 November" };
+      if (r && r.ok) await migMark(env, "payg_bill_we22_v1", String(r.note || r.status || "done").slice(0, 200));
+      else console.log("payg we22 bill not made", r && r.note);
+    } catch (e) { console.log("payg we22 bill failed", String(e && e.message || e)); }
   }
   // One time, 23 November 2026: the PAYG notice for the pay run ending 15 November, as a draft bill in Xero (any earlier test draft is replaced).
   if (!(await migDone(env, "payg_bill_test_v2"))) {
