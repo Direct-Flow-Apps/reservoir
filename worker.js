@@ -654,7 +654,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
 
 // Update push. Set this to a bundle name (for example "Full-Reservoir-2026.11.25-v26") and every open Reservoir and Weir window that finds that bundle newer than its own reloads straight away, instead of waiting for midnight or a home screen. Leave it empty for the normal gentle update.
 const APP_FORCE_UPDATE = "Full-Reservoir-2026.11.25-v26";
-const WORKER_BUILD = "Reservoir-Worker-2026.11.25-w321";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.26-w322";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -5355,7 +5355,7 @@ async function mailRoutes(request, env, user, url) {
             }
           }
         } catch (e) {}
-        const sys = "You are a proofreader for Australian English business emails. Correct only spelling mistakes, grammar mistakes, punctuation and capital letters. Add commas, full stops and capitals where they are missing, and split run on sentences with punctuation. Never reword, never add, remove or reorder words, never change the tone, and keep names, numbers, job numbers, addresses and codes exactly as written. Each input line is numbered like '3: text'. Reply with every line again in the same order, in the same numbered format, one line each, and nothing else.";
+        const sys = "You are a proofreader for Australian English business emails. Correct only spelling mistakes, grammar mistakes, punctuation and capital letters. Add commas, full stops and capitals where they are missing, and split run on sentences with punctuation. A sentence that asks a question ends with a question mark. Never reword, never add, remove or reorder words, never change the tone, and keep names, numbers, job numbers, addresses and codes exactly as written. Each input line is numbered like '3: text'. Reply with every line again in the same order, in the same numbered format, one line each, and nothing else.";
         let out;
         try {
           out = await env.AI.run(MODEL, { messages: [{ role: "system", content: sys }, { role: "user", content: send.map((x) => `${x.i + 1}: ${x.t}`).join("\n") }], max_tokens: 2048, temperature: 0 });
@@ -5366,6 +5366,16 @@ async function mailRoutes(request, env, user, url) {
         const words = (s) => String(s).toLowerCase().replace(/[^a-z0-9'\s]/g, " ").split(/\s+/).filter(Boolean);
         let changed = 0;
         const cap = (x) => x.replace(/^(\s*)([a-z])/, (m, sp, ch) => sp + ch.toUpperCase());
+        // A sentence that asks a question ends with a question mark, whatever the proofreader did.
+        const QS = /^(are (you|we|they|there)|is (it|there|this|that|he|she|anyone)|was (it|there)|were (you|they)|do (you|we|they)|does (it|this|that|he|she|anyone)|did (you|we|they|he|she|it)|can (you|we|i|they|someone|anyone)|could (you|we|i|they|someone|anyone)|will (you|we|they|it|someone|anyone)|would (you|we|they|it|someone|anyone)|should (we|i|you|they)|may i|have (you|we|they)|has (anyone|he|she|it|someone)|how (do|does|did|can|could|would|long|much|many|about|is|are)|what (is|are|was|were|do|does|did|time|about|else)|when (is|are|was|will|can|do|does|did|would)|where (is|are|was|do|does|did|can)|why (is|are|was|do|does|did|can|would)|who (is|are|was|can|will|did|has|would))\b/i;
+        const qfix = (line) => String(line).replace(/[^.!?]+(?:[.!?]+|$)/g, (sn) => {
+          const t = sn.trim();
+          if (!t || !QS.test(t)) return sn;
+          const m = sn.match(/^(\s*)([^.!?]*?)(\.+)?(\s*)$/);
+          if (!m || /[!?]/.test(sn)) return sn;
+          if (m[3] && m[3].length > 1) return sn;
+          return m[1] + m[2] + "?" + m[4];
+        });
         const sent = new Set(send.map((x) => x.i));
         const fixed = lines.map((t, i) => {
           if (!sent.has(i)) return t;
@@ -5377,7 +5387,7 @@ async function mailRoutes(request, env, user, url) {
             const ok = !(b1.length < a1.length * 0.7 || b1.length > a1.length * 1.4) && !(a1.length && a1.filter((x) => b1.includes(x)).length / a1.length < 0.7);
             if (ok) r = c;
           }
-          r = cap(r);
+          r = qfix(cap(r));
           if (r !== orig[i]) changed++;
           return r;
         });
