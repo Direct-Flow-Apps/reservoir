@@ -30,8 +30,8 @@ self.addEventListener("notificationclick", (e) => {
   e.waitUntil((async () => {
     const all = await self.clients.matchAll({ type: "window", includeUncontrolled: true });
     const go = e.notification.data && e.notification.data.url;
-    // Weir can be saved as /mail or /weir. Its notices only go to a Weir window, and every other notice to a Reservoir window, never to the Task List.
-    const appOf = (path) => /^\/(mail|weir)(\/|$|\.)/.test(path) ? "mail" : /^\/(tasks|punch)(\/|$|\.)/.test(path) ? "tasks" : "main";
+    // Weir can be saved as /mail or /weir. Its notices only go to a Weir window, and every other notice to a Reservoir window.
+    const appOf = (path) => /^\/(mail|weir)(\/|$|\.)/.test(path) ? "mail" : "main";
     const want = go ? appOf(go.split("?")[0]) : "main";
     for (const c of all) {
       let here = "main";

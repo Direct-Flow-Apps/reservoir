@@ -2,13 +2,9 @@
   Cache-Control: no-cache, must-revalidate
 /mail
   Cache-Control: no-cache, must-revalidate
-/tasks
-  Cache-Control: no-cache, must-revalidate
 /index.html
   Cache-Control: no-cache, must-revalidate
 /mail.html
-  Cache-Control: no-cache, must-revalidate
-/tasks.html
   Cache-Control: no-cache, must-revalidate
 /sw.js
   Cache-Control: no-cache, must-revalidate
@@ -20,9 +16,5 @@
   Cache-Control: no-cache, must-revalidate
 /weir
   Cache-Control: no-cache, must-revalidate
-/punch
-  Cache-Control: no-cache, must-revalidate
 /weir.html
-  Cache-Control: no-cache, must-revalidate
-/punch.html
   Cache-Control: no-cache, must-revalidate

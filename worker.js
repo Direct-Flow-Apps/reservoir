@@ -651,7 +651,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
   await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
 }
 
-const WORKER_BUILD = "Reservoir-Worker-2026.11.25-w308";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.25-w309";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -7091,7 +7091,7 @@ async function pushRoutes(request, env, user, url) {
     const subMode = Object.prototype.hasOwnProperty.call(PUSH_MODES, String(body.mode)) ? String(body.mode) : null;
     await env.DB.prepare("INSERT INTO push_subs (endpoint, email, tier, p256dh, auth, ua, hours_mode, all_hours) VALUES (?, ?, ?, ?, ?, ?, COALESCE(?, 'default'), ?) ON CONFLICT(endpoint) DO UPDATE SET email = excluded.email, tier = excluded.tier, p256dh = excluded.p256dh, auth = excluded.auth, ua = excluded.ua, hours_mode = COALESCE(?, hours_mode), all_hours = CASE WHEN ? IS NULL THEN all_hours WHEN ? = '24' THEN 1 ELSE 0 END").bind(ep, email, String(user.tier || "T3"), p, a, String(body.ua || "").slice(0, 160), subMode, subMode === "24" ? 1 : 0, subMode, subMode, subMode).run();
     // Reservoir and Weir Mail share one browser profile on a Mac, so they share one endpoint. Once Weir Mail has registered, Reservoir opening later must not take the tag back.
-    await env.DB.prepare("UPDATE push_subs SET app = CASE WHEN app = 'mail' AND ? != 'tasks' THEN 'mail' ELSE ? END WHERE endpoint = ?").bind(["mail", "tasks"].includes(String(body.app)) ? String(body.app) : "main", ["mail", "tasks"].includes(String(body.app)) ? String(body.app) : "main", ep).run();
+    await env.DB.prepare("UPDATE push_subs SET app = CASE WHEN app = 'mail' THEN 'mail' ELSE ? END WHERE endpoint = ?").bind(String(body.app) === "mail" ? "mail" : "main", ep).run();
     return reply(env, 200, { ok: true });
   }
   if (url.pathname === "/api/push/business") {
