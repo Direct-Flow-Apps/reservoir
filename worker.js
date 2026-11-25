@@ -654,7 +654,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
 
 // Update push. Set this to a bundle name (for example "Full-Reservoir-2026.11.25-v26") and every open Reservoir and Weir window that finds that bundle newer than its own reloads straight away, instead of waiting for midnight or a home screen. Leave it empty for the normal gentle update.
 const APP_FORCE_UPDATE = "Full-Reservoir-2026.11.25-v26";
-const WORKER_BUILD = "Reservoir-Worker-2026.11.25-w316";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.25-w317";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -5364,16 +5364,21 @@ async function mailRoutes(request, env, user, url) {
         txt.split(/\n+/).forEach((l) => { const m = l.match(/^\s*(\d+)\s*[:.)]\s?(.*)$/); if (m) got[Number(m[1]) - 1] = m[2]; });
         const words = (s) => String(s).toLowerCase().replace(/[^a-z0-9'\s]/g, " ").split(/\s+/).filter(Boolean);
         let changed = 0;
+        const cap = (x) => x.replace(/^(\s*)([a-z])/, (m, sp, ch) => sp + ch.toUpperCase());
+        const sent = new Set(send.map((x) => x.i));
         const fixed = lines.map((t, i) => {
+          if (!sent.has(i)) return t;
+          let r = t;
           const c = got[i];
-          if (c == null || !c.trim() || c === t) return t;
-          // A line is only taken if it is the same writing: similar length, and most of the words are still there. Anything else is left as the person wrote it.
-          const a1 = words(t), b1 = words(c);
-          if (b1.length < a1.length * 0.7 || b1.length > a1.length * 1.4) return t;
-          const keep = a1.filter((x) => b1.includes(x)).length;
-          if (a1.length && keep / a1.length < 0.7) return t;
-          changed++;
-          return c;
+          if (c != null && c.trim() && c !== t) {
+            // The AI's line is only taken if it is the same writing: similar length, and most of the words still there.
+            const a1 = words(t), b1 = words(c);
+            const ok = !(b1.length < a1.length * 0.7 || b1.length > a1.length * 1.4) && !(a1.length && a1.filter((x) => b1.includes(x)).length / a1.length < 0.7);
+            if (ok) r = c;
+          }
+          r = cap(r);
+          if (r !== t) changed++;
+          return r;
         });
         const u = (out && out.usage) || {};
         const tin = Number(u.prompt_tokens) || Math.ceil((sys.length + send.reduce((n, x) => n + x.t.length, 0)) / 4), tout = Number(u.completion_tokens) || Math.ceil(txt.length / 4);
