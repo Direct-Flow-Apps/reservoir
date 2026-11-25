@@ -652,7 +652,9 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
   await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
 }
 
-const WORKER_BUILD = "Reservoir-Worker-2026.11.25-w313";
+// Update push. Set this to a bundle name (for example "Full-Reservoir-2026.11.25-v26") and every open Reservoir and Weir window that finds that bundle newer than its own reloads straight away, instead of waiting for midnight or a home screen. Leave it empty for the normal gentle update.
+const APP_FORCE_UPDATE = "Full-Reservoir-2026.11.25-v26";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.25-w314";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -8989,6 +8991,7 @@ export default {
       const nm = String(q.get("n") || "attachment").replace(/[\r\n"\\/]/g, "_").slice(0, 120);
       return new Response(dlRes.body, { status: 200, headers: { ...cors(env), "Access-Control-Allow-Origin": "*", "Content-Type": dlRes.headers.get("Content-Type") || "application/octet-stream", "Content-Disposition": `attachment; filename="${nm}"`, "Cache-Control": "no-store" } });
     }
+    if (earlyUrl.pathname === "/api/app/push" && request.method === "GET") return reply(env, 200, { force: APP_FORCE_UPDATE });
     if (earlyUrl.pathname === "/api/ping" && request.method === "GET") return reply(env, 200, { worker: WORKER_BUILD, xeroMe: true, xeroStaff: true });
     if (earlyUrl.pathname === "/api/invoices/notify" && request.method === "POST") {
       // Microsoft pings here when mail lands in the Reservoir folder. The first call after the registration is made carries a validation token that must be echoed back.
