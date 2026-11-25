@@ -651,7 +651,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
   await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
 }
 
-const WORKER_BUILD = "Reservoir-Worker-2026.11.25-w309";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.25-w310";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -5055,6 +5055,8 @@ async function mailRoutes(request, env, user, url) {
         });
         level = next;
       }
+      // Deleted Items and Junk can hold things that are not emails (old calendar items and the like), so their count is the number of emails the folder really lists.
+      await Promise.all(["deleteditems", "junkemail"].map(async (fid) => { const f = folders.find((x) => x.id === fid); if (!f) return; try { const r = await mailGraph(env, addr, `/mailFolders/${fid}/messages?$top=1&$select=id&$count=true`); const n = r.ok && r.json ? r.json["@odata.count"] : undefined; if (typeof n === "number") f.total = n; } catch (e) { /* keep Microsoft's count */ } }));
       const held = await mailHoldIds(env, addr);
       // Held emails are drafts in Microsoft, but Reservoir lists them under Outbox, so they are taken off the Drafts count.
       if (held.length) { const dr = folders.find((f) => f.id === "drafts"); if (dr) dr.total = Math.max(0, Number(dr.total || 0) - held.length); }
@@ -5118,9 +5120,14 @@ async function mailRoutes(request, env, user, url) {
         const f = ["receivedDateTime ge 1900-01-01T00:00:00Z"];
         if (filter === "unread") f.push("isRead eq false");
         if (filter === "attachments") f.push("hasAttachments eq true");
-        const r = await mailGraph(env, addr, `/mailFolders/${encodeURIComponent(folder)}/messages?$top=${top}&${fields}&$filter=${encodeURIComponent(f.join(" and "))}&$orderby=receivedDateTime desc`);
+        // Deleted Items and Junk are read without the date filter, because a deleted draft or an item with no received date would otherwise never appear.
+        const loose = /^(deleteditems|junkemail)$/i.test(String(folder)) && filter !== "unread" && filter !== "attachments";
+        const r = loose
+          ? await mailGraph(env, addr, `/mailFolders/${encodeURIComponent(folder)}/messages?$top=${top}&${fields.replace("$select=", "$select=createdDateTime,sentDateTime,")}`)
+          : await mailGraph(env, addr, `/mailFolders/${encodeURIComponent(folder)}/messages?$top=${top}&${fields}&$filter=${encodeURIComponent(f.join(" and "))}&$orderby=receivedDateTime desc`);
         if (!r.ok) return reply(env, 200, { ok: false, error: mailWhy(r), worker: WORKER_BUILD });
         rows = (r.json && r.json.value) || [];
+        if (loose) { rows.forEach((m) => { if (!m.receivedDateTime) m.receivedDateTime = m.sentDateTime || m.createdDateTime || ""; }); rows.sort((x, y) => String(y.receivedDateTime || "").localeCompare(String(x.receivedDateTime || ""))); }
       }
       if (!q && /^drafts$/i.test(String(folder))) { const hid = new Set((await mailHoldIds(env, addr)).map((h) => h.draft_id)); if (hid.size) rows = rows.filter((m) => !hid.has(m.id)); }
       // A search covers every folder, so each result says which folder it is in.
