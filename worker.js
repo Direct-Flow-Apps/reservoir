@@ -654,7 +654,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
 
 // Update push. Set this to a bundle name (for example "Full-Reservoir-2026.11.25-v26") and every open Reservoir and Weir window that finds that bundle newer than its own reloads straight away, instead of waiting for midnight or a home screen. Leave it empty for the normal gentle update.
 const APP_FORCE_UPDATE = "Full-Reservoir-2026.11.25-v26";
-const WORKER_BUILD = "Reservoir-Worker-2026.11.25-w314";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.25-w315";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -5349,8 +5349,8 @@ async function mailRoutes(request, env, user, url) {
           const t = line.trim();
           if (!t || /@|https?:\/\//i.test(t)) continue;
           const words = t.split(/\s+/).length;
-          if (words >= 4 && !/[.!?:;,)"'\u201d]$/.test(t)) problems.push({ message: "No full stop at the end of this line", text: t.slice(0, 60) });
-          if (/^[a-z]/.test(t)) problems.push({ message: "Starts without a capital letter", text: t.slice(0, 60) });
+          if (words >= 4 && !/[.!?:;,)"'\u201d]$/.test(t)) problems.push({ message: "No full stop at the end of this line", text: t.slice(0, 60), kind: "stop", end: t.slice(-30) });
+          if (/^[a-z]/.test(t)) problems.push({ message: "Starts without a capital letter", text: t.slice(0, 60), kind: "cap" });
         }
         let skipped = false;
         try {
@@ -5367,7 +5367,7 @@ async function mailRoutes(request, env, user, url) {
               const bit = txt.substr(m.offset, m.length);
               if (/SPELL|MORFOLOGIK/i.test(String(m.rule && m.rule.id || "")) && (/^[A-Z]/.test(bit) || /\d/.test(bit))) continue;
               const fix = (m.replacements || []).slice(0, 2).map((r) => r.value).filter(Boolean).join(" or ");
-              problems.push({ message: String(m.shortMessage || m.message || "Check this").slice(0, 80), text: bit.slice(0, 40), fix });
+              problems.push({ message: String(m.shortMessage || m.message || "Check this").slice(0, 80), text: bit.slice(0, 40), fix, kind: "edit", rep: String(((m.replacements || [])[0] || {}).value || ""), whole: bit.length <= 40 });
             }
           }
         } catch (e) { skipped = true; }
