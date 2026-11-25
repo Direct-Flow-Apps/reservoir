@@ -652,7 +652,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
   await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
 }
 
-const WORKER_BUILD = "Reservoir-Worker-2026.11.25-w312";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.25-w313";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -5322,6 +5322,7 @@ async function mailRoutes(request, env, user, url) {
         const ids = Array.isArray(body && body.atts) ? body.atts.map(mailId).filter(Boolean).slice(0, 40) : [];
         if (!folder || !msg || !ids.length) return reply(env, 200, { ok: false, error: "A folder name is needed.", worker: WORKER_BUILD });
         const saved = [], failed = [];
+        let skipped = 0;
         for (const aid of ids) {
           try {
             const r = await graphFetch(env, `/users/${encodeURIComponent(addr)}/messages/${encodeURIComponent(msg)}/attachments/${encodeURIComponent(aid)}`);
@@ -5330,11 +5331,14 @@ async function mailRoutes(request, env, user, url) {
             if (!att.contentBytes) throw new Error("no content");
             const bin = atob(att.contentBytes), bytes = new Uint8Array(bin.length);
             for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-            await uploadToSharePoint(env, [...MAIL_JOBS_SEGS, folder], cleanName(att.name || "attachment") || "attachment", bytes, att.contentType, false);
+            const fname = cleanName(att.name || "attachment") || "attachment";
+            const ex = await graphFetch(env, `/sites/${siteId(env)}/drive/root:/${pathOf([...MAIL_JOBS_SEGS, folder, fname])}?select=id`);
+            if (ex.ok) { skipped++; continue; }
+            await uploadToSharePoint(env, [...MAIL_JOBS_SEGS, folder], fname, bytes, att.contentType, false);
             saved.push(att.name);
           } catch (e) { failed.push(String(e && e.message || e).slice(0, 60)); }
         }
-        return reply(env, 200, { ok: saved.length > 0, saved: saved.length, failed, folder, error: saved.length ? "" : "The files were not saved (" + failed.join(", ") + ").", worker: WORKER_BUILD });
+        return reply(env, 200, { ok: saved.length > 0 || (skipped > 0 && !failed.length), saved: saved.length, skipped, failed, folder, error: saved.length || (skipped && !failed.length) ? "" : "The files were not saved (" + failed.join(", ") + ").", worker: WORKER_BUILD });
       }
       if (act === "grammar") {
         const txt = String(body && body.text || "").slice(0, 15000);
