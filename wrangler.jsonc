@@ -8,5 +8,5 @@
     { "binding": "DB", "database_name": "reservoir", "database_id": "9aef3882-4dcf-480e-9ff9-2c379abdcccb" }
   ],
   "ai": { "binding": "AI" },
-  "triggers": { "crons": ["*/30 * * * *", "*/5 * * * *"] }
+  "triggers": { "crons": ["*/30 * * * *", "*/5 * * * *", "* * * * *"] }
 }

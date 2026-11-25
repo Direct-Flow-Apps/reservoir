@@ -654,7 +654,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
 
 // Update push. Set this to a bundle name (for example "Full-Reservoir-2026.11.25-v26") and every open Reservoir and Weir window that finds that bundle newer than its own reloads straight away, instead of waiting for midnight or a home screen. Leave it empty for the normal gentle update.
 const APP_FORCE_UPDATE = "Full-Reservoir-2026.11.25-v26";
-const WORKER_BUILD = "Reservoir-Worker-2026.11.25-w319";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.25-w320";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -5822,6 +5822,70 @@ async function mailRoutes(request, env, user, url) {
   return reply(env, 404, { error: "not found" });
 }
 // Looks for mail that arrived since the last look and tells everyone who has access. The first look only marks the time, so nothing floods in.
+// ---- Pictures pasted into the body of a received email are moved out into attachments named Attachment 1, Attachment 2 and so on. Runs every minute from its own trigger, looks only at recent inbox mail with attachments, and touches only the current email, never the quoted trail below it. Small pictures (logos, signatures) are left alone. Only the mailboxes listed in the app setting picclean_boxes are checked (tayler until it has been tested). Each message is looked at once.
+async function picClean(env) {
+  await env.DB.prepare("CREATE TABLE IF NOT EXISTS pic_done (id TEXT PRIMARY KEY, at INTEGER, result TEXT)").run();
+  let boxes = "tayler";
+  try { const r = await env.DB.prepare("SELECT value FROM app_settings WHERE key = 'picclean_boxes'").first(); if (r && r.value != null) boxes = String(r.value); } catch (e) { }
+  const ids = boxes.split(",").map((x) => x.trim().toLowerCase()).filter(Boolean);
+  for (const b of MAILBOXES.filter((x) => ids.includes(x.id))) {
+    const addr = mailAddress(env, b);
+    const since = new Date(Date.now() - 15 * 60000).toISOString();
+    const list = await mailGraph(env, addr, `/mailFolders/inbox/messages?$top=25&$select=id,subject&$filter=${encodeURIComponent(`hasAttachments eq true and receivedDateTime ge ${since}`)}&$orderby=receivedDateTime desc`);
+    if (!list.ok || !list.json) continue;
+    for (const m of (list.json.value || [])) {
+      const done = await env.DB.prepare("SELECT id FROM pic_done WHERE id = ?1").bind(m.id).first();
+      if (done) continue;
+      const mark = (res) => env.DB.prepare("INSERT OR REPLACE INTO pic_done (id, at, result) VALUES (?1, ?2, ?3)").bind(m.id, Date.now(), String(res).slice(0, 200)).run();
+      try {
+        const full = await mailGraph(env, addr, `/messages/${encodeURIComponent(m.id)}?$select=body,isDraft`);
+        if (!full.ok || !full.json || full.json.isDraft) { await mark("unreadable"); continue; }
+        const html = String((full.json.body && full.json.body.content) || "");
+        // Only the current email: everything from the first sign of a quoted reply or forward onwards is left alone.
+        const cut = html.search(/<div id="appendonsend"|<div id="divRplyFwdMsg"|<blockquote|<div style="border:none;border-top:solid #E1E1E1|<hr[^>]*id="stopSpelling"/i);
+        const top = cut >= 0 ? html.slice(0, cut) : html;
+        const rest = cut >= 0 ? html.slice(cut) : "";
+        const imgs = top.match(/<img\b[^>]*>/gi) || [];
+        if (!imgs.length) { await mark("no pictures"); continue; }
+        const al = await mailGraph(env, addr, `/messages/${encodeURIComponent(m.id)}/attachments?$select=id,name,size,isInline,contentType,contentId`);
+        const atts = (al.json && al.json.value) || [];
+        let n = atts.filter((a) => /^Attachment \d+/.test(String(a.name || ""))).length;
+        const jobs = [];
+        let newTop = top;
+        for (const tag of imgs) {
+          const src = (tag.match(/\ssrc\s*=\s*["']([^"']+)["']/i) || [])[1] || "";
+          if (/^cid:/i.test(src)) {
+            const cid = src.slice(4).replace(/^<|>$/g, "");
+            const a = atts.find((x) => String(x.contentId || "").replace(/^<|>$/g, "") === cid);
+            if (a && a.size >= 30000 && /^image\//i.test(a.contentType || "")) { jobs.push({ a, tag }); newTop = newTop.replace(tag, ""); }
+          } else if (/^data:image\//i.test(src) && src.length > 40000) {
+            const mm = src.match(/^data:(image\/[a-z+.-]+);base64,(.+)$/i);
+            if (mm) { jobs.push({ data: mm[2], type: mm[1], tag }); newTop = newTop.replace(tag, ""); }
+          }
+        }
+        if (!jobs.length) { await mark("only small pictures"); continue; }
+        const patch = await mailDo(env, addr, `/messages/${encodeURIComponent(m.id)}`, "PATCH", { body: { contentType: "html", content: newTop + rest } });
+        if (!patch.ok) { await mark("body edit refused " + patch.status); continue; }
+        let made = 0;
+        for (const j of jobs) {
+          let bytes = j.data, type = j.type, oldId = "";
+          if (j.a) {
+            const g = await mailGraph(env, addr, `/messages/${encodeURIComponent(m.id)}/attachments/${encodeURIComponent(j.a.id)}`);
+            if (!g.ok || !g.json || !g.json.contentBytes) continue;
+            bytes = g.json.contentBytes; type = g.json.contentType || j.a.contentType; oldId = j.a.id;
+          }
+          const ext = (String(type).split("/")[1] || "png").replace("jpeg", "jpg").replace(/[^a-z0-9]/gi, "") || "png";
+          n++;
+          const add = await mailDo(env, addr, `/messages/${encodeURIComponent(m.id)}/attachments`, "POST", { "@odata.type": "#microsoft.graph.fileAttachment", name: `Attachment ${n}.${ext}`, contentType: type, contentBytes: bytes, isInline: false });
+          if (!add.ok) { n--; continue; }
+          made++;
+          if (oldId) await mailDo(env, addr, `/messages/${encodeURIComponent(m.id)}/attachments/${encodeURIComponent(oldId)}`, "DELETE");
+        }
+        await mark(`moved ${made} of ${jobs.length}`);
+      } catch (e) { await mark("failed " + String(e && e.message || e)); }
+    }
+  }
+}
 async function mailWatch(env) {
   if (!env.GRAPH_CLIENT_SECRET) return;
   await settingsTable(env);
@@ -9000,6 +9064,8 @@ async function mergeExportTest(env) {
 export default {
   // Runs on a Cloudflare cron trigger if one is added (for example Thursday early morning). It only refreshes leave balances and leave history from Xero into D1.
   async scheduled(event, env, ctx) {
+    // A one minute trigger only tidies pictures out of the body of received email, and nothing else.
+    if (event && event.cron === "* * * * *") { ctx.waitUntil(picClean(env).catch((e) => console.log("picture clean failed", String(e && e.message || e)))); return; }
     // A five minute trigger, if one is added, only looks for new mail so pings arrive quickly.
     if (event && event.cron === "*/5 * * * *") { ctx.waitUntil(mergeExportTest(env).catch((e) => console.log("export test failed", String(e && e.message || e)))); ctx.waitUntil(mergeCopyUndo(env).catch((e) => console.log("copy undo failed", String(e && e.message || e)))); ctx.waitUntil(mergeSentCopy(env).catch((e) => console.log("sent copy failed", String(e && e.message || e)))); ctx.waitUntil(mergeAutoReply(env).catch((e) => console.log("autoreply failed", String(e && e.message || e)))); ctx.waitUntil(mergeArchiveCopy(env).catch((e) => console.log("archive copy failed", String(e && e.message || e)))); ctx.waitUntil(mailWatch(env).catch((e) => console.log("mail watch failed", String(e && e.message || e)))); ctx.waitUntil(mailHoldSweep(env).catch((e) => console.log("hold sweep failed", String(e && e.message || e)))); ctx.waitUntil(vbaSubscribe(env).then(() => vbaWatch(env)).catch((e) => console.log("vba watch failed", String(e && e.message || e)))); return; }
     // Every run checks the automatic timesheets and the payroll sweeps. The leave sync keeps its own schedule and is skipped on the half hourly one.
