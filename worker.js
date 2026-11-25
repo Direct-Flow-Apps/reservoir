@@ -226,6 +226,7 @@ async function driveMeta(env, id) {
 
 // ---- Voice Guides: spoken explanations kept in Development / Voice Guides, one folder per home screen and one audio file per tile. A replaced file is moved into that folder's Previous folder as v1, v2 and so on. ----
 const VOICE_ROOT = ["Development", "Voice Guides"];
+const MAIL_JOBS_SEGS = ["Client Records", "New Jobs"];
 const VOICE_EXT = /\.(mp3|m4a|wav)$/i;
 const voiceNorm = (s) => String(s || "").toLowerCase().replace(/\.(mp3|m4a|wav)$/i, "").replace(/&/g, " and ").replace(/[^a-z0-9]+/g, "");
 let voiceCache = { at: 0, list: null };
@@ -651,7 +652,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
   await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
 }
 
-const WORKER_BUILD = "Reservoir-Worker-2026.11.25-w310";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.25-w312";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -4854,8 +4855,13 @@ async function mailManualDraft(env, addr, msg, op, to) {
   const quoted = trail + String((m.body && m.body.content) || "").replace(/^[\s\S]*?<body[^>]*>/i, "").replace(/<\/body>[\s\S]*$/i, "");
   return mailDo(env, addr, "/messages", "POST", { subject, toRecipients: toR, ccRecipients: ccR, body: { contentType: "HTML", content: "<html><body>" + quoted + "</body></html>" } });
 }
+let MAIL_CTX = null;
+// Work that does not change what the person sees runs after the answer has gone back, so Send finishes the moment Microsoft has sent the email.
+const mailAfter = (p) => { const q = Promise.resolve(p).catch(() => {}); try { if (MAIL_CTX && MAIL_CTX.waitUntil) MAIL_CTX.waitUntil(q); } catch (e) { /* ignore */ } return q; };
 async function mailDraftSend(env, addr, msg, op, text, to, extra) {
   const x = extra || {};
+  const t0 = Date.now(), lap = [];
+  const mark = (n) => lap.push(n + " " + (Date.now() - t0));
   let made = await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}/${op}`, "POST", {});
   if (!made.ok && /ErrorInvalidReferenceItem/i.test(String(made.text || ""))) made = await mailManualDraft(env, addr, msg, op, to);
   if (!made.ok || !made.json || !made.json.id) return made;
@@ -4873,6 +4879,7 @@ async function mailDraftSend(env, addr, msg, op, text, to, extra) {
       await mailDo(env, addr, `/messages/${encodeURIComponent(id)}/attachments/${encodeURIComponent(a.id)}`, "DELETE");
     }
   }
+  mark("draft");
   const old = String((made.json.body && made.json.body.content) || "");
   const mine = mailBodyHtml(x, text) + "<br>";
   // The trail now sits in the editor, where it can be edited or deleted. "graph" means it was left untouched (the real trail from Microsoft goes under the message), "edited" means what is in the message is the trail, and "none" means it was deleted. Nothing sent means the old behaviour.
@@ -4889,12 +4896,18 @@ async function mailDraftSend(env, addr, msg, op, text, to, extra) {
   const at = holdAt ? "" : mailWhenOk(x.sendAt);
   if (at) patch.singleValueExtendedProperties = [{ id: "SystemTime 0x3FEF", value: at }];
   const upd = await mailDo(env, addr, `/messages/${encodeURIComponent(id)}`, "PATCH", patch);
+  mark("patch");
   if (!upd.ok) return upd;
-  for (const a of mailAtts(x.attachments)) { const ar = await mailDo(env, addr, `/messages/${encodeURIComponent(id)}/attachments`, "POST", a); if (!ar.ok) return ar; }
+  const attRes = await Promise.all(mailAtts(x.attachments).map((a) => mailDo(env, addr, `/messages/${encodeURIComponent(id)}/attachments`, "POST", a)));
+  const attBad = attRes.find((r) => !r.ok);
+  if (attBad) return attBad;
+  mark("atts");
   if (x.noSend) return { ok: true, status: 200, json: { id } };
   if (holdAt) { await mailHoldAdd(env, addr, id, holdAt, x.by); return { ok: true, status: 200, json: { id, held: holdAt } }; }
   const sent = await mailDo(env, addr, `/messages/${encodeURIComponent(id)}/send`, "POST");
-  if (sent && sent.ok) await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}`, "PATCH", { singleValueExtendedProperties: [{ id: "Integer 0x1081", value: op === "createForward" ? "104" : op === "createReplyAll" ? "103" : "102" }] }).catch(() => {});
+  mark("sent");
+  console.log("mail send timing ms: " + lap.join(", "));
+  if (sent && sent.ok) mailAfter(mailDo(env, addr, `/messages/${encodeURIComponent(msg)}`, "PATCH", { singleValueExtendedProperties: [{ id: "Integer 0x1081", value: op === "createForward" ? "104" : op === "createReplyAll" ? "103" : "102" }] }));
   return sent;
 }
 // Emails written after hours are kept as drafts and listed in Reservoir's own Outbox. A five minute run sends each one once its time comes, so it is always visible and never lost in Microsoft's queue.
@@ -5299,6 +5312,30 @@ async function mailRoutes(request, env, user, url) {
       if (["send", "reply", "replyall", "forward", "savedraft"].includes(act)) await mailEmbedLogo(env, body);
       const done = (r) => r.ok ? reply(env, 200, { ok: true, worker: WORKER_BUILD }) : reply(env, 200, { ok: false, error: mailWhy(r, true), worker: WORKER_BUILD });
       // Writing check on Send (Tayler only for now). Own rules for capitals and full stops, then LanguageTool's free public service in Australian English. If LanguageTool cannot be reached the email is allowed through.
+      // Save to OneDrive: list the job folders under Client Records / New Jobs, and save a message's attachments loose into one of them (made if it is new).
+      if (act === "spwhere") {
+        const kids = (await voiceChildren(env, MAIL_JOBS_SEGS)) || [];
+        return reply(env, 200, { ok: true, folders: kids.filter((x) => x.folder).map((x) => x.name).sort((x, y) => x.localeCompare(y, "en", { numeric: true })), worker: WORKER_BUILD });
+      }
+      if (act === "spsave") {
+        const folder = cleanName(body && body.folder);
+        const ids = Array.isArray(body && body.atts) ? body.atts.map(mailId).filter(Boolean).slice(0, 40) : [];
+        if (!folder || !msg || !ids.length) return reply(env, 200, { ok: false, error: "A folder name is needed.", worker: WORKER_BUILD });
+        const saved = [], failed = [];
+        for (const aid of ids) {
+          try {
+            const r = await graphFetch(env, `/users/${encodeURIComponent(addr)}/messages/${encodeURIComponent(msg)}/attachments/${encodeURIComponent(aid)}`);
+            if (!r.ok) throw new Error("read " + r.status);
+            const att = await r.json();
+            if (!att.contentBytes) throw new Error("no content");
+            const bin = atob(att.contentBytes), bytes = new Uint8Array(bin.length);
+            for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+            await uploadToSharePoint(env, [...MAIL_JOBS_SEGS, folder], cleanName(att.name || "attachment") || "attachment", bytes, att.contentType, false);
+            saved.push(att.name);
+          } catch (e) { failed.push(String(e && e.message || e).slice(0, 60)); }
+        }
+        return reply(env, 200, { ok: saved.length > 0, saved: saved.length, failed, folder, error: saved.length ? "" : "The files were not saved (" + failed.join(", ") + ").", worker: WORKER_BUILD });
+      }
       if (act === "grammar") {
         const txt = String(body && body.text || "").slice(0, 15000);
         const problems = [];
@@ -5312,7 +5349,7 @@ async function mailRoutes(request, env, user, url) {
         let skipped = false;
         try {
           const ctl = new AbortController();
-          const timer = setTimeout(() => ctl.abort(), 5000);
+          const timer = setTimeout(() => ctl.abort(), 2000);
           const lt = await fetch("https://api.languagetool.org/v2/check", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json" }, body: "language=en-AU&text=" + encodeURIComponent(txt), signal: ctl.signal });
           clearTimeout(timer);
           if (!lt.ok) skipped = true;
@@ -8932,6 +8969,7 @@ export default {
     ctx.waitUntil(leaveSync(env).catch((e) => console.log("leave sync failed", String(e && e.message || e))));
   },
   async fetch(request, rawEnv, ctx) {
+    MAIL_CTX = ctx;
     let env = rawEnv;
     if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: cors(env) });
     const earlyUrl = new URL(request.url);
