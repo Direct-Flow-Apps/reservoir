@@ -654,7 +654,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
 
 // Update push. Set this to a bundle name (for example "Full-Reservoir-2026.11.25-v26") and every open Reservoir and Weir window that finds that bundle newer than its own reloads straight away, instead of waiting for midnight or a home screen. Leave it empty for the normal gentle update.
 const APP_FORCE_UPDATE = "Full-Reservoir-2026.11.25-v26";
-const WORKER_BUILD = "Reservoir-Worker-2026.11.25-w315";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.25-w316";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -5342,36 +5342,44 @@ async function mailRoutes(request, env, user, url) {
         }
         return reply(env, 200, { ok: saved.length > 0 || (skipped > 0 && !failed.length), saved: saved.length, skipped, failed, folder, error: saved.length || (skipped && !failed.length) ? "" : "The files were not saved (" + failed.join(", ") + ").", worker: WORKER_BUILD });
       }
-      if (act === "grammar") {
-        const txt = String(body && body.text || "").slice(0, 15000);
-        const problems = [];
-        for (const line of txt.split(/\n+/)) {
-          const t = line.trim();
-          if (!t || /@|https?:\/\//i.test(t)) continue;
-          const words = t.split(/\s+/).length;
-          if (words >= 4 && !/[.!?:;,)"'\u201d]$/.test(t)) problems.push({ message: "No full stop at the end of this line", text: t.slice(0, 60), kind: "stop", end: t.slice(-30) });
-          if (/^[a-z]/.test(t)) problems.push({ message: "Starts without a capital letter", text: t.slice(0, 60), kind: "cap" });
+      if (act === "fixlines" || act === "aiusage") {
+        // Writing fix on Cloudflare's own AI (free daily allowance). It only corrects spelling, grammar, punctuation and capital letters, never the words. Every call is counted so the Development screen can show the real Neuron use.
+        await env.DB.prepare("CREATE TABLE IF NOT EXISTS ai_usage (day TEXT PRIMARY KEY, calls INTEGER DEFAULT 0, tin INTEGER DEFAULT 0, tout INTEGER DEFAULT 0, neurons REAL DEFAULT 0)").run();
+        if (act === "aiusage") {
+          const rows = ((await env.DB.prepare("SELECT day, calls, tin, tout, neurons FROM ai_usage ORDER BY day DESC LIMIT 7").all()).results) || [];
+          return reply(env, 200, { ok: true, today: rows.find((r) => r.day === new Date().toISOString().slice(0, 10)) || { calls: 0, tin: 0, tout: 0, neurons: 0 }, week: rows, free: 10000, worker: WORKER_BUILD });
         }
-        let skipped = false;
+        if (!env.AI) return reply(env, 200, { ok: false, error: "The writing check is not switched on yet.", worker: WORKER_BUILD });
+        const lines = (Array.isArray(body && body.lines) ? body.lines : []).slice(0, 80).map((x) => String(x || "").slice(0, 1500));
+        const send = lines.map((t, i) => ({ i, t })).filter((x) => x.t.trim() && !/@|https?:\/\//i.test(x.t));
+        if (!send.length) return reply(env, 200, { ok: true, lines, changed: 0, worker: WORKER_BUILD });
+        const MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
+        const sys = "You are a proofreader for Australian English business emails. Correct only spelling mistakes, grammar mistakes, punctuation and capital letters. Add commas, full stops and capitals where they are missing, and split run on sentences with punctuation. Never reword, never add, remove or reorder words, never change the tone, and keep names, numbers, job numbers, addresses and codes exactly as written. Each input line is numbered like '3: text'. Reply with every line again in the same order, in the same numbered format, one line each, and nothing else.";
+        let out;
         try {
-          const ctl = new AbortController();
-          const timer = setTimeout(() => ctl.abort(), 2000);
-          const lt = await fetch("https://api.languagetool.org/v2/check", { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json" }, body: "language=en-AU&text=" + encodeURIComponent(txt), signal: ctl.signal });
-          clearTimeout(timer);
-          if (!lt.ok) skipped = true;
-          else {
-            const j = await lt.json();
-            for (const m of (j.matches || [])) {
-              const cat = String(m.rule && m.rule.category && m.rule.category.id || "");
-              if (/STYLE|REDUNDANCY|PLAIN_ENGLISH|COLLOQUIALISMS|WIKIPEDIA/.test(cat)) continue;
-              const bit = txt.substr(m.offset, m.length);
-              if (/SPELL|MORFOLOGIK/i.test(String(m.rule && m.rule.id || "")) && (/^[A-Z]/.test(bit) || /\d/.test(bit))) continue;
-              const fix = (m.replacements || []).slice(0, 2).map((r) => r.value).filter(Boolean).join(" or ");
-              problems.push({ message: String(m.shortMessage || m.message || "Check this").slice(0, 80), text: bit.slice(0, 40), fix, kind: "edit", rep: String(((m.replacements || [])[0] || {}).value || ""), whole: bit.length <= 40 });
-            }
-          }
-        } catch (e) { skipped = true; }
-        return reply(env, 200, { ok: true, problems: problems.slice(0, 8), total: problems.length, skipped, worker: WORKER_BUILD });
+          out = await env.AI.run(MODEL, { messages: [{ role: "system", content: sys }, { role: "user", content: send.map((x) => `${x.i + 1}: ${x.t}`).join("\n") }], max_tokens: 2048, temperature: 0 });
+        } catch (e) { return reply(env, 200, { ok: false, error: "The writing check could not run just now.", worker: WORKER_BUILD }); }
+        const txt = String(out && (out.response || (out.result && out.result.response)) || "");
+        const got = {};
+        txt.split(/\n+/).forEach((l) => { const m = l.match(/^\s*(\d+)\s*[:.)]\s?(.*)$/); if (m) got[Number(m[1]) - 1] = m[2]; });
+        const words = (s) => String(s).toLowerCase().replace(/[^a-z0-9'\s]/g, " ").split(/\s+/).filter(Boolean);
+        let changed = 0;
+        const fixed = lines.map((t, i) => {
+          const c = got[i];
+          if (c == null || !c.trim() || c === t) return t;
+          // A line is only taken if it is the same writing: similar length, and most of the words are still there. Anything else is left as the person wrote it.
+          const a1 = words(t), b1 = words(c);
+          if (b1.length < a1.length * 0.7 || b1.length > a1.length * 1.4) return t;
+          const keep = a1.filter((x) => b1.includes(x)).length;
+          if (a1.length && keep / a1.length < 0.7) return t;
+          changed++;
+          return c;
+        });
+        const u = (out && out.usage) || {};
+        const tin = Number(u.prompt_tokens) || Math.ceil((sys.length + send.reduce((n, x) => n + x.t.length, 0)) / 4), tout = Number(u.completion_tokens) || Math.ceil(txt.length / 4);
+        const neurons = tin * 26668 / 1e6 + tout * 204805 / 1e6;
+        try { await env.DB.prepare("INSERT INTO ai_usage (day, calls, tin, tout, neurons) VALUES (?1, 1, ?2, ?3, ?4) ON CONFLICT(day) DO UPDATE SET calls = calls + 1, tin = tin + ?2, tout = tout + ?3, neurons = neurons + ?4").bind(new Date().toISOString().slice(0, 10), tin, tout, neurons).run(); } catch (e) {}
+        return reply(env, 200, { ok: true, lines: fixed, changed, worker: WORKER_BUILD });
       }
       if (act === "catadd") {
         const nm = String(body.name || "").replace(/\s+/g, " ").trim().slice(0, 40);
