@@ -654,7 +654,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
 
 // Update push. Set this to a bundle name (for example "Full-Reservoir-2026.11.25-v26") and every open Reservoir and Weir window that finds that bundle newer than its own reloads straight away, instead of waiting for midnight or a home screen. Leave it empty for the normal gentle update.
 const APP_FORCE_UPDATE = "Full-Reservoir-2026.11.25-v26";
-const WORKER_BUILD = "Reservoir-Worker-2026.11.25-w317";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.25-w319";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -5353,7 +5353,27 @@ async function mailRoutes(request, env, user, url) {
         const lines = (Array.isArray(body && body.lines) ? body.lines : []).slice(0, 80).map((x) => String(x || "").slice(0, 1500));
         const send = lines.map((t, i) => ({ i, t })).filter((x) => x.t.trim() && !/@|https?:\/\//i.test(x.t));
         if (!send.length) return reply(env, 200, { ok: true, lines, changed: 0, worker: WORKER_BUILD });
+        const orig = lines.slice();
         const MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
+        let uin = 0, uout = 0;
+        const lev = (a, b) => { const d = Array.from({ length: a.length + 1 }, (_, i) => [i, ...Array(b.length).fill(0)]); for (let j = 1; j <= b.length; j++) d[0][j] = j; for (let i = 1; i <= a.length; i++) for (let j = 1; j <= b.length; j++) d[i][j] = Math.min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1)); return d[a.length][b.length]; };
+        // Pass 1: spelling, one word at a time against Australian English. Names, short forms and codes are left alone, and a correction must be a small change to the same word.
+        try {
+          const uniq = [...new Set(send.map((x) => x.t).join(" ").match(/[A-Za-z][A-Za-z']{3,}/g) || [])].slice(0, 400);
+          if (uniq.length) {
+            const so = await env.AI.run(MODEL, { messages: [{ role: "system", content: "You check spelling against the Australian English dictionary (Macquarie style: colour, organise, centre, licence as the noun, metre, programme only for TV). You are given a list of words, one per line. Reply only with the words that are misspelled, one per line, as wrong=right. Do not list correctly spelt words. Do not change names of people or places, company names, abbreviations or codes. If every word is spelt correctly reply with the single word NONE." }, { role: "user", content: uniq.join("\n") }], max_tokens: 600, temperature: 0 });
+            const st = String(so && (so.response || (so.result && so.result.response)) || "");
+            const su = (so && so.usage) || {};
+            uin += Number(su.prompt_tokens) || 0; uout += Number(su.completion_tokens) || 0;
+            const fixes = {};
+            st.split(/\n+/).forEach((l) => { const m = l.trim().match(/^([A-Za-z']+)\s*=\s*([A-Za-z']+)$/); if (m && m[1].toLowerCase() !== m[2].toLowerCase() && uniq.includes(m[1]) && lev(m[1].toLowerCase(), m[2].toLowerCase()) <= 3 && m[1][0].toLowerCase() === m[2][0].toLowerCase()) fixes[m[1]] = m[2]; });
+            const keys = Object.keys(fixes);
+            if (keys.length) {
+              const fit = (from, to) => from === from.toUpperCase() && from.length > 1 ? to.toUpperCase() : from[0] === from[0].toUpperCase() ? to[0].toUpperCase() + to.slice(1) : to;
+              send.forEach((x) => { x.t = x.t.replace(/[A-Za-z][A-Za-z']{3,}/g, (wd) => (fixes[wd] ? fit(wd, fixes[wd]) : wd)); lines[x.i] = x.t; });
+            }
+          }
+        } catch (e) {}
         const sys = "You are a proofreader for Australian English business emails. Correct only spelling mistakes, grammar mistakes, punctuation and capital letters. Add commas, full stops and capitals where they are missing, and split run on sentences with punctuation. Never reword, never add, remove or reorder words, never change the tone, and keep names, numbers, job numbers, addresses and codes exactly as written. Each input line is numbered like '3: text'. Reply with every line again in the same order, in the same numbered format, one line each, and nothing else.";
         let out;
         try {
@@ -5377,11 +5397,31 @@ async function mailRoutes(request, env, user, url) {
             if (ok) r = c;
           }
           r = cap(r);
-          if (r !== t) changed++;
+          if (r !== orig[i]) changed++;
           return r;
         });
+        // Paragraphs: a long block of writing is broken into paragraphs between sentences. No words change. If the AI's answer is not the same text, the block is split every three sentences instead.
+        for (let i = 0; i < fixed.length; i++) {
+          const ln = fixed[i];
+          if (!sent.has(i) || ln.length < 300) continue;
+          const sents = ln.match(/[^.!?]+[.!?]+(?:\s+|$)/g);
+          if (!sents || sents.length < 3 || sents.join("").replace(/\s+/g, " ").trim() !== ln.replace(/\s+/g, " ").trim()) continue;
+          let parts = null;
+          try {
+            const po = await env.AI.run(MODEL, { messages: [{ role: "system", content: "You lay out business emails. Insert the marker ||| between sentences where a new paragraph should start, at natural changes of topic, roughly every two to four sentences. Do not change, add or remove any other character. Reply with the text only." }, { role: "user", content: ln }], max_tokens: 1024, temperature: 0 });
+            const pt = String(po && (po.response || (po.result && po.result.response)) || "");
+            const pu = (po && po.usage) || {};
+            uin += Number(pu.prompt_tokens) || Math.ceil(ln.length / 4); uout += Number(pu.completion_tokens) || Math.ceil(pt.length / 4);
+            const ps = pt.split("|||").map((x) => x.trim()).filter(Boolean);
+            if (ps.length > 1 && ps.join(" ").replace(/\s+/g, " ") === ln.replace(/\s+/g, " ").trim()) parts = ps;
+          } catch (e) {}
+          if (!parts) { parts = []; for (let k = 0; k < sents.length; k += 3) parts.push(sents.slice(k, k + 3).join("").trim()); }
+          if (parts.length < 2) continue;
+          if (fixed[i] === orig[i]) changed++;
+          fixed[i] = parts.join("\n");
+        }
         const u = (out && out.usage) || {};
-        const tin = Number(u.prompt_tokens) || Math.ceil((sys.length + send.reduce((n, x) => n + x.t.length, 0)) / 4), tout = Number(u.completion_tokens) || Math.ceil(txt.length / 4);
+        const tin = uin + (Number(u.prompt_tokens) || Math.ceil((sys.length + send.reduce((n, x) => n + x.t.length, 0)) / 4)), tout = uout + (Number(u.completion_tokens) || Math.ceil(txt.length / 4));
         const neurons = tin * 26668 / 1e6 + tout * 204805 / 1e6;
         try { await env.DB.prepare("INSERT INTO ai_usage (day, calls, tin, tout, neurons) VALUES (?1, 1, ?2, ?3, ?4) ON CONFLICT(day) DO UPDATE SET calls = calls + 1, tin = tin + ?2, tout = tout + ?3, neurons = neurons + ?4").bind(new Date().toISOString().slice(0, 10), tin, tout, neurons).run(); } catch (e) {}
         return reply(env, 200, { ok: true, lines: fixed, changed, worker: WORKER_BUILD });
