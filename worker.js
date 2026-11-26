@@ -654,7 +654,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
 
 // Update push. Set this to a bundle name (for example "Full-Reservoir-2026.11.25-v26") and every open Reservoir and Weir window that finds that bundle newer than its own reloads straight away, instead of waiting for midnight or a home screen. Leave it empty for the normal gentle update.
 const APP_FORCE_UPDATE = "Full-Reservoir-2026.11.25-v26";
-const WORKER_BUILD = "Reservoir-Worker-2026.11.26-w330";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.26-w331";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -5165,7 +5165,7 @@ async function mailRoutes(request, env, user, url) {
     if (url.pathname === "/api/mail/message" && !post) {
       const msg = mailId(url.searchParams.get("msg"));
       if (!msg) return reply(env, 400, { error: "bad request" });
-      const r = await mailGraph(env, addr, `/messages/${encodeURIComponent(msg)}?$select=subject,from,toRecipients,ccRecipients,bccRecipients,isDraft,importance,receivedDateTime,sentDateTime,body,hasAttachments,isRead,categories,flag,internetMessageId&$expand=attachments($select=id,name,size,contentType,isInline,contentId)`);
+      const r = await mailGraph(env, addr, `/messages/${encodeURIComponent(msg)}?$select=subject,from,toRecipients,ccRecipients,bccRecipients,isDraft,importance,receivedDateTime,sentDateTime,body,hasAttachments,isRead,categories,flag,internetMessageId&$expand=attachments($select=id,name,size,contentType,isInline)`);
       if (!r.ok) return reply(env, 200, { ok: false, error: mailWhy(r), worker: WORKER_BUILD });
       const m = r.json || {};
       const html = !!(m.body && String(m.body.contentType || "").toLowerCase() === "html");
@@ -5177,17 +5177,26 @@ async function mailRoutes(request, env, user, url) {
         let top = cutAt >= 0 ? shown.slice(0, cutAt) : shown;
         const rest = cutAt >= 0 ? shown.slice(cutAt) : "";
         let n = (m.attachments || []).filter((a) => /^Attachment \d+/.test(String(a.name || ""))).length;
-        for (const tag of (top.match(/<img\b[^>]*>/gi) || [])) {
-          const src = (tag.match(/\ssrc\s*=\s*["']([^"']+)["']/i) || [])[1] || "";
-          if (!/^cid:/i.test(src)) continue;
-          const cid = src.slice(4).replace(/^<|>$/g, "");
-          const a = (m.attachments || []).find((x) => String(x.contentId || "").replace(/^<|>$/g, "") === cid);
-          if (!a || Number(a.size || 0) < 30000 || !/^image\//i.test(String(a.contentType || ""))) continue;
-          n++;
-          const ext = (String(a.contentType).split("/")[1] || "png").replace("jpeg", "jpg").replace(/[^a-z0-9]/gi, "") || "png";
-          movedPics.push({ id: a.id, name: `Attachment ${n}.${ext}`, size: Number(a.size || 0), type: String(a.contentType || "") });
-          top = top.replace(tag, "");
-        }
+        try {
+          const big = (m.attachments || []).filter((x) => Number(x.size || 0) >= 30000 && /^image\//i.test(String(x.contentType || "")) && x.isInline).slice(0, 10);
+          const cids = new Map();
+          for (const a of big) {
+            let g = await mailGraph(env, addr, `/messages/${encodeURIComponent(msg)}/attachments/${encodeURIComponent(a.id)}?$select=id,contentId`);
+            if (!g.ok) g = await mailGraph(env, addr, `/messages/${encodeURIComponent(msg)}/attachments/${encodeURIComponent(a.id)}`);
+            const c = g.ok && g.json ? String(g.json.contentId || "").replace(/^<|>$/g, "") : "";
+            if (c) cids.set(c, a);
+          }
+          for (const tag of (top.match(/<img\b[^>]*>/gi) || [])) {
+            const src = (tag.match(/\ssrc\s*=\s*["']([^"']+)["']/i) || [])[1] || "";
+            if (!/^cid:/i.test(src)) continue;
+            const a = cids.get(src.slice(4).replace(/^<|>$/g, ""));
+            if (!a) continue;
+            n++;
+            const ext = (String(a.contentType).split("/")[1] || "png").replace("jpeg", "jpg").replace(/[^a-z0-9]/gi, "") || "png";
+            movedPics.push({ id: a.id, name: `Attachment ${n}.${ext}`, size: Number(a.size || 0), type: String(a.contentType || "") });
+            top = top.replace(tag, "");
+          }
+        } catch (e) { movedPics.length = 0; console.log("picture view failed", String(e && e.message || e)); }
         if (movedPics.length) shown = top + rest;
       }
       if (html && /cid:/i.test(shown)) {
