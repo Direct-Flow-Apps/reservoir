@@ -654,7 +654,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
 
 // Update push. Set this to a bundle name (for example "Full-Reservoir-2026.11.25-v26") and every open Reservoir and Weir window that finds that bundle newer than its own reloads straight away, instead of waiting for midnight or a home screen. Leave it empty for the normal gentle update.
 const APP_FORCE_UPDATE = "Full-Reservoir-2026.11.25-v26";
-const WORKER_BUILD = "Reservoir-Worker-2026.11.26-w325";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.26-w327";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -4320,6 +4320,15 @@ async function approvalsTable(env) {
   await env.DB.prepare("CREATE TABLE IF NOT EXISTS contact_approvals (email TEXT PRIMARY KEY, box TEXT, name TEXT, status TEXT, logo INTEGER DEFAULT 0, cnt INTEGER DEFAULT 0, next_at INTEGER DEFAULT 0, created_at TEXT DEFAULT (datetime('now')))").run();
   try { await env.DB.prepare("ALTER TABLE contact_approvals ADD COLUMN msg TEXT").run(); } catch (e) {}
   await env.DB.prepare("DELETE FROM contact_approvals WHERE email LIKE '%aroflo%'").run();
+  // One time (26.11.2026): every sender that was approved goes back to waiting, so each one is approved again and gets a real contact.
+  try {
+    await env.DB.prepare("CREATE TABLE IF NOT EXISTS app_flags (k TEXT PRIMARY KEY, at TEXT)").run();
+    const rd = await env.DB.prepare("SELECT k FROM app_flags WHERE k = 'approvals_reset_20261126'").first();
+    if (!rd) {
+      await env.DB.prepare("UPDATE contact_approvals SET status = 'pending', cnt = 1 WHERE status = 'approved'").run();
+      await env.DB.prepare("INSERT OR IGNORE INTO app_flags (k, at) VALUES ('approvals_reset_20261126', datetime('now'))").run();
+    }
+  } catch (e) {}
 }
 async function approvalSeen(env, b, em, name, msgId) {
   em = String(em || "").toLowerCase().trim();
@@ -5672,16 +5681,21 @@ async function mailRoutes(request, env, user, url) {
         }
         const ob = MAILBOXES.find((x) => x.id === row.box) || MAILBOXES[0];
         const owner = encodeURIComponent(mailAddress(env, ob));
-        const cr = await graphFetch(env, `/users/${owner}/contacts`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ displayName: row.name || em, emailAddresses: [{ address: em, name: row.name || em }] }) });
-        if (!cr.ok) return reply(env, 200, { ok: false, error: "The contact could not be created.", worker: WORKER_BUILD });
-        const c = await cr.json();
+        let c = null;
+        const ex = await graphFetch(env, `/users/${owner}/contacts?$filter=${encodeURIComponent(`emailAddresses/any(a:a/address eq '${em}')`)}&$select=id,displayName,companyName,mobilePhone,businessPhones&$top=1`);
+        if (ex.ok) c = (((await ex.json()).value) || [])[0] || null;
+        if (!c) {
+          const cr = await graphFetch(env, `/users/${owner}/contacts`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ displayName: row.name || em, emailAddresses: [{ address: em, name: row.name || em }] }) });
+          if (!cr.ok) return reply(env, 200, { ok: false, error: "The contact could not be created.", worker: WORKER_BUILD });
+          c = await cr.json();
+        }
         let pic = false;
         try {
           const lg = await logoLookup(env, em);
           if (lg) { const pr = await graphFetch(env, `/users/${owner}/contacts/${encodeURIComponent(c.id)}/photo/$value`, { method: "PUT", headers: { "Content-Type": lg.headers.get("Content-Type") || "image/png" }, body: new Uint8Array(await lg.arrayBuffer()) }); pic = pr.ok; }
         } catch (e) {}
         await env.DB.prepare("UPDATE contact_approvals SET status = 'approved' WHERE email = ?").bind(em).run();
-        return reply(env, 200, { ok: true, logo: pic, worker: WORKER_BUILD });
+        return reply(env, 200, { ok: true, logo: pic, contact: { id: ob.id + ":" + c.id, name: String(c.displayName || row.name || "").slice(0, 80), company: String(c.companyName || "").slice(0, 60), emails: [em], phone: String(c.mobilePhone || (c.businessPhones || [])[0] || "").slice(0, 30), address: "" }, worker: WORKER_BUILD });
       }
       if (act === "newfolder") {
         const name = String(body.name || "").replace(/\s+/g, " ").trim().slice(0, 100);
@@ -5952,7 +5966,7 @@ async function mailWatch(env) {
     const now = new Date().toISOString();
     const save = (v) => env.DB.prepare("INSERT INTO app_settings (key, value, detail, by_name, at) VALUES (?, ?, 'mail watch', 'Reservoir', datetime('now')) ON CONFLICT(key) DO UPDATE SET value = excluded.value, at = datetime('now')").bind(key, v).run();
     if (!row) { await save(now); continue; }
-    const r = await mailGraph(env, mailAddress(env, b), `/mailFolders/inbox/messages?$top=20&$select=id,receivedDateTime,subject,from&$orderby=receivedDateTime desc&$filter=${encodeURIComponent("receivedDateTime gt " + row.value)}`);
+    const r = await mailGraph(env, mailAddress(env, b), `/mailFolders/inbox/messages?$top=20&$select=id,receivedDateTime,subject,from,categories&$orderby=receivedDateTime desc&$filter=${encodeURIComponent("receivedDateTime gt " + row.value)}`);
     if (!r.ok) { console.log("mail watch", b.id, r.status); continue; }
     const fresh = ((r.json && r.json.value) || []);
     if (!fresh.length) continue;
@@ -5992,9 +6006,28 @@ async function mailWatch(env) {
     const brandNewAll = brandNew;
     brandNew.splice(0, brandNew.length, ...brandNewAll.filter((m) => !isVm(m)));
     if (!brandNew.length) continue;
-    const prev = brandNew.length === 1 ? `${who(brandNew[0])}: ${String(brandNew[0].subject || "(no subject)").slice(0, 100)}` : `${brandNew.length} new emails, latest from ${who(brandNew[0])}`;
+    // No alert for mail from one of DFP's own mailboxes (the blind copy on our replies), and none for mail that has already left the Inbox. The checks run together so the alert is not slowed.
+    const baddr = mailAddress(env, b);
+    const ownAddrs = MAILBOXES.map((x) => mailAddress(env, x).toLowerCase());
+    let alertNew = brandNew.filter((m) => !ownAddrs.includes(String((m.from && m.from.emailAddress && m.from.emailAddress.address) || "").toLowerCase()));
+    const still = await Promise.all(alertNew.map(async (m) => { try { const g = await mailGraph(env, baddr, `/mailFolders/inbox/messages/${encodeURIComponent(m.id)}?$select=id`); return g.status !== 404; } catch (e) { return true; } }));
+    alertNew = alertNew.filter((_, i) => still[i]);
+    const prev = alertNew.length === 1 ? `${who(alertNew[0])}: ${String(alertNew[0].subject || "(no subject)").slice(0, 100)}` : `${alertNew.length} new emails, latest from ${who(alertNew[0])}`;
     for (const m of brandNew) { try { const fa = (m.from && m.from.emailAddress) || {}; await approvalSeen(env, b, fa.address, fa.name, m.id); } catch (e) { console.log("approval seen", String(e && e.message || e).slice(0, 120)); } }
-    for (const e of to) await notify(env, { to: e, kind: "mail", title: `New Email - ${b.label}`, body: prev, preview: true, link: "emailbox", box: b.id, by: "Reservoir" });
+    if (alertNew.length) for (const e of to) await notify(env, { to: e, kind: "mail", title: `New Email - ${b.label}`, body: prev, preview: true, link: "emailbox", box: b.id, by: "Reservoir" });
+    // After the alert: a new email with no category picks up the category of an earlier email with the same subject (subject alone, Re: and Fw: ignored).
+    for (const m of brandNew) {
+      try {
+        if ((m.categories || []).length) continue;
+        const base = String(m.subject || "").replace(/^\s*((re|fw|fwd)\s*:\s*)+/i, "").trim();
+        if (!base || base.length > 200) continue;
+        const q = base.replace(/'/g, "''");
+        const flt = ["", "Re: ", "RE: ", "Fw: ", "FW: ", "Fwd: "].map((p) => `subject eq '${p}${q}'`).join(" or ");
+        const rr = await mailGraph(env, baddr, `/messages?$top=30&$select=id,categories,receivedDateTime&$filter=${encodeURIComponent(flt)}`);
+        const hit = ((rr.ok && rr.json && rr.json.value) || []).filter((x) => x.id !== m.id && (x.categories || []).length).sort((a, c) => String(c.receivedDateTime).localeCompare(String(a.receivedDateTime)))[0];
+        if (hit) await mailDo(env, baddr, `/messages/${encodeURIComponent(m.id)}`, "PATCH", { categories: hit.categories });
+      } catch (e) { console.log("category copy", String(e && e.message || e).slice(0, 100)); }
+    }
   }
 }
 // Once a day: drafts with no subject, recipients or words are deleted after 7 days, and any draft older than 14 days is deleted after a day's warning to whoever started it (matched from the name in its signature, or everyone with that mailbox if there is no match).
