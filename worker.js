@@ -318,9 +318,10 @@ async function driveBytes(env, id) {
 // While testing, a director viewing as someone can do everything that person can. Set false before go live to make View As read only again.
 const VIEW_AS_WRITES = true;
 
-async function sendToXero(env, user, meta) {
+async function sendToXero(env, user, meta, given) {
   if (!env.XERO_BILLS_EMAIL) throw new Error("XERO_BILLS_EMAIL is not set on the Worker");
-  const bytes = await driveBytes(env, meta.id);
+  // Reservoir sends the finished PDF with the request. Without one, the stored file goes as it is.
+  const bytes = given && given.byteLength ? given : await driveBytes(env, meta.id);
   if (bytes.byteLength > MAX_EMAIL) throw new Error("too large");
   // Xero only reads PDF, JPG and PNG. Go by what the file really is, not by its name or the type SharePoint guessed, and give it the matching name and type.
   const head = new Uint8Array(bytes.slice(0, 16));
@@ -676,7 +677,7 @@ const receiptRecordOut = (r) => ({ id: r.id, kind: "receipt", receiptType: r.typ
 
 // Update push. Set this to a bundle name (for example "Full-Reservoir-2026.11.25-v26") and every open Reservoir and Weir window that finds that bundle newer than its own reloads straight away, instead of waiting for midnight or a home screen. Leave it empty for the normal gentle update.
 const APP_FORCE_UPDATE = "Full-Reservoir-2026.11.25-v26";
-const WORKER_BUILD = "Reservoir-Worker-2026.11.27-w338";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.27-w339";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -7248,12 +7249,12 @@ async function noticesTable(env) {
       await migMark(env, "reimb_xero_at_v1", `${d && d.meta ? d.meta.changes : 0} reimbursements stamped`);
     } catch (e) { /* tried again on the next start */ }
   }
-  // One time, 27 November 2026: Mitch's $32.69 reimbursement from 26 November was marked processed but never reached Xero. It goes back to waiting, and is checked against Xero.
-  if (!(await migDone(env, "mitch_3269_recheck_v1"))) {
+  // One time, 27 November 2026: Mitch's $32.69 reimbursement from 25 November goes back to waiting as if it had just been sent, so Process sends it to Xero afresh. Remove this block in the next build.
+  if (!(await migDone(env, "mitch_3269_reset_v2"))) {
     try {
       await receiptRecordsTable(env);
-      const d = await env.DB.prepare("UPDATE receipt_records SET status = 'checking', done_date = '', xero_name = replace(item_id, ',', '|'), xero_at = COALESCE(xero_at, created_at), xero_state = 'missing' WHERE type = 'reimbursement' AND status = 'paid' AND lower(by_name) LIKE 'mitch%' AND amount IN ('32.69', '$32.69') AND sent_date >= '2026-11-24'").run();
-      await migMark(env, "mitch_3269_recheck_v1", `${d && d.meta ? d.meta.changes : 0} reimbursements put back to waiting`);
+      const d = await env.DB.prepare("UPDATE receipt_records SET status = 'submitted', done_date = '', xero_name = NULL, xero_at = NULL, xero_state = NULL WHERE type = 'reimbursement' AND status IN ('paid', 'checking') AND lower(by_name) LIKE 'mitch%' AND amount IN ('32.69', '$32.69') AND sent_date >= '2026-11-24'").run();
+      await migMark(env, "mitch_3269_reset_v2", `${d && d.meta ? d.meta.changes : 0} reimbursements put back to waiting`);
     } catch (e) { /* tried again on the next start */ }
   }
   // One time, 26 November 2026: the PAYG notice for the pay run ending 22 November again, as a draft bill in Xero with the new reference (the approved one was voided).
@@ -11302,7 +11303,7 @@ export default {
         const meta = await driveMeta(env, xm[1]);
         if (!meta) return reply(env, 404, { error: "not found", detail: "the file is no longer in SharePoint or its id is not valid", worker: WORKER_BUILD });
         if (meta.folder.startsWith("Receipts/Reimbursements") && user.tier !== "T1") return reply(env, 403, { error: "forbidden" });
-        await sendToXero(env, user, meta);
+        await sendToXero(env, user, meta, await request.arrayBuffer());
         // Remember when and for whom a reimbursement went, so the draft bill Xero makes can be given that person as its contact.
         try { await receiptMarkSent(env, xm[1]); } catch (e) { /* the send already worked */ }
         return reply(env, 200, { ok: true });
@@ -11394,25 +11395,6 @@ export default {
         return reply(env, 200, { ok: true, status: body.status });
       }
       return reply(env, 405, { error: "method not allowed" });
-    }
-
-    const rfile = url.pathname.match(/^\/api\/receipts\/([A-Za-z0-9!_-]{1,200})\/file$/);
-    if (rfile && request.method === "PUT") {
-      // Overwrite a stored receipt with a corrected copy (T1). The SharePoint item keeps its id, and any receipt that points at it goes back to waiting, so it is sent to Xero again from scratch.
-      if (user.tier !== "T1") return reply(env, 403, { error: "forbidden" });
-      try {
-        const meta = await driveMeta(env, rfile[1]);
-        if (!meta || !meta.folder.startsWith("Receipts/")) return reply(env, 404, { error: "not found" });
-        const bytes = await request.arrayBuffer();
-        if (!bytes.byteLength || bytes.byteLength > MAX_UPLOAD) return reply(env, 400, { error: "bad file" });
-        const put = await graphFetch(env, `/sites/${siteId(env)}/drive/items/${rfile[1]}/content`, { method: "PUT", headers: { "Content-Type": "application/pdf" }, body: bytes });
-        if (!put.ok) return reply(env, 502, { error: "replace failed", detail: "SharePoint answered " + put.status });
-        await receiptRecordsTable(env);
-        await env.DB.prepare("UPDATE receipt_records SET status = 'submitted', done_date = '', xero_name = NULL, xero_at = NULL, xero_state = NULL WHERE status IN ('submitted', 'checking') AND (',' || item_id || ',') LIKE ?").bind(`%,${rfile[1]},%`).run();
-        return reply(env, 200, { ok: true });
-      } catch (e) {
-        return reply(env, 502, { error: "replace failed", detail: String(e.message || "").slice(0, 200) });
-      }
     }
 
     if (url.pathname === "/api/receipts" && request.method === "POST") {
