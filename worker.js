@@ -654,7 +654,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
 
 // Update push. Set this to a bundle name (for example "Full-Reservoir-2026.11.25-v26") and every open Reservoir and Weir window that finds that bundle newer than its own reloads straight away, instead of waiting for midnight or a home screen. Leave it empty for the normal gentle update.
 const APP_FORCE_UPDATE = "Full-Reservoir-2026.11.25-v26";
-const WORKER_BUILD = "Reservoir-Worker-2026.11.26-w331";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.26-w333";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -5170,9 +5170,9 @@ async function mailRoutes(request, env, user, url) {
       const m = r.json || {};
       const html = !!(m.body && String(m.body.contentType || "").toLowerCase() === "html");
       let shown = String((m.body && m.body.content) || "").slice(0, 1500000);
-      // Big pictures sitting in the body of the current email (not the quoted trail, not small logos) are taken out of the view and listed as attachments called Attachment 1, Attachment 2. Nothing is changed in Exchange. Replies build their trail from this cleaned view, so the pictures stay out of reply trails. Tayler's sign in only for now.
+      // Big pictures sitting in the body of the current email (not the quoted trail, not small logos) are taken out of the view and listed as attachments called Attachment 1, Attachment 2. Nothing is changed in Exchange. Replies build their trail from this cleaned view, so the pictures stay out of reply trails. Everybody.
       const movedPics = [];
-      if (html && !m.isDraft && /<img/i.test(shown) && user.tier === "T1" && (/^tayler/i.test(String(user.email || "")) || /^tayler\b/i.test(String(user.name || "")))) {
+      if (html && !m.isDraft && /<img/i.test(shown)) {
         const cutAt = shown.search(/<div id="appendonsend"|<div id="divRplyFwdMsg"|<blockquote|<div style="border:none;border-top:solid #E1E1E1|<hr[^>]*id="stopSpelling"/i);
         let top = cutAt >= 0 ? shown.slice(0, cutAt) : shown;
         const rest = cutAt >= 0 ? shown.slice(cutAt) : "";
@@ -5432,7 +5432,7 @@ async function mailRoutes(request, env, user, url) {
         // Paragraphs: a long block of writing is broken into paragraphs between sentences. No words change. If the AI's answer is not the same text, the block is split every three sentences instead.
         for (let i = 0; i < fixed.length; i++) {
           const ln = fixed[i];
-          if (!sent.has(i) || ln.length < 300) continue;
+          if (!body.spacing || !sent.has(i) || ln.length < 300) continue;
           const sents = ln.match(/[^.!?]+[.!?]+(?:\s+|$)/g);
           if (!sents || sents.length < 3 || sents.join("").replace(/\s+/g, " ").trim() !== ln.replace(/\s+/g, " ").trim()) continue;
           let parts = null;
