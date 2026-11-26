@@ -654,7 +654,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
 
 // Update push. Set this to a bundle name (for example "Full-Reservoir-2026.11.25-v26") and every open Reservoir and Weir window that finds that bundle newer than its own reloads straight away, instead of waiting for midnight or a home screen. Leave it empty for the normal gentle update.
 const APP_FORCE_UPDATE = "Full-Reservoir-2026.11.25-v26";
-const WORKER_BUILD = "Reservoir-Worker-2026.11.26-w327";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.26-w328";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -5943,6 +5943,68 @@ async function picClean(env) {
     }
   }
 }
+// ---- One off test: three emails sent from the Tayler mailbox to itself with pictures sitting in the body, to prove the picture clean up. Runs once (flag in app_settings) from the every minute trigger.
+async function pngMake(w, h, px) {
+  const crcT = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; crcT[n] = c >>> 0; }
+  const crc = (u8) => { let c = 0xFFFFFFFF; for (let i = 0; i < u8.length; i++) c = crcT[(c ^ u8[i]) & 255] ^ (c >>> 8); return (c ^ 0xFFFFFFFF) >>> 0; };
+  const chunk = (type, data) => { const o = new Uint8Array(12 + data.length); const dv = new DataView(o.buffer); dv.setUint32(0, data.length); for (let i = 0; i < 4; i++) o[4 + i] = type.charCodeAt(i); o.set(data, 8); dv.setUint32(8 + data.length, crc(o.subarray(4, 8 + data.length))); return o; };
+  const ihdr = new Uint8Array(13); const iv = new DataView(ihdr.buffer); iv.setUint32(0, w); iv.setUint32(4, h); ihdr[8] = 8; ihdr[9] = 2;
+  let y = 0;
+  const rs = new ReadableStream({ pull(ctl) { if (y >= h) { ctl.close(); return; } const row = new Uint8Array(1 + w * 3); for (let x = 0; x < w; x++) { const c = px(x, y); row[1 + x * 3] = c[0]; row[2 + x * 3] = c[1]; row[3 + x * 3] = c[2]; } y++; ctl.enqueue(row); } }).pipeThrough(new CompressionStream("deflate"));
+  const rd = rs.getReader(); const parts = []; let len = 0;
+  for (;;) { const r = await rd.read(); if (r.done) break; parts.push(r.value); len += r.value.length; }
+  const idat = new Uint8Array(len); let o = 0; for (const q of parts) { idat.set(q, o); o += q.length; }
+  const sig = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
+  const a = chunk("IHDR", ihdr), b = chunk("IDAT", idat), c = chunk("IEND", new Uint8Array(0));
+  const out = new Uint8Array(sig.length + a.length + b.length + c.length); let k = 0; for (const q of [sig, a, b, c]) { out.set(q, k); k += q.length; }
+  return out;
+}
+const u8b64 = (u8) => { let s = ""; for (let i = 0; i < u8.length; i += 0x8000) s += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000)); return btoa(s); };
+async function picTest(env) {
+  await env.DB.prepare("CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT, detail TEXT, by_name TEXT, at TEXT)").run();
+  const done = await env.DB.prepare("SELECT value FROM app_settings WHERE key = 'pictest.20261126'").first();
+  if (done) return;
+  await env.DB.prepare("INSERT INTO app_settings (key, value, detail, by_name, at) VALUES ('pictest.20261126', '1', 'picture clean up test sent', 'Reservoir', datetime('now'))").run();
+  const b = MAILBOXES.find((x) => x.id === "tayler");
+  const addr = mailAddress(env, b);
+  // A screenshot style picture: light page, coloured bars, a little noise so it is a real size.
+  const shot = (seed) => (x, y) => { const n = (((x * 7 + y * 13 + seed * 31) * 2654435761) >>> 24) % 24; const bar = (y % 90) < 40 && x > 80 && x < 1000 - (y % 7) * 40; return bar ? [40 + seed * 40 + n, 110 + n, 190 - seed * 30 + n] : [236 - n, 238 - n, 242 - n]; };
+  // A camera style picture: large, smooth sky and ground with fine grain.
+  const photo = (x, y) => { const g = (Math.random() * 2) | 0, t = y / 5000; return y < 2600 ? [80 + g + ((t * 160) | 0), 140 + g + ((t * 90) | 0), 215 - ((t * 60) | 0) + (g & 1)] : [60 + g + ((x / 4000 * 40) | 0), 90 + g, 50 + (g & 1)]; };
+  const jobs = [
+    { subject: "Picture test 1 of 3: one screenshot in the body", pics: [{ w: 1280, h: 720, px: shot(1) }] },
+    { subject: "Picture test 2 of 3: three screenshots in the body", pics: [{ w: 1280, h: 720, px: shot(0) }, { w: 1280, h: 720, px: shot(1) }, { w: 1280, h: 720, px: shot(2) }] },
+    { subject: "Picture test 3 of 3: one large camera photo in the body", pics: [{ w: 4000, h: 5000, px: photo }] }
+  ];
+  for (const j of jobs) {
+    let html = `<div style="font-family:Calibri,sans-serif;font-size:11pt">Morning,<br><br>Test email. The pictures below should be moved out into attachments.<br><br>`;
+    const files = [];
+    for (let i = 0; i < j.pics.length; i++) { const bytes = await pngMake(j.pics[i].w, j.pics[i].h, j.pics[i].px); files.push({ name: `image00${i + 1}.png`, cid: `pic${i + 1}@test`, bytes }); html += `<img src="cid:pic${i + 1}@test" width="480"><br><br>`; }
+    html += `Regards</div>`;
+    const made = await mailDo(env, addr, "/messages", "POST", { subject: j.subject, body: { contentType: "HTML", content: html }, toRecipients: [{ emailAddress: { address: addr } }] });
+    if (!made.ok || !made.json || !made.json.id) { console.log("pic test draft failed", made.status); continue; }
+    const id = made.json.id;
+    let okAll = true;
+    for (const f of files) {
+      if (f.bytes.length < 2500000) {
+        const r = await mailDo(env, addr, `/messages/${encodeURIComponent(id)}/attachments`, "POST", { "@odata.type": "#microsoft.graph.fileAttachment", name: f.name, contentType: "image/png", contentBytes: u8b64(f.bytes), isInline: true, contentId: f.cid });
+        if (!r.ok) { okAll = false; console.log("pic test attach failed", r.status); }
+      } else {
+        const us = await mailDo(env, addr, `/messages/${encodeURIComponent(id)}/attachments/createUploadSession`, "POST", { AttachmentItem: { attachmentType: "file", name: f.name, size: f.bytes.length, contentType: "image/png", isInline: true, contentId: f.cid } });
+        const url = us.json && us.json.uploadUrl;
+        if (!url) { okAll = false; console.log("pic test upload session failed", us.status); continue; }
+        const step = 3 * 1024 * 1024;
+        for (let at = 0; at < f.bytes.length; at += step) {
+          const part = f.bytes.subarray(at, Math.min(at + step, f.bytes.length));
+          const pr = await fetch(url, { method: "PUT", headers: { "Content-Length": String(part.length), "Content-Range": `bytes ${at}-${at + part.length - 1}/${f.bytes.length}` }, body: part });
+          if (!pr.ok) { okAll = false; console.log("pic test upload failed", pr.status); break; }
+        }
+      }
+    }
+    if (okAll) { const sent = await mailDo(env, addr, `/messages/${encodeURIComponent(id)}/send`, "POST"); if (!sent.ok) console.log("pic test send failed", sent.status); }
+  }
+}
 async function mailWatch(env) {
   if (!env.GRAPH_CLIENT_SECRET) return;
   await settingsTable(env);
@@ -9175,7 +9237,7 @@ export default {
   // Runs on a Cloudflare cron trigger if one is added (for example Thursday early morning). It only refreshes leave balances and leave history from Xero into D1.
   async scheduled(event, env, ctx) {
     // A one minute trigger only tidies pictures out of the body of received email, and nothing else.
-    if (event && event.cron === "* * * * *") { ctx.waitUntil(picClean(env).catch((e) => console.log("picture clean failed", String(e && e.message || e)))); return; }
+    if (event && event.cron === "* * * * *") { ctx.waitUntil(picTest(env).catch((e) => console.log("picture test failed", String(e && e.message || e))).then(() => picClean(env)).catch((e) => console.log("picture clean failed", String(e && e.message || e)))); return; }
     // A five minute trigger, if one is added, only looks for new mail so pings arrive quickly.
     if (event && event.cron === "*/5 * * * *") { ctx.waitUntil(mergeExportTest(env).catch((e) => console.log("export test failed", String(e && e.message || e)))); ctx.waitUntil(mergeCopyUndo(env).catch((e) => console.log("copy undo failed", String(e && e.message || e)))); ctx.waitUntil(mergeSentCopy(env).catch((e) => console.log("sent copy failed", String(e && e.message || e)))); ctx.waitUntil(mergeAutoReply(env).catch((e) => console.log("autoreply failed", String(e && e.message || e)))); ctx.waitUntil(mergeArchiveCopy(env).catch((e) => console.log("archive copy failed", String(e && e.message || e)))); ctx.waitUntil(mailWatch(env).catch((e) => console.log("mail watch failed", String(e && e.message || e)))); ctx.waitUntil(mailHoldSweep(env).catch((e) => console.log("hold sweep failed", String(e && e.message || e)))); ctx.waitUntil(rcptRefresh(env, MAILBOXES, (Math.floor(Date.now() / 300000) % 6 === 0) ? "all" : "sent").catch((e) => console.log("address index failed", String(e && e.message || e)))); ctx.waitUntil(vbaSubscribe(env).then(() => vbaWatch(env)).catch((e) => console.log("vba watch failed", String(e && e.message || e)))); return; }
     // Every run checks the automatic timesheets and the payroll sweeps. The leave sync keeps its own schedule and is skipped on the half hourly one.
