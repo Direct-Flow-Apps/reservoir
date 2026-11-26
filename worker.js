@@ -654,7 +654,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
 
 // Update push. Set this to a bundle name (for example "Full-Reservoir-2026.11.25-v26") and every open Reservoir and Weir window that finds that bundle newer than its own reloads straight away, instead of waiting for midnight or a home screen. Leave it empty for the normal gentle update.
 const APP_FORCE_UPDATE = "Full-Reservoir-2026.11.25-v26";
-const WORKER_BUILD = "Reservoir-Worker-2026.11.26-w328";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.26-w329";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -5887,8 +5887,8 @@ async function picClean(env) {
   const ids = boxes.split(",").map((x) => x.trim().toLowerCase()).filter(Boolean);
   for (const b of MAILBOXES.filter((x) => ids.includes(x.id))) {
     const addr = mailAddress(env, b);
-    const since = new Date(Date.now() - 15 * 60000).toISOString();
-    const list = await mailGraph(env, addr, `/mailFolders/inbox/messages?$top=25&$select=id,subject&$filter=${encodeURIComponent(`hasAttachments eq true and receivedDateTime ge ${since}`)}&$orderby=receivedDateTime desc`);
+    const since = new Date(Date.now() - 60 * 60000).toISOString();
+    const list = await mailGraph(env, addr, `/mailFolders/inbox/messages?$top=25&$select=id,subject&$filter=${encodeURIComponent(`receivedDateTime ge ${since}`)}&$orderby=receivedDateTime desc`);
     if (!list.ok || !list.json) continue;
     for (const m of (list.json.value || [])) {
       const done = await env.DB.prepare("SELECT id FROM pic_done WHERE id = ?1").bind(m.id).first();
