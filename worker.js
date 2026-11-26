@@ -654,7 +654,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
 
 // Update push. Set this to a bundle name (for example "Full-Reservoir-2026.11.25-v26") and every open Reservoir and Weir window that finds that bundle newer than its own reloads straight away, instead of waiting for midnight or a home screen. Leave it empty for the normal gentle update.
 const APP_FORCE_UPDATE = "Full-Reservoir-2026.11.25-v26";
-const WORKER_BUILD = "Reservoir-Worker-2026.11.26-w324";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.26-w325";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -5251,12 +5251,12 @@ async function mailRoutes(request, env, user, url) {
         const cid = f.ok ? (((await f.json()).value || [])[0] || {}).id : "";
         if (!cid) continue;
         const res = await graphFetch(env, `/users/${owner}/contacts/${encodeURIComponent(cid)}/photo/$value`);
-        if (res.ok) return new Response(res.body, { status: 200, headers: { ...cors(env), "Content-Type": res.headers.get("Content-Type") || "image/jpeg", "Cache-Control": "private, max-age=3600" } });
+        if (res.ok) return new Response(res.body, { status: 200, headers: { ...cors(env), "Content-Type": res.headers.get("Content-Type") || "image/jpeg", "Cache-Control": "private, no-cache" } });
       }
       // A mail system address (no reply, or a Xero sending address) never gets a logo from the folder, only a real contact photo.
       if (/^(no-?reply|do-?not-?reply|donotreply|mailer-daemon|postmaster)/i.test(em.split("@")[0]) || /(^|\.)xero\.com$/.test(em.split("@")[1] || "")) return new Response(null, { status: 404, headers: { ...cors(env), "Cache-Control": "no-store" } });
       try { const lg = await logoLookup(env, em); if (lg) {
-        return new Response(lg.body, { status: 200, headers: { ...cors(env), "Content-Type": lg.headers.get("Content-Type") || "image/png", "Cache-Control": "private, max-age=3600" } }); } } catch (e) {}
+        return new Response(lg.body, { status: 200, headers: { ...cors(env), "Content-Type": lg.headers.get("Content-Type") || "image/png", "Cache-Control": "private, no-cache" } }); } } catch (e) {}
       return new Response(null, { status: 404, headers: cors(env) });
     }
     if (url.pathname === "/api/mail/contactphoto" && !post) {
@@ -5265,7 +5265,7 @@ async function mailRoutes(request, env, user, url) {
       if (!cid) return reply(env, 400, { error: "bad request" });
       const res = await graphFetch(env, `/users/${encodeURIComponent(mailAddress(env, owner))}/contacts/${encodeURIComponent(cid)}/photo/$value`);
       if (!res.ok) return new Response(null, { status: 404, headers: cors(env) });
-      return new Response(res.body, { status: 200, headers: { ...cors(env), "Content-Type": res.headers.get("Content-Type") || "image/jpeg", "Cache-Control": "private, max-age=3600" } });
+      return new Response(res.body, { status: 200, headers: { ...cors(env), "Content-Type": res.headers.get("Content-Type") || "image/jpeg", "Cache-Control": "private, no-cache" } });
     }
     if (url.pathname === "/api/mail/attlink" && !post) {
       const lm = mailId(url.searchParams.get("msg")), la = mailId(url.searchParams.get("att"));
@@ -5568,6 +5568,21 @@ async function mailRoutes(request, env, user, url) {
         const bin = atob(b64), bytes = new Uint8Array(bin.length);
         for (let k = 0; k < bin.length; k++) bytes[k] = bin.charCodeAt(k);
         const up = await graphFetch(env, `/users/${encodeURIComponent(mailAddress(env, ob))}/contacts/${encodeURIComponent(ref.slice(i + 1))}/photo/$value`, { method: "PUT", headers: { "Content-Type": "image/jpeg" }, body: bytes });
+        // The same sender can sit as a contact in more than one mailbox, and the sender picture is read from the first one that has it. So the new photo is written to every copy.
+        if (up.ok) {
+          try {
+            const mine0 = await graphFetch(env, `/users/${encodeURIComponent(mailAddress(env, ob))}/contacts/${encodeURIComponent(ref.slice(i + 1))}?$select=emailAddresses`);
+            const ems = mine0.ok ? (((await mine0.json()).emailAddresses) || []).map((x) => String(x.address || "").toLowerCase()).filter((x) => /^[^\s@'"<>]+@[^\s@'"<>]+$/.test(x)) : [];
+            for (const o2 of MAILBOXES.filter((x) => x.id !== ob.id && mailAllowed(x, user))) {
+              for (const em of ems) {
+                const o2a = encodeURIComponent(mailAddress(env, o2));
+                const f2 = await graphFetch(env, `/users/${o2a}/contacts?$filter=${encodeURIComponent(`emailAddresses/any(a:a/address eq '${em}')`)}&$select=id&$top=5`);
+                const ids = f2.ok ? (((await f2.json()).value) || []).map((x) => x.id) : [];
+                for (const id2 of ids) await graphFetch(env, `/users/${o2a}/contacts/${encodeURIComponent(id2)}/photo/$value`, { method: "PUT", headers: { "Content-Type": "image/jpeg" }, body: bytes });
+              }
+            }
+          } catch (e) { console.log("photo copies", String(e && e.message || e).slice(0, 120)); }
+        }
         return up.ok ? reply(env, 200, { ok: true, worker: WORKER_BUILD }) : reply(env, 200, { ok: false, error: "Microsoft did not take the photo. It answered " + up.status + ".", worker: WORKER_BUILD });
       }
       if (act === "avatarsave") {
