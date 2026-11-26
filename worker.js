@@ -654,7 +654,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
 
 // Update push. Set this to a bundle name (for example "Full-Reservoir-2026.11.25-v26") and every open Reservoir and Weir window that finds that bundle newer than its own reloads straight away, instead of waiting for midnight or a home screen. Leave it empty for the normal gentle update.
 const APP_FORCE_UPDATE = "Full-Reservoir-2026.11.25-v26";
-const WORKER_BUILD = "Reservoir-Worker-2026.11.26-w323";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.26-w324";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -5231,11 +5231,11 @@ async function mailRoutes(request, env, user, url) {
       const found = await Promise.all(mine.map(async (bx) => {
         const ad = mailAddress(env, bx); let all = [];
         for (let skip = 0; skip < 2000; skip += 200) {
-          const r = await mailGraph(env, ad, `/contacts?$top=200&$skip=${skip}&$orderby=displayName&$select=id,displayName,emailAddresses,companyName,mobilePhone,businessPhones,businessAddress,homeAddress`);
+          const r = await mailGraph(env, ad, `/contacts?$top=200&$skip=${skip}&$orderby=displayName&$select=id,displayName,emailAddresses,companyName,mobilePhone,businessPhones,homePhones,businessAddress,homeAddress`);
           const v = (r.ok && r.json && r.json.value) || [];
           all = all.concat(v); if (v.length < 200) break;
         }
-        return all.map((c) => ({ id: bx.id + ":" + c.id, name: String(c.displayName || "").slice(0, 80), company: String(c.companyName || "").slice(0, 60), emails: (c.emailAddresses || []).map((e) => String(e.address || "")).filter(Boolean).slice(0, 4), phone: String(c.mobilePhone || (c.businessPhones || [])[0] || "").slice(0, 30), address: mxAddr(c.businessAddress && Object.keys(c.businessAddress).length ? c.businessAddress : c.homeAddress) }));
+        return all.map((c) => ({ id: bx.id + ":" + c.id, name: String(c.displayName || "").slice(0, 80), company: String(c.companyName || "").slice(0, 60), emails: (c.emailAddresses || []).map((e) => String(e.address || "")).filter(Boolean).slice(0, 4), phone: String(c.mobilePhone || (c.businessPhones || [])[0] || "").slice(0, 30), phones: [c.mobilePhone].concat(c.businessPhones || [], c.homePhones || []).filter(Boolean).map((x) => String(x).slice(0, 30)).slice(0, 6), address: mxAddr(c.businessAddress && Object.keys(c.businessAddress).length ? c.businessAddress : c.homeAddress) }));
       }));
       const seen = new Set(), out = [];
       for (const c of found.flat()) { if (!c.emails.length) continue; const k = c.emails[0].toLowerCase(); if (seen.has(k)) continue; seen.add(k); out.push(c); }
@@ -5953,6 +5953,30 @@ async function mailWatch(env) {
     await env.DB.prepare("INSERT INTO app_settings (key, value, detail, by_name, at) VALUES (?, ?, 'mail ids', 'Reservoir', datetime('now')) ON CONFLICT(key) DO UPDATE SET value = excluded.value, at = datetime('now')").bind(idKey, JSON.stringify(doneIds.concat(fresh.map((m) => m.id)).slice(-60))).run();
     if (!brandNew.length) continue;
     const to = Object.keys(tiers).filter((e) => mailAllowed(b, { email: e, tier: tiers[e] }));
+    // Teleca voicemails get their own alert (caller's name or number) and no normal new email alert.
+    const isVm = (m) => /^no-?reply@teleca\.com\.au$/i.test(String((m.from && m.from.emailAddress && m.from.emailAddress.address) || "")) && /^\s*voicemail from\b/i.test(String(m.subject || ""));
+    for (const m of brandNew.filter(isVm)) {
+      try {
+        const num = (String(m.subject).match(/^\s*voicemail from\s+(\+?[\d\s()]{6,}?)(?:\s*-\s*\d+:\d+.*)?\s*$/i) || [])[1] || "";
+        const key = (v) => { let d = String(v || "").replace(/\D/g, ""); if (d.startsWith("61") && d.length === 11) d = "0" + d.slice(2); else if (d.length === 9 && !d.startsWith("0")) d = "0" + d; return d; };
+        let who2 = String(num).trim(), want = key(num);
+        if (want.length >= 8) {
+          find: for (const bx of MAILBOXES) {
+            for (let skip = 0; skip < 2000; skip += 200) {
+              const r2 = await mailGraph(env, mailAddress(env, bx), `/contacts?$top=200&$skip=${skip}&$select=displayName,mobilePhone,businessPhones,homePhones`);
+              const v = (r2.ok && r2.json && r2.json.value) || [];
+              const hit = v.find((c) => [c.mobilePhone].concat(c.businessPhones || [], c.homePhones || []).some((x) => x && key(x) === want));
+              if (hit && hit.displayName) { who2 = String(hit.displayName).slice(0, 60); break find; }
+              if (v.length < 200) break;
+            }
+          }
+        }
+        for (const e of to) await notify(env, { to: e, kind: "mail", title: `1300 voicemail from ${who2}, in ${b.label}`, body: "", preview: true, link: "emailbox", box: b.id, by: "Reservoir" });
+      } catch (e) { console.log("voicemail alert", String(e && e.message || e).slice(0, 120)); }
+    }
+    const brandNewAll = brandNew;
+    brandNew.splice(0, brandNew.length, ...brandNewAll.filter((m) => !isVm(m)));
+    if (!brandNew.length) continue;
     const prev = brandNew.length === 1 ? `${who(brandNew[0])}: ${String(brandNew[0].subject || "(no subject)").slice(0, 100)}` : `${brandNew.length} new emails, latest from ${who(brandNew[0])}`;
     for (const m of brandNew) { try { const fa = (m.from && m.from.emailAddress) || {}; await approvalSeen(env, b, fa.address, fa.name, m.id); } catch (e) { console.log("approval seen", String(e && e.message || e).slice(0, 120)); } }
     for (const e of to) await notify(env, { to: e, kind: "mail", title: `New Email - ${b.label}`, body: prev, preview: true, link: "emailbox", box: b.id, by: "Reservoir" });
