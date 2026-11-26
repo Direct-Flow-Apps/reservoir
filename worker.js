@@ -388,7 +388,6 @@ async function receiptRecordsTable(env) {
   receiptRecordsReady = true;
   await env.DB.prepare("CREATE TABLE IF NOT EXISTS receipt_records (id TEXT PRIMARY KEY, by_name TEXT, by_email TEXT, type TEXT, amount TEXT, note TEXT, item_id TEXT, file_name TEXT, status TEXT, view TEXT, sent_date TEXT, done_date TEXT, created_at TEXT DEFAULT (datetime('now')))").run();
   for (const col of ["xero_name TEXT", "xero_at TEXT", "xero_state TEXT"]) { try { await env.DB.prepare(`ALTER TABLE receipt_records ADD COLUMN ${col}`).run(); } catch (e) { /* already there */ } }
-  try { await env.DB.prepare("UPDATE receipt_records SET xero_state = NULL").run(); } catch (e) { /* ignore */ }
 }
 
 // A receipt Xero turns into a draft bill with no contact gets one. Fuel becomes DFP Fuel. A reimbursement takes the contact of the team member it was sent for, matched on the amount. Either way the bill is due on its own date. Drafts stay drafts.
@@ -622,19 +621,45 @@ function financePdf(o) {
 }
 const financeDots = (iso) => String(iso).split("-").reverse().join(".");
 const financeShort = (iso) => financeDots(iso).slice(0, 5);
-// Xero never replies to the bills inbox email, so Reservoir looks in the Xero Files inbox for the file it sent. Waiting for 10 minutes without finding it means Xero did not take it.
+// Xero never replies to the bills inbox email, so Reservoir looks in Xero for the bill it made from each file sent. A reimbursement is only processed once its bill has appeared in Xero. Until then it stays waiting. If nothing has appeared after 10 minutes it is marked missing and the office is pinged.
 let xeroVerifyAt = 0;
+async function receiptSettle(env, id, status, doneOn, who) {
+  await env.DB.prepare("UPDATE receipt_records SET status = ?, done_date = ? WHERE id = ?").bind(status, doneOn, id).run();
+  if (/^inc-[A-Za-z0-9_-]{8,64}$/.test(id)) {
+    const incId = id.slice(4);
+    try {
+      if (status === "paid") await env.DB.prepare("UPDATE incentives SET status = 'redeemed', redeemed_at = datetime('now') WHERE id = ?").bind(incId).run();
+      else await env.DB.prepare("UPDATE incentives SET status = 'issued' WHERE id = ? AND status = 'processing'").bind(incId).run();
+    } catch (e) { /* the receipt still moves on */ }
+  }
+  const rr = await env.DB.prepare("SELECT by_email, type FROM receipt_records WHERE id = ?").bind(id).first();
+  if (rr && rr.by_email && rr.type === "reimbursement") {
+    if (status === "paid") await notify(env, { to: rr.by_email, kind: "receipt", title: "Reimbursement request processed", body: "Your reimbursement has been paid. Open Receipts to see it.", link: "receipts", by: who });
+    else await notify(env, { to: rr.by_email, kind: "receipt", title: "Reimbursement request declined", body: "Your reimbursement was not approved. Open Receipts to see it.", link: "receipts", by: who });
+  }
+}
+// Called when a file goes to Xero. The record remembers which files went and when, and starts waiting for the bill.
+async function receiptMarkSent(env, itemId) {
+  await receiptRecordsTable(env);
+  const row = await env.DB.prepare("SELECT id, xero_name, xero_at FROM receipt_records WHERE (',' || item_id || ',') LIKE ?").bind(`%,${itemId},%`).first();
+  if (!row) return;
+  let names = String(row.xero_name || "").split("|").filter(Boolean);
+  let at = row.xero_at || new Date().toISOString();
+  if (!names.length || names.includes(itemId)) { names = [itemId]; at = new Date().toISOString(); } else names.push(itemId);
+  await env.DB.prepare("UPDATE receipt_records SET xero_name = ?, xero_at = ?, xero_state = 'waiting' WHERE id = ?").bind(names.join("|"), at, row.id).run();
+}
 async function xeroVerify(env) {
   await receiptRecordsTable(env);
-  const rows = (await env.DB.prepare("SELECT id, amount, xero_name, xero_at, xero_state FROM receipt_records WHERE xero_name IS NOT NULL AND xero_state IN ('waiting','missing') AND xero_at > ?").bind(new Date(Date.now() - 36 * 3600 * 1000).toISOString()).all()).results || [];
+  const rows = (await env.DB.prepare("SELECT id, type, status, by_name, amount, xero_name, xero_at, xero_state FROM receipt_records WHERE xero_name IS NOT NULL AND xero_state IN ('waiting','missing') AND xero_at > ?").bind(new Date(Date.now() - 36 * 3600 * 1000).toISOString()).all()).results || [];
   if (!rows.length) return;
-  // Xero turns each emailed receipt into a draft bill, so look for new drafts made since the send, and use up one draft per file sent. A record with a known amount must match a draft total as well.
+  // Xero turns each emailed receipt into a bill, so look for bills made since the send, and use up one bill per file sent. A record with a known amount must match a bill total as well.
   rows.sort((a, b) => String(a.xero_at).localeCompare(String(b.xero_at)));
   const earliest = new Date(Date.parse(rows[0].xero_at) - 120000).toUTCString();
-  const res = await xeroFetch(env, `api.xro/2.0/Invoices?where=${encodeURIComponent('Type=="ACCPAY" AND Status=="DRAFT"')}&order=${encodeURIComponent("UpdatedDateUTC DESC")}&page=1`, { headers: { "If-Modified-Since": earliest } });
+  const res = await xeroFetch(env, `api.xro/2.0/Invoices?where=${encodeURIComponent('Type=="ACCPAY"')}&order=${encodeURIComponent("UpdatedDateUTC DESC")}&page=1`, { headers: { "If-Modified-Since": earliest } });
   if (!res.ok) return;
   const stamp = (v) => { const m = /\/Date\((-?\d+)/.exec(String(v || "")); return m ? Number(m[1]) : (Date.parse(String(v || "")) || 0); };
-  const drafts = (((await res.json()).Invoices) || []).map((d) => ({ at: stamp(d.UpdatedDateUTC), total: Number(d.Total) || 0, used: false }));
+  const drafts = (((await res.json()).Invoices) || []).filter((d) => d.Status !== "DELETED" && d.Status !== "VOIDED").map((d) => ({ at: stamp(d.UpdatedDateUTC), total: Number(d.Total) || 0, used: false }));
+  const day = new Date(Date.now() + 11 * 3600000).toISOString().slice(0, 10);
   for (const r of rows) {
     const since = Date.parse(r.xero_at) - 120000;
     const need = String(r.xero_name).split("|").filter(Boolean).length || 1;
@@ -643,13 +668,15 @@ async function xeroVerify(env) {
     const state = pool.length >= need ? "ok" : (Date.now() - Date.parse(r.xero_at) > 10 * 60000 ? "missing" : "waiting");
     if (state === "ok") pool.slice(0, need).forEach((d) => { d.used = true; });
     if (state !== r.xero_state) await env.DB.prepare("UPDATE receipt_records SET xero_state = ? WHERE id = ?").bind(state, r.id).run();
+    if (state === "ok" && r.type === "reimbursement" && r.status === "checking") await receiptSettle(env, r.id, "paid", day, "Xero");
+    if (state === "missing" && r.xero_state !== "missing") await notify(env, { to: "tayler@directflow.com.au", kind: "receipt", title: "Not seen in Xero", body: `${String(r.by_name || "A")} ${r.type === "reimbursement" ? "reimbursement" : "receipt"}${r.amount ? ` $${r.amount}` : ""} was sent to Xero but no bill has appeared. ${r.type === "reimbursement" ? "It has not been processed. " : ""}Open Receipts.`, link: "receipts", by: "Reservoir" });
   }
 }
 const receiptRecordOut = (r) => ({ id: r.id, kind: "receipt", receiptType: r.type, amount: r.amount || "", text: r.note || "", itemId: r.item_id || "", fileName: r.file_name || "", status: r.status, by: r.by_name || "", date: r.sent_date || String(r.created_at || "").slice(0, 10), doneDate: r.done_date || "", photos: r.view ? [{ name: r.file_name || "", view: r.view }] : [], xero: r.xero_state || "", server: true });
 
 // Update push. Set this to a bundle name (for example "Full-Reservoir-2026.11.25-v26") and every open Reservoir and Weir window that finds that bundle newer than its own reloads straight away, instead of waiting for midnight or a home screen. Leave it empty for the normal gentle update.
 const APP_FORCE_UPDATE = "Full-Reservoir-2026.11.25-v26";
-const WORKER_BUILD = "Reservoir-Worker-2026.11.26-w336";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.27-w337";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -7221,6 +7248,14 @@ async function noticesTable(env) {
       await migMark(env, "reimb_xero_at_v1", `${d && d.meta ? d.meta.changes : 0} reimbursements stamped`);
     } catch (e) { /* tried again on the next start */ }
   }
+  // One time, 27 November 2026: Mitch's $32.69 reimbursement from 26 November was marked processed but never reached Xero. It goes back to waiting, and is checked against Xero.
+  if (!(await migDone(env, "mitch_3269_recheck_v1"))) {
+    try {
+      await receiptRecordsTable(env);
+      const d = await env.DB.prepare("UPDATE receipt_records SET status = 'checking', done_date = '', xero_name = replace(item_id, ',', '|'), xero_at = COALESCE(xero_at, created_at), xero_state = 'missing' WHERE type = 'reimbursement' AND status = 'paid' AND lower(by_name) LIKE 'mitch%' AND amount IN ('32.69', '$32.69') AND sent_date >= '2026-11-24'").run();
+      await migMark(env, "mitch_3269_recheck_v1", `${d && d.meta ? d.meta.changes : 0} reimbursements put back to waiting`);
+    } catch (e) { /* tried again on the next start */ }
+  }
   // One time, 26 November 2026: the PAYG notice for the pay run ending 22 November again, as a draft bill in Xero with the new reference (the approved one was voided).
   if (!(await migDone(env, "payg_bill_we22_v1"))) {
     try {
@@ -9309,6 +9344,7 @@ export default {
     if (event && event.cron === "*/5 * * * *") { ctx.waitUntil(mergeExportTest(env).catch((e) => console.log("export test failed", String(e && e.message || e)))); ctx.waitUntil(mergeCopyUndo(env).catch((e) => console.log("copy undo failed", String(e && e.message || e)))); ctx.waitUntil(mergeSentCopy(env).catch((e) => console.log("sent copy failed", String(e && e.message || e)))); ctx.waitUntil(mergeAutoReply(env).catch((e) => console.log("autoreply failed", String(e && e.message || e)))); ctx.waitUntil(mergeArchiveCopy(env).catch((e) => console.log("archive copy failed", String(e && e.message || e)))); ctx.waitUntil(mailWatch(env).catch((e) => console.log("mail watch failed", String(e && e.message || e)))); ctx.waitUntil(mailHoldSweep(env).catch((e) => console.log("hold sweep failed", String(e && e.message || e)))); ctx.waitUntil(rcptRefresh(env, MAILBOXES, (Math.floor(Date.now() / 300000) % 6 === 0) ? "all" : "sent").catch((e) => console.log("address index failed", String(e && e.message || e)))); ctx.waitUntil(vbaSubscribe(env).then(() => vbaWatch(env)).catch((e) => console.log("vba watch failed", String(e && e.message || e)))); return; }
     // Every run checks the automatic timesheets and the payroll sweeps. The leave sync keeps its own schedule and is skipped on the half hourly one.
     ctx.waitUntil(fuelDraftFix(env).catch((e) => console.log("fuel draft fix failed", String(e && e.message || e))));
+    ctx.waitUntil(xeroVerify(env).catch((e) => console.log("xero verify failed", String(e && e.message || e))));
     ctx.waitUntil(tsAutoRun(env).catch((e) => console.log("auto timesheets failed", String(e && e.message || e))));
     ctx.waitUntil(pushFlushHeld(env));
     ctx.waitUntil(dailyOpsAlert(env).catch((e) => console.log("daily ops alert failed", String(e && e.message || e))));
@@ -11268,7 +11304,7 @@ export default {
         if (meta.folder.startsWith("Receipts/Reimbursements") && user.tier !== "T1") return reply(env, 403, { error: "forbidden" });
         await sendToXero(env, user, meta);
         // Remember when and for whom a reimbursement went, so the draft bill Xero makes can be given that person as its contact.
-        try { await receiptRecordsTable(env); await env.DB.prepare("UPDATE receipt_records SET xero_at = ? WHERE item_id = ?").bind(new Date().toISOString(), xm[1]).run(); } catch (e) { /* the send already worked */ }
+        try { await receiptMarkSent(env, xm[1]); } catch (e) { /* the send already worked */ }
         return reply(env, 200, { ok: true });
       } catch (e) {
         return reply(env, e.message === "too large" ? 413 : 502, { error: "send failed", detail: String(e.message || "").slice(0, 200) });
@@ -11297,6 +11333,8 @@ export default {
       const mail = String(user.email || "").toLowerCase();
       const today = new Date().toISOString().slice(0, 10);
       if (request.method === "GET" && !rrm[1]) {
+        // The office opening the receipts checks Xero first (at most every 30 seconds), so waiting reimbursements are settled before they are listed.
+        if (user.tier === "T1" && Date.now() - xeroVerifyAt > 30000) { xeroVerifyAt = Date.now(); try { await xeroVerify(env); } catch (e) { /* the list still loads */ } }
         const rows = user.tier === "T1"
           ? await env.DB.prepare("SELECT * FROM receipt_records ORDER BY created_at DESC LIMIT 300").all()
           : await env.DB.prepare("SELECT * FROM receipt_records WHERE by_email = ? ORDER BY created_at DESC LIMIT 300").bind(mail).all();
@@ -11322,9 +11360,12 @@ export default {
           byName = String(person.name).split(" ")[0];
           byMail = forMail;
         }
-        if (type === "reimbursement" && body.status === "paid" && user.tier === "T1") { rowStatus = "paid"; doneOn = date; }
+        // Already sent to Xero before the record existed: it waits for the bill to appear there before it counts as processed.
+        const viaXero = body.xeroSent === true && (type === "company" ? (user.tier === "T1" || user.tier === "T2") : user.tier === "T1");
+        if (type === "reimbursement" && (body.status === "paid" || body.status === "checking") && user.tier === "T1") { if (viaXero) rowStatus = "checking"; else { rowStatus = "paid"; doneOn = date; } }
         await env.DB.prepare("INSERT OR IGNORE INTO receipt_records (id, by_name, by_email, type, amount, note, item_id, file_name, status, view, sent_date, done_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
           .bind(id, byName, byMail, type, type === "reimbursement" ? txt(body.amount, 12) : "", txt(body.text, 500), txt(body.itemId, 600), txt(body.fileName, 600), rowStatus, view, date, doneOn).run();
+        if (viaXero) await env.DB.prepare("UPDATE receipt_records SET xero_name = ?, xero_at = ?, xero_state = 'waiting' WHERE id = ?").bind(String(txt(body.itemId, 600)).split(",").filter(Boolean).join("|") || id, new Date(Date.now() - 60000).toISOString(), id).run();
         if (type === "reimbursement" && rowStatus === "paid") await notify(env, { to: byMail, kind: "receipt", title: "Reimbursement request processed", body: "Your reimbursement has been paid. Open Receipts to see it.", link: "receipts", by: user.name || mail });
         return reply(env, 200, { ok: true });
       }
@@ -11332,23 +11373,25 @@ export default {
         if (!isApprover(user)) return reply(env, 403, { error: "forbidden" });
         if (!["paid", "declined"].includes(body.status)) return reply(env, 400, { error: "bad status" });
         const date = /^\d{4}-\d{2}-\d{2}$/.test(String(body.date || "")) ? body.date : today;
-        await env.DB.prepare("UPDATE receipt_records SET status = ?, done_date = ? WHERE id = ?").bind(body.status, date, rrm[1]).run();
-        if (/^inc-[A-Za-z0-9_-]{8,64}$/.test(rrm[1])) {
-          const incId = rrm[1].slice(4);
-          try {
-            if (body.status === "paid") await env.DB.prepare("UPDATE incentives SET status = 'redeemed', redeemed_at = datetime('now') WHERE id = ?").bind(incId).run();
-            else await env.DB.prepare("UPDATE incentives SET status = 'issued' WHERE id = ? AND status = 'processing'").bind(incId).run();
-          } catch (e) { /* the receipt still moves on */ }
-        }
-        // The person being reimbursed is told it is processed, even when the director who processed it is the one who logged it.
-        {
-          const rr = await env.DB.prepare("SELECT by_email, type FROM receipt_records WHERE id = ?").bind(rrm[1]).first();
-          if (rr && rr.by_email && rr.type === "reimbursement") {
-            if (body.status === "paid") await notify(env, { to: rr.by_email, kind: "receipt", title: "Reimbursement request processed", body: "Your reimbursement has been paid. Open Receipts to see it.", link: "receipts", by: user.name || mail });
-            else await notify(env, { to: rr.by_email, kind: "receipt", title: "Reimbursement request declined", body: "Your reimbursement was not approved. Open Receipts to see it.", link: "receipts", by: user.name || mail });
+        // A reimbursement sent to Xero is only processed once its bill has appeared in Xero. Until then it stays waiting. T1 can tick it as entered by hand.
+        if (body.status === "paid") {
+          let rr0 = await env.DB.prepare("SELECT type, xero_state FROM receipt_records WHERE id = ?").bind(rrm[1]).first();
+          if (rr0 && rr0.type === "reimbursement" && rr0.xero_state && rr0.xero_state !== "ok") {
+            if (body.manual === true) {
+              if (user.tier !== "T1") return reply(env, 403, { error: "forbidden" });
+              await env.DB.prepare("UPDATE receipt_records SET xero_state = 'manual' WHERE id = ?").bind(rrm[1]).run();
+            } else {
+              try { await xeroVerify(env); } catch (e) { /* the state stays as it was */ }
+              rr0 = await env.DB.prepare("SELECT type, xero_state FROM receipt_records WHERE id = ?").bind(rrm[1]).first();
+              if (rr0 && rr0.xero_state && rr0.xero_state !== "ok") {
+                await env.DB.prepare("UPDATE receipt_records SET status = 'checking', done_date = '' WHERE id = ?").bind(rrm[1]).run();
+                return reply(env, 200, { ok: true, status: "checking", xero: rr0.xero_state });
+              }
+            }
           }
         }
-        return reply(env, 200, { ok: true });
+        await receiptSettle(env, rrm[1], body.status, date, user.name || mail);
+        return reply(env, 200, { ok: true, status: body.status });
       }
       return reply(env, 405, { error: "method not allowed" });
     }
