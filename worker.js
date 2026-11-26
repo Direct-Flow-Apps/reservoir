@@ -654,7 +654,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
 
 // Update push. Set this to a bundle name (for example "Full-Reservoir-2026.11.25-v26") and every open Reservoir and Weir window that finds that bundle newer than its own reloads straight away, instead of waiting for midnight or a home screen. Leave it empty for the normal gentle update.
 const APP_FORCE_UPDATE = "Full-Reservoir-2026.11.25-v26";
-const WORKER_BUILD = "Reservoir-Worker-2026.11.26-w334";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.26-w335";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -7038,6 +7038,7 @@ async function todosTable(env) {
   await env.DB.prepare("CREATE TABLE IF NOT EXISTS todo_workspaces (name TEXT PRIMARY KEY, members TEXT NOT NULL DEFAULT '[]', by_name TEXT, created_at TEXT, updated_at TEXT)").run();
   await env.DB.prepare("CREATE TABLE IF NOT EXISTS todo_items (id TEXT PRIMARY KEY, title TEXT NOT NULL, note TEXT, assigned_to TEXT, ws TEXT, due TEXT, repeat TEXT, done INTEGER NOT NULL DEFAULT 0, by_name TEXT, created TEXT, updated_at TEXT)").run();
   try { await env.DB.prepare("ALTER TABLE todo_items ADD COLUMN ord INTEGER NOT NULL DEFAULT 0").run(); } catch (e) {}
+  try { await env.DB.prepare("ALTER TABLE todo_items ADD COLUMN kind TEXT").run(); } catch (e) {}
   // One time: the finance tasks are moved into the Finance workspace.
   try {
     if (!(await migDone(env, "todo_finance_ws_v1"))) {
@@ -7075,14 +7076,14 @@ async function todosRoutes(request, env, user, url) {
     const ws = ((await env.DB.prepare("SELECT name, members FROM todo_workspaces ORDER BY name COLLATE NOCASE").all()).results) || [];
     const workspaces = {};
     for (const w of ws) { let a = []; try { a = JSON.parse(w.members || "[]"); } catch (e) { a = []; } workspaces[w.name] = a; }
-    const rows = ((await env.DB.prepare("SELECT id, title, note, assigned_to, ws, due, repeat, done, ord, by_name, created FROM todo_items ORDER BY created DESC, rowid DESC").all()).results) || [];
+    const rows = ((await env.DB.prepare("SELECT id, title, note, assigned_to, ws, due, repeat, done, ord, kind, by_name, created FROM todo_items ORDER BY created DESC, rowid DESC").all()).results) || [];
     const items = rows.filter((r) => {
       if (senior) return true;
       const mine = firstOf(r.assigned_to) === me || r.by_name === me;
       if (mine) return true;
       if (!r.ws || !(workspaces[r.ws] || []).includes(me)) return false;
       return r.ws === "DFP Team" ? senior : true;
-    }).map((r) => { let rp = null; try { rp = r.repeat ? JSON.parse(r.repeat) : null; } catch (e) { rp = null; } return { id: r.id, title: r.title, note: r.note || "", assignedTo: r.assigned_to || "", group: r.ws || "", due: r.due || "", importance: "date", repeat: rp, done: r.done === 1, ord: Number(r.ord) || 0, by: r.by_name || "", created: r.created || "" }; });
+    }).map((r) => { let rp = null; try { rp = r.repeat ? JSON.parse(r.repeat) : null; } catch (e) { rp = null; } return { id: r.id, title: r.title, note: r.note || "", assignedTo: r.assigned_to || "", group: r.ws || "", due: r.due || "", importance: "date", repeat: rp, done: r.done === 1, ord: Number(r.ord) || 0, kind: r.kind || "", by: r.by_name || "", created: r.created || "" }; });
     return reply(env, 200, { workspaces, items, worker: WORKER_BUILD });
   }
   if (request.method === "PUT" && m[1] === "workspaces") {
@@ -7138,7 +7139,7 @@ async function todosRoutes(request, env, user, url) {
       const mineItem = firstOf(cur.assigned_to) === me || cur.by_name === me;
       if (senior && b.title != null) {
         const rp = b.repeat && b.repeat.type ? JSON.stringify({ type: String(b.repeat.type).slice(0, 10), dow: Number(b.repeat.dow) || 0, dom: Number(b.repeat.dom) || 1 }) : null;
-        await env.DB.prepare("UPDATE todo_items SET title = ?, note = ?, assigned_to = ?, ws = ?, due = ?, repeat = ?, done = ?, ord = ?, updated_at = ? WHERE id = ?").bind(String(b.title || "").trim().slice(0, 60), String(b.note || "").slice(0, 2000), String(b.assignedTo || "").slice(0, 80), String(b.group || "").slice(0, 50), String(b.due || "").slice(0, 10), rp, b.done ? 1 : 0, Math.max(0, Math.min(999, Math.round(Number(b.ord) || 0))), now, id).run();
+        await env.DB.prepare("UPDATE todo_items SET title = ?, note = ?, assigned_to = ?, ws = ?, due = ?, repeat = ?, done = ?, ord = ?, kind = ?, updated_at = ? WHERE id = ?").bind(String(b.title || "").trim().slice(0, 60), String(b.note || "").slice(0, 2000), String(b.assignedTo || "").slice(0, 80), String(b.group || "").slice(0, 50), String(b.due || "").slice(0, 10), rp, b.done ? 1 : 0, Math.max(0, Math.min(999, Math.round(Number(b.ord) || 0))), String(b.kind || "").slice(0, 3), now, id).run();
         return reply(env, 200, { ok: true });
       }
       if (mineItem || senior) { await env.DB.prepare("UPDATE todo_items SET done = ?, updated_at = ? WHERE id = ?").bind(b.done ? 1 : 0, now, id).run(); return reply(env, 200, { ok: true }); }
@@ -7147,7 +7148,7 @@ async function todosRoutes(request, env, user, url) {
     const title = String(b.title || "").trim().slice(0, 60);
     if (!title) return reply(env, 400, { error: "A title is needed" });
     const rp = b.repeat && b.repeat.type ? JSON.stringify({ type: String(b.repeat.type).slice(0, 10), dow: Number(b.repeat.dow) || 0, dom: Number(b.repeat.dom) || 1 }) : null;
-    await env.DB.prepare("INSERT INTO todo_items (id, title, note, assigned_to, ws, due, repeat, done, ord, by_name, created, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)").bind(id, title, String(b.note || "").slice(0, 2000), String(b.assignedTo || "").slice(0, 80), String(b.group || "").slice(0, 50), String(b.due || "").slice(0, 10), rp, Math.max(0, Math.min(999, Math.round(Number(b.ord) || 0))), me, String(b.created || now.slice(0, 10)).slice(0, 10), now).run();
+    await env.DB.prepare("INSERT INTO todo_items (id, title, note, assigned_to, ws, due, repeat, done, ord, kind, by_name, created, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)").bind(id, title, String(b.note || "").slice(0, 2000), String(b.assignedTo || "").slice(0, 80), String(b.group || "").slice(0, 50), String(b.due || "").slice(0, 10), rp, Math.max(0, Math.min(999, Math.round(Number(b.ord) || 0))), String(b.kind || "").slice(0, 3), me, String(b.created || now.slice(0, 10)).slice(0, 10), now).run();
     return reply(env, 200, { ok: true });
   }
   return reply(env, 405, { error: "method not allowed" });
