@@ -141,7 +141,6 @@ const rowToItem = (r) => {
   return item;
 };
 
-const LABELS = { name: "Name", rego: "Rego", expiry: "Rego Expiry", serial: "Registration Serial Number", make: "Make", model: "Model", colour: "Colour", year: "Year", body: "Body Type", vin: "VIN", engine: "Engine Number", compliance: "Compliance Plate", fuel: "Fuel", driver: "Driver", garaged: "Garaged Address", finance: "Finance Company", directDebit: "Direct Debit", contract: "Contract Number", serviceProvider: "Service Provider", servicePhone: "Service Phone", serviceEmail: "Service Email", serviceBooking: "Service Booking Link", financeExpiry: "Finance Expiry", financeDocs: "Finance Documents" };
 
 
 // ---- SharePoint document storage through Microsoft Graph (Reservoir site, app only access) ----
@@ -648,13 +647,9 @@ async function xeroVerify(env) {
 }
 const receiptRecordOut = (r) => ({ id: r.id, kind: "receipt", receiptType: r.type, amount: r.amount || "", text: r.note || "", itemId: r.item_id || "", fileName: r.file_name || "", status: r.status, by: r.by_name || "", date: r.sent_date || String(r.created_at || "").slice(0, 10), doneDate: r.done_date || "", photos: r.view ? [{ name: r.file_name || "", view: r.view }] : [], xero: r.xero_state || "", server: true });
 
-async function logUpdate(env, user, vehicleId, label, summary, detail) {
-  await env.DB.prepare("INSERT INTO t2_updates (user_name, tier, vehicle_id, vehicle_label, summary, detail) VALUES (?, ?, ?, ?, ?, ?)").bind(user.name, user.tier, vehicleId, String(label || "").slice(0, 100), String(summary).slice(0, 200), JSON.stringify(detail || {}).slice(0, 4000)).run();
-}
-
 // Update push. Set this to a bundle name (for example "Full-Reservoir-2026.11.25-v26") and every open Reservoir and Weir window that finds that bundle newer than its own reloads straight away, instead of waiting for midnight or a home screen. Leave it empty for the normal gentle update.
 const APP_FORCE_UPDATE = "Full-Reservoir-2026.11.25-v26";
-const WORKER_BUILD = "Reservoir-Worker-2026.11.26-w335";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.26-w336";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -5393,7 +5388,7 @@ async function mailRoutes(request, env, user, url) {
             }
           }
         } catch (e) {}
-        const sys = "You are a proofreader for Australian English business emails. Correct only spelling mistakes, grammar mistakes, punctuation and capital letters. Add commas, full stops and capitals where they are missing, and split run on sentences with punctuation. A sentence that asks a question ends with a question mark. Never reword, never add, remove or reorder words, never change the tone, and keep names, numbers, job numbers, addresses and codes exactly as written. Each input line is numbered like '3: text'. Reply with every line again in the same order, in the same numbered format, one line each, and nothing else.";
+        const sys = "You are a proofreader for Australian English business emails. Correct only spelling mistakes, grammar mistakes, punctuation and capital letters. Add full stops and capitals where they are missing, and split run on sentences with punctuation. Never add, remove or move commas. A sentence that asks a question ends with a question mark. Never reword, never add, remove or reorder words, never change the tone, and keep names, numbers, job numbers, addresses and codes exactly as written. Each input line is numbered like '3: text'. Reply with every line again in the same order, in the same numbered format, one line each, and nothing else.";
         let out;
         try {
           out = await env.AI.run(MODEL, { messages: [{ role: "system", content: sys }, { role: "user", content: send.map((x) => `${x.i + 1}: ${x.t}`).join("\n") }], max_tokens: 2048, temperature: 0 });
@@ -5426,6 +5421,9 @@ async function mailRoutes(request, env, user, url) {
             if (ok) r = c;
           }
           r = qfix(cap(r));
+          // A difference that is only commas is not a mistake, so the line is left as written.
+          const nc = (x) => String(x).replace(/,/g, "").replace(/\s+/g, " ").trim();
+          if (r !== t && nc(r) === nc(t)) r = t;
           if (r !== orig[i]) changed++;
           return r;
         });
@@ -9452,25 +9450,6 @@ export default {
     if (todosReply) return todosReply;
     const noticesReply = await noticesRoutes(request, env, user, url);
     if (noticesReply) return noticesReply;
-    // The app background everyone sees. Any tier can read which one is chosen, only a director (T1) can change it. The pictures themselves are built into the app, so only the name is stored.
-    if (url.pathname === "/api/background") {
-      const KEYS = ["wave", "papercut", "curve", "aqua", "orib", "ofac", "oecl"];
-      if (request.method === "GET") {
-        await launchTable(env);
-        const r = await env.DB.prepare("SELECT value FROM app_settings WHERE key = 'launch.app_background'").first();
-        const v = r && KEYS.includes(r.value) ? r.value : "wave";
-        return reply(env, 200, { key: v, worker: WORKER_BUILD });
-      }
-      if (request.method === "PUT") {
-        if (user.tier !== "T1") return reply(env, 403, { error: "forbidden" });
-        let b;
-        try { b = await request.json(); } catch (e) { b = {}; }
-        if (!KEYS.includes(b.key)) return reply(env, 400, { error: "That background is not available" });
-        await launchTable(env);
-        await env.DB.prepare("INSERT INTO app_settings (key, value, by_name, at) VALUES ('launch.app_background', ?, ?, datetime('now')) ON CONFLICT(key) DO UPDATE SET value = excluded.value, by_name = excluded.by_name, at = datetime('now')").bind(b.key, user.name || user.email || "").run();
-        return reply(env, 200, { key: b.key, worker: WORKER_BUILD });
-      }
-    }
     const accessReply = await accessRoutes(request, env, user, url);
     if (accessReply) return accessReply;
     const budgetReply = await budgetRoutes(request, env, user, url);
@@ -10875,21 +10854,6 @@ export default {
       } catch (e) { return reply(env, 502, { error: "address service" }); }
     }
 
-    const um = url.pathname.match(/^\/api\/updates(\/seen)?$/);
-    if (um) {
-      // The T2 Updates monitor is for T1 only.
-      if (user.tier !== "T1") return reply(env, 403, { error: "forbidden" });
-      if (request.method === "GET" && !um[1]) {
-        const { results } = await env.DB.prepare("SELECT id, created_at, user_name, vehicle_id, vehicle_label, summary, detail, seen FROM t2_updates ORDER BY id DESC LIMIT 100").all();
-        return reply(env, 200, results);
-      }
-      if (request.method === "PUT" && um[1]) {
-        await env.DB.prepare("UPDATE t2_updates SET seen = 1 WHERE seen = 0").run();
-        return reply(env, 200, { ok: true });
-      }
-      return reply(env, 405, { error: "method not allowed" });
-    }
-
     const sm = url.pathname.match(/^\/api\/secrets(?:\/([A-Za-z0-9._-]{1,100}))?$/);
     if (sm) {
       // Company passwords and IDs. Only T1 and T2 can read or change them, and the Director ID is T1 only.
@@ -10951,7 +10915,6 @@ export default {
         const docs = (Array.isArray(body.docs) ? body.docs : []).slice(0, 10).map((d) => ({ id: String(d.id || "").slice(0, 64), name: String(d.name || "").slice(0, 200), itemId: String(d.itemId || "").slice(0, 200), kind: d.kind === "invoice" ? "invoice" : "extra" }));
         const id = `r${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}`;
         await env.DB.prepare("INSERT INTO fleet_repairs (id, vehicle_id, repair_date, contact_id, contact_name, notes, docs, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?)").bind(id, rm[1], date, String(body.contactId || "").slice(0, 64), contactName, String(body.notes || "").slice(0, 2000), JSON.stringify(docs), user.name || "").run();
-        if (user.tier === "T2") { try { await logUpdate(env, user, rm[1], veh.rego || veh.name || rm[1], "Repair Added", { date, url: "", notes: `${contactName}. ${String(body.notes || "").slice(0, 300)}` }); } catch (e) { /* the record is already saved */ } }
         const row = await env.DB.prepare("SELECT * FROM fleet_repairs WHERE id = ?").bind(id).first();
         return reply(env, 200, { item: out(row) });
       }
@@ -11149,9 +11112,6 @@ export default {
       if (bytes.byteLength > MAX_UPLOAD) return reply(env, 413, { error: "file too large" });
       try {
         const item = await uploadToSharePoint(env, ["Fleet Management", row.grp === "Machinery" ? "Machinery" : "Vehicles", label, ({ Finance: "Finance", Repairs: "Repairs" })[url.searchParams.get("folder")] || "Service"], fileName, bytes, request.headers.get("Content-Type"), url.searchParams.get("replace") === "1");
-        if (user.tier === "T2") {
-          try { await logUpdate(env, user, dm[1], row.rego || row.name || dm[1], "Document Uploaded", { date: new Date().toISOString().slice(0, 10), url: "", notes: item.name || fileName }); } catch (e) { /* upload already succeeded */ }
-        }
         return reply(env, 200, { id: item.id, name: item.name || fileName });
       } catch (e) {
         return reply(env, 502, { error: "upload failed" });
@@ -11524,22 +11484,6 @@ export default {
             await graphFetch(env, `/sites/${siteId(env)}/drive/root:/${oldPath}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: cleanName(sent.rego) }) });
           } catch (e) { /* folder may not exist yet */ }
         }
-        if (user.tier === "T2") {
-          try {
-            const label = sent.rego || existing.rego || existing.name || id;
-            let oldHistory = [];
-            try { oldHistory = JSON.parse(existing.serviceHistory || "[]"); } catch { oldHistory = []; }
-            const known = new Set(oldHistory.map((e) => String(e.id)));
-            for (const e of arr(body.historyUpsert).filter((e) => e && !known.has(String(e.id)))) {
-              await logUpdate(env, user, id, label, "Service Added", { date: String(e.date || "").slice(0, 10), url: String(e.url || "").slice(0, 500), notes: String(e.notes || "").slice(0, 1000) });
-            }
-            for (const f of names) {
-              if (f === "lastService" || f === "nextService") continue;
-              const to = clean(f);
-              if (String(existing[f] ?? "") !== to) await logUpdate(env, user, id, label, `${LABELS[f] || f} Changed`, { from: String(existing[f] ?? "").slice(0, 300), to: to.slice(0, 300) });
-            }
-          } catch (e) { /* the change itself has already been saved */ }
-        }
         return reply(env, 200, { ok: true });
       }
       // Whole record saves from an older copy of the app are refused on a vehicle that already exists, because that is the save that wiped service entries.
@@ -11558,7 +11502,6 @@ export default {
       const incomingHistory = Array.isArray(body.serviceHistory) ? body.serviceHistory.slice(0, 500) : [];
       const history = JSON.stringify((existing ? mergeById(incomingHistory, existing.serviceHistory, body.knownHistory) : incomingHistory).slice(0, 500));
       if (history.length > 400000) return reply(env, 413, { error: "too large" });
-      const changes = [];
       const grp = body.group === "Machinery" ? "Machinery" : "Vehicles";
       const vals = FIELDS.map((f) => f === "servicePhone" ? normPhone(String(body[f] ?? "").slice(0, 500)) : String(body[f] ?? "").slice(0, fleetLimit(f)));
       if (existing) {
@@ -11569,19 +11512,6 @@ export default {
             const oldPath = pathOf(["Fleet Management", grpName, cleanName(existing.rego)]);
             await graphFetch(env, `/sites/${siteId(env)}/drive/root:/${oldPath}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: cleanName(body.rego) }) });
           } catch (e) { /* folder may not exist yet */ }
-        }
-        if (user.tier === "T2") {
-          try {
-            const label = body.rego || existing.rego || existing.name || id;
-            let oldHistory = [];
-            try { oldHistory = JSON.parse(existing.serviceHistory || "[]"); } catch { oldHistory = []; }
-            const known = new Set(oldHistory.map((e) => e.id));
-            for (const e of JSON.parse(history).filter((e) => e && !known.has(e.id))) {
-              await logUpdate(env, user, id, label, "Service Added", { date: String(e.date || "").slice(0, 10), url: String(e.url || "").slice(0, 500), notes: String(e.notes || "").slice(0, 1000) });
-            }
-            FIELDS.forEach((f, i) => { if (f !== "lastService" && f !== "nextService" && String(existing[f] ?? "") !== vals[i]) changes.push([f, String(existing[f] ?? ""), vals[i]]); });
-            for (const [f, from, to] of changes) await logUpdate(env, user, id, label, `${LABELS[f] || f} Changed`, { from: from.slice(0, 300), to: to.slice(0, 300) });
-          } catch (e) { /* the change itself has already been saved */ }
         }
       } else {
         const next = await env.DB.prepare("SELECT COALESCE(MAX(sort_order), 0) + 1 AS n FROM fleet WHERE grp = ?").bind(grp).first();
