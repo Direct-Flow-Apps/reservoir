@@ -654,7 +654,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
 
 // Update push. Set this to a bundle name (for example "Full-Reservoir-2026.11.25-v26") and every open Reservoir and Weir window that finds that bundle newer than its own reloads straight away, instead of waiting for midnight or a home screen. Leave it empty for the normal gentle update.
 const APP_FORCE_UPDATE = "Full-Reservoir-2026.11.25-v26";
-const WORKER_BUILD = "Reservoir-Worker-2026.11.26-w333";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.26-w334";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -5909,6 +5909,45 @@ async function rcptRefresh(env, boxes, what) {
   }
 }
 // ---- Pictures pasted into the body of a received email are moved out into attachments named Attachment 1, Attachment 2 and so on. Runs every minute from its own trigger, looks only at recent inbox mail with attachments, and touches only the current email, never the quoted trail below it. Small pictures (logos, signatures) are left alone. Only the mailboxes listed in the app setting picclean_boxes are checked (tayler until it has been tested). Each message is looked at once.
+// Teleca 1300 voicemail emails land in DFP Jobs. The body names the voicemail box the caller chose. Commercial gets the Andrew category and a note, General and Maintenance gets the Maintenance category, Residential Builds and Accounts and Other are left alone.
+async function vmTag(env) {
+  await env.DB.prepare("CREATE TABLE IF NOT EXISTS vm_done (id TEXT PRIMARY KEY, at INTEGER, result TEXT)").run();
+  await mailExtraTable(env);
+  const b = MAILBOXES.find((x) => x.id === "jobs");
+  if (!b) return;
+  const addr = mailAddress(env, b);
+  const since = new Date(Date.now() - 60 * 60000).toISOString();
+  const list = await mailGraph(env, addr, `/mailFolders/inbox/messages?$top=25&$select=id,from,internetMessageId,categories&$filter=${encodeURIComponent(`receivedDateTime ge ${since}`)}&$orderby=receivedDateTime desc`);
+  if (!list.ok || !list.json) return;
+  for (const m of (list.json.value || [])) {
+    const from = String((((m.from || {}).emailAddress || {}).address) || "").toLowerCase();
+    if (!/@([\w-]+\.)*teleca\.[a-z.]+$/.test(from)) continue;
+    const done = await env.DB.prepare("SELECT id FROM vm_done WHERE id = ?1").bind(m.id).first();
+    if (done) continue;
+    const mark = (res) => env.DB.prepare("INSERT OR REPLACE INTO vm_done (id, at, result) VALUES (?1, ?2, ?3)").bind(m.id, Date.now(), String(res).slice(0, 200)).run();
+    try {
+      const full = await mailGraph(env, addr, `/messages/${encodeURIComponent(m.id)}?$select=body`);
+      if (!full.ok || !full.json) { await mark("unreadable"); continue; }
+      const text = String((full.json.body && full.json.body.content) || "").replace(/<[^>]+>/g, " ").replace(/&nbsp;/g, " ").replace(/\s+/g, " ");
+      const nm = /Voicemail name:\s*([A-Za-z][A-Za-z &]*?)\s*(?:Caller ID|Kind Regards|$)/i.exec(text);
+      const name = nm ? nm[1].trim().toLowerCase() : "";
+      if (!name) { await mark("no voicemail name"); continue; }
+      const have = (m.categories || []).map(String);
+      if (/commercial/.test(name)) {
+        await mailDo(env, addr, `/messages/${encodeURIComponent(m.id)}`, "PATCH", { categories: [...new Set([...have, "Andrew"])] });
+        const imid = String(m.internetMessageId || "").slice(0, 300);
+        if (imid) {
+          await env.DB.prepare("INSERT OR IGNORE INTO mail_extra (box, imid) VALUES (?, ?)").bind(b.id, imid).run();
+          await env.DB.prepare("UPDATE mail_extra SET note = ?, note_by = ?, note_at = ? WHERE box = ? AND imid = ? AND (note IS NULL OR note = '')").bind("This is a commercial inquiry through the 1300.", "Weir", new Date().toISOString(), b.id, imid).run();
+        }
+        await mark("commercial");
+      } else if (/general|maintenance/.test(name)) {
+        await mailDo(env, addr, `/messages/${encodeURIComponent(m.id)}`, "PATCH", { categories: [...new Set([...have, "Maintenance"])] });
+        await mark("maintenance");
+      } else await mark("left alone: " + name);
+    } catch (e) { await mark("failed " + String(e && e.message || e)); }
+  }
+}
 async function picClean(env) {
   await env.DB.prepare("CREATE TABLE IF NOT EXISTS pic_done (id TEXT PRIMARY KEY, at INTEGER, result TEXT)").run();
   let boxes = "";
@@ -9266,7 +9305,7 @@ export default {
   // Runs on a Cloudflare cron trigger if one is added (for example Thursday early morning). It only refreshes leave balances and leave history from Xero into D1.
   async scheduled(event, env, ctx) {
     // A one minute trigger only tidies pictures out of the body of received email, and nothing else.
-    if (event && event.cron === "* * * * *") { ctx.waitUntil(picTest(env).catch((e) => console.log("picture test failed", String(e && e.message || e))).then(() => picClean(env)).catch((e) => console.log("picture clean failed", String(e && e.message || e)))); return; }
+    if (event && event.cron === "* * * * *") { ctx.waitUntil(picTest(env).catch((e) => console.log("picture test failed", String(e && e.message || e))).then(() => picClean(env)).catch((e) => console.log("picture clean failed", String(e && e.message || e)))); ctx.waitUntil(vmTag(env).catch((e) => console.log("voicemail tag failed", String(e && e.message || e)))); return; }
     // A five minute trigger, if one is added, only looks for new mail so pings arrive quickly.
     if (event && event.cron === "*/5 * * * *") { ctx.waitUntil(mergeExportTest(env).catch((e) => console.log("export test failed", String(e && e.message || e)))); ctx.waitUntil(mergeCopyUndo(env).catch((e) => console.log("copy undo failed", String(e && e.message || e)))); ctx.waitUntil(mergeSentCopy(env).catch((e) => console.log("sent copy failed", String(e && e.message || e)))); ctx.waitUntil(mergeAutoReply(env).catch((e) => console.log("autoreply failed", String(e && e.message || e)))); ctx.waitUntil(mergeArchiveCopy(env).catch((e) => console.log("archive copy failed", String(e && e.message || e)))); ctx.waitUntil(mailWatch(env).catch((e) => console.log("mail watch failed", String(e && e.message || e)))); ctx.waitUntil(mailHoldSweep(env).catch((e) => console.log("hold sweep failed", String(e && e.message || e)))); ctx.waitUntil(rcptRefresh(env, MAILBOXES, (Math.floor(Date.now() / 300000) % 6 === 0) ? "all" : "sent").catch((e) => console.log("address index failed", String(e && e.message || e)))); ctx.waitUntil(vbaSubscribe(env).then(() => vbaWatch(env)).catch((e) => console.log("vba watch failed", String(e && e.message || e)))); return; }
     // Every run checks the automatic timesheets and the payroll sweeps. The leave sync keeps its own schedule and is skipped on the half hourly one.
