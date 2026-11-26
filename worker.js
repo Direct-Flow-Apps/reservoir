@@ -654,7 +654,7 @@ async function logUpdate(env, user, vehicleId, label, summary, detail) {
 
 // Update push. Set this to a bundle name (for example "Full-Reservoir-2026.11.25-v26") and every open Reservoir and Weir window that finds that bundle newer than its own reloads straight away, instead of waiting for midnight or a home screen. Leave it empty for the normal gentle update.
 const APP_FORCE_UPDATE = "Full-Reservoir-2026.11.25-v26";
-const WORKER_BUILD = "Reservoir-Worker-2026.11.26-w329";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.26-w330";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -5165,11 +5165,31 @@ async function mailRoutes(request, env, user, url) {
     if (url.pathname === "/api/mail/message" && !post) {
       const msg = mailId(url.searchParams.get("msg"));
       if (!msg) return reply(env, 400, { error: "bad request" });
-      const r = await mailGraph(env, addr, `/messages/${encodeURIComponent(msg)}?$select=subject,from,toRecipients,ccRecipients,bccRecipients,isDraft,importance,receivedDateTime,sentDateTime,body,hasAttachments,isRead,categories,flag,internetMessageId&$expand=attachments($select=id,name,size,contentType,isInline)`);
+      const r = await mailGraph(env, addr, `/messages/${encodeURIComponent(msg)}?$select=subject,from,toRecipients,ccRecipients,bccRecipients,isDraft,importance,receivedDateTime,sentDateTime,body,hasAttachments,isRead,categories,flag,internetMessageId&$expand=attachments($select=id,name,size,contentType,isInline,contentId)`);
       if (!r.ok) return reply(env, 200, { ok: false, error: mailWhy(r), worker: WORKER_BUILD });
       const m = r.json || {};
       const html = !!(m.body && String(m.body.contentType || "").toLowerCase() === "html");
       let shown = String((m.body && m.body.content) || "").slice(0, 1500000);
+      // Big pictures sitting in the body of the current email (not the quoted trail, not small logos) are taken out of the view and listed as attachments called Attachment 1, Attachment 2. Nothing is changed in Exchange. Replies build their trail from this cleaned view, so the pictures stay out of reply trails. Tayler's sign in only for now.
+      const movedPics = [];
+      if (html && !m.isDraft && /<img/i.test(shown) && user.tier === "T1" && (/^tayler/i.test(String(user.email || "")) || /^tayler\b/i.test(String(user.name || "")))) {
+        const cutAt = shown.search(/<div id="appendonsend"|<div id="divRplyFwdMsg"|<blockquote|<div style="border:none;border-top:solid #E1E1E1|<hr[^>]*id="stopSpelling"/i);
+        let top = cutAt >= 0 ? shown.slice(0, cutAt) : shown;
+        const rest = cutAt >= 0 ? shown.slice(cutAt) : "";
+        let n = (m.attachments || []).filter((a) => /^Attachment \d+/.test(String(a.name || ""))).length;
+        for (const tag of (top.match(/<img\b[^>]*>/gi) || [])) {
+          const src = (tag.match(/\ssrc\s*=\s*["']([^"']+)["']/i) || [])[1] || "";
+          if (!/^cid:/i.test(src)) continue;
+          const cid = src.slice(4).replace(/^<|>$/g, "");
+          const a = (m.attachments || []).find((x) => String(x.contentId || "").replace(/^<|>$/g, "") === cid);
+          if (!a || Number(a.size || 0) < 30000 || !/^image\//i.test(String(a.contentType || ""))) continue;
+          n++;
+          const ext = (String(a.contentType).split("/")[1] || "png").replace("jpeg", "jpg").replace(/[^a-z0-9]/gi, "") || "png";
+          movedPics.push({ id: a.id, name: `Attachment ${n}.${ext}`, size: Number(a.size || 0), type: String(a.contentType || "") });
+          top = top.replace(tag, "");
+        }
+        if (movedPics.length) shown = top + rest;
+      }
       if (html && /cid:/i.test(shown)) {
         let room = 8000000;
         for (const a of (m.attachments || []).filter((x) => /^image\//i.test(String(x.contentType || "")) && Number(x.size || 0) <= 2000000).slice(0, 20)) {
@@ -5187,7 +5207,7 @@ async function mailRoutes(request, env, user, url) {
       if (html && m.isDraft && /cid:dfplogo/i.test(shown)) shown = shown.split("cid:dfplogo").join(String(env.ALLOWED_ORIGIN || "").split(",")[0].trim().replace(/\/$/, "") + "/dfp-signature-logo.png");
       const imid = String(m.internetMessageId || "").slice(0, 300);
       const ex = imid ? (await mailExtraFor(env, box.id, [imid])).get(imid) : null;
-      return reply(env, 200, { ok: true, id: m.id, imid, note: ex && ex.note ? { text: String(ex.note), by: String(ex.note_by || ""), at: String(ex.note_at || "") } : null, urgentOff: !!(ex && ex.urgent_off), subject: String(m.subject || "(no subject)"), from: mailPart(m.from), to: (m.toRecipients || []).map(mailPart), cc: (m.ccRecipients || []).map(mailPart), bcc: (m.bccRecipients || []).map(mailPart), importance: String(m.importance || "normal"), at: m.receivedDateTime || m.sentDateTime || "", read: !!m.isRead, categories: (m.categories || []).slice(0, 6).map((c) => String(c).slice(0, 40)), flag: mailFlag(m.flag), html, body: shown, attachments: (m.attachments || []).filter((a) => !a.isInline).map((a) => ({ id: a.id, name: String(a.name || "attachment").slice(0, 160), size: Number(a.size || 0), type: String(a.contentType || "") })), worker: WORKER_BUILD });
+      return reply(env, 200, { ok: true, id: m.id, imid, note: ex && ex.note ? { text: String(ex.note), by: String(ex.note_by || ""), at: String(ex.note_at || "") } : null, urgentOff: !!(ex && ex.urgent_off), subject: String(m.subject || "(no subject)"), from: mailPart(m.from), to: (m.toRecipients || []).map(mailPart), cc: (m.ccRecipients || []).map(mailPart), bcc: (m.bccRecipients || []).map(mailPart), importance: String(m.importance || "normal"), at: m.receivedDateTime || m.sentDateTime || "", read: !!m.isRead, categories: (m.categories || []).slice(0, 6).map((c) => String(c).slice(0, 40)), flag: mailFlag(m.flag), html, body: shown, attachments: (m.attachments || []).filter((a) => !a.isInline).map((a) => ({ id: a.id, name: String(a.name || "attachment").slice(0, 160), size: Number(a.size || 0), type: String(a.contentType || "") })).concat(movedPics), worker: WORKER_BUILD });
     }
     if (url.pathname === "/api/mail/replies" && !post) {
       // Everything our side sent in the same conversation as this email: replies and forwards, with the folder each one sits in.
@@ -5882,7 +5902,7 @@ async function rcptRefresh(env, boxes, what) {
 // ---- Pictures pasted into the body of a received email are moved out into attachments named Attachment 1, Attachment 2 and so on. Runs every minute from its own trigger, looks only at recent inbox mail with attachments, and touches only the current email, never the quoted trail below it. Small pictures (logos, signatures) are left alone. Only the mailboxes listed in the app setting picclean_boxes are checked (tayler until it has been tested). Each message is looked at once.
 async function picClean(env) {
   await env.DB.prepare("CREATE TABLE IF NOT EXISTS pic_done (id TEXT PRIMARY KEY, at INTEGER, result TEXT)").run();
-  let boxes = "tayler";
+  let boxes = "";
   try { const r = await env.DB.prepare("SELECT value FROM app_settings WHERE key = 'picclean_boxes'").first(); if (r && r.value != null) boxes = String(r.value); } catch (e) { }
   const ids = boxes.split(",").map((x) => x.trim().toLowerCase()).filter(Boolean);
   for (const b of MAILBOXES.filter((x) => ids.includes(x.id))) {
