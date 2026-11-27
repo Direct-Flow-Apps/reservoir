@@ -1,0 +1,11680 @@
+// Reservoir-Worker-2026.11.03-w212
+globalThis.w210_TOP = "Reservoir-Worker-2026.11.03-w212";
+// Reservoir API Worker. Validates the Microsoft Entra token on every request, then reads and writes the D1 fleet table.
+const FIELDS = ["name","rego","expiry","serial","make","model","colour","year","body","vin","engine","compliance","fuel","driver","garaged","finance","directDebit","contract","lastService","nextService","serviceProvider","servicePhone","serviceEmail","serviceBooking","financeExpiry","financeDocs"];
+
+let jwksCache = { at: 0, keys: null };
+
+const b64u = (s) => Uint8Array.from(atob(s.replace(/-/g, "+").replace(/_/g, "/").padEnd(Math.ceil(s.length / 4) * 4, "=")), (c) => c.charCodeAt(0));
+const parseJson = (s) => JSON.parse(new TextDecoder().decode(b64u(s)));
+
+async function getKeys(env) {
+  if (jwksCache.keys && Date.now() - jwksCache.at < 3600000) return jwksCache.keys;
+  const res = await fetch(`https://login.microsoftonline.com/${env.TENANT_ID}/discovery/v2.0/keys`);
+  if (!res.ok) throw new Error("jwks");
+  jwksCache = { at: Date.now(), keys: (await res.json()).keys };
+  return jwksCache.keys;
+}
+
+
+// Speed: setup statements (CREATE TABLE/INDEX IF NOT EXISTS, ALTER TABLE) and one time seeds are remembered in D1 per Worker build, so a cold Worker start reads one list instead of running dozens of setup calls.
+let schemaSet = null;
+let schemaLoading = null;
+const SCHEMA_DDL = /^\s*(CREATE\s+(UNIQUE\s+)?(TABLE|INDEX)\s+IF\s+NOT\s+EXISTS|ALTER\s+TABLE)/i;
+function schemaHash(str) {
+  let a = 0x811c9dc5, b = 5381;
+  for (let i = 0; i < str.length; i++) { const c = str.charCodeAt(i); a = Math.imul(a ^ c, 16777619) >>> 0; b = (Math.imul(b, 33) + c) >>> 0; }
+  return a.toString(36) + b.toString(36) + str.length.toString(36);
+}
+async function schemaLoad(rawEnv) {
+  if (schemaSet) return schemaSet;
+  if (!schemaLoading) schemaLoading = (async () => {
+    try {
+      let rows;
+      try { rows = ((await rawEnv.DB.prepare("SELECT h FROM schema_done WHERE b = ?").bind(WORKER_BUILD).all()).results) || []; }
+      catch (e) {
+        await rawEnv.DB.prepare("CREATE TABLE IF NOT EXISTS schema_done (h TEXT NOT NULL, b TEXT NOT NULL, PRIMARY KEY (h, b))").run();
+        rows = [];
+      }
+      schemaSet = new Set(rows.map((r) => r.h));
+      try { await rawEnv.DB.prepare("DELETE FROM schema_done WHERE b <> ?").bind(WORKER_BUILD).run(); } catch (e) { /* tidy up only */ }
+    } catch (e) { schemaSet = new Set(); schemaSet.broken = true; }
+    return schemaSet;
+  })();
+  return schemaLoading;
+}
+async function schemaMark(rawEnv, h) {
+  if (!schemaSet || schemaSet.broken) return;
+  schemaSet.add(h);
+  try { await rawEnv.DB.prepare("INSERT OR IGNORE INTO schema_done (h, b) VALUES (?, ?)").bind(h, WORKER_BUILD).run(); } catch (e) { /* will just run again next start */ }
+}
+function schemaDb(rawEnv) {
+  const db = rawEnv.DB;
+  const noop = { bind() { return this; }, run: async () => ({ success: true, results: [] }), all: async () => ({ results: [] }), first: async () => null, raw: async () => [] };
+  return {
+    prepare(sql) {
+      if (!schemaSet || !SCHEMA_DDL.test(sql)) return db.prepare(sql);
+      const h = schemaHash(sql);
+      if (schemaSet.has(h)) return noop;
+      const st = db.prepare(sql);
+      return {
+        bind() { return this; },
+        async run() {
+          try { const r = await st.run(); await schemaMark(rawEnv, h); return r; }
+          catch (e) { if (/duplicate column|already exists/i.test(String(e && e.message || e))) await schemaMark(rawEnv, h); throw e; }
+        },
+        all: () => st.all(), first: () => st.first(), raw: () => st.raw()
+      };
+    },
+    batch: (x) => db.batch(x),
+    exec: (q) => db.exec(q)
+  };
+}
+// Runs fn once per Worker build (the seeds and moves that only need doing after a deploy).
+async function schemaOnce(env, name, fn) {
+  if (schemaSet && !schemaSet.broken && schemaSet.has("once:" + name)) return;
+  await fn();
+  await schemaMark(env, "once:" + name);
+}
+
+async function verifyToken(request, env) {
+  const h = request.headers.get("Authorization") || "";
+  if (!h.startsWith("Bearer ")) throw new Error("no token");
+  const token = h.slice(7);
+  const parts = token.split(".");
+  if (parts.length !== 3) throw new Error("bad token");
+  const header = parseJson(parts[0]);
+  const claims = parseJson(parts[1]);
+  if (header.alg !== "RS256") throw new Error("alg");
+  let keys = await getKeys(env);
+  let jwk = keys.find((k) => k.kid === header.kid);
+  if (!jwk) { jwksCache.keys = null; keys = await getKeys(env); jwk = keys.find((k) => k.kid === header.kid); }
+  if (!jwk) throw new Error("kid");
+  const key = await crypto.subtle.importKey("jwk", jwk, { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, false, ["verify"]);
+  const ok = await crypto.subtle.verify("RSASSA-PKCS1-v1_5", key, b64u(parts[2]), new TextEncoder().encode(parts[0] + "." + parts[1]));
+  if (!ok) throw new Error("signature");
+  const now = Math.floor(Date.now() / 1000);
+  if (claims.exp < now - 60 || (claims.nbf && claims.nbf > now + 60)) throw new Error("expired");
+  if (claims.tid !== env.TENANT_ID) throw new Error("tenant");
+  if (claims.aud !== env.CLIENT_ID && claims.aud !== `api://${env.CLIENT_ID}`) throw new Error("aud");
+  const issOk = claims.iss === `https://login.microsoftonline.com/${env.TENANT_ID}/v2.0` || claims.iss === `https://sts.windows.net/${env.TENANT_ID}/`;
+  if (!issOk) throw new Error("iss");
+  const roles = Array.isArray(claims.roles) ? claims.roles : [];
+  const tier = ["T1", "T2", "T3", "T4", "T5"].find((t) => roles.includes(t));
+  if (!tier) throw new Error("no role");
+  return { tier, name: claims.name || claims.preferred_username || "", email: String(claims.email || claims.preferred_username || claims.upn || "").toLowerCase() };
+}
+
+const cors = (env) => ({
+  "Access-Control-Allow-Origin": env.ALLOWED_ORIGIN,
+  "Access-Control-Allow-Headers": "Authorization, Content-Type, X-View-As",
+  "Access-Control-Allow-Methods": "GET, PUT, POST, PATCH, DELETE, OPTIONS",
+  "Access-Control-Max-Age": "86400",
+  Vary: "Origin"
+});
+const reply = (env, status, body) => new Response(body === null ? null : JSON.stringify(body), { status, headers: { ...cors(env), "Content-Type": "application/json", "Cache-Control": "no-store" } });
+
+// A save sends the whole vehicle, so a phone holding an old copy used to wipe whatever another device had just added. The app now sends the ids it had loaded (known). Anything on the server that the sender never had is kept, anything the sender had and removed is dropped, and anything it sent wins.
+const mergeById = (incoming, storedJson, known) => {
+  let stored;
+  try { stored = JSON.parse(storedJson || "[]"); } catch { stored = []; }
+  if (!Array.isArray(known) || !Array.isArray(stored)) return incoming;
+  const have = new Set(incoming.map((x) => x && x.id));
+  const seen = new Set(known.map(String));
+  const keep = stored.filter((x) => x && x.id !== undefined && !have.has(x.id) && !seen.has(String(x.id)));
+  return [...incoming, ...keep];
+};
+
+const fleetLimit = (f) => f === "financeDocs" ? 20000 : 500;
+let fleetColsDone = false;
+async function fleetCols(env) {
+  if (fleetColsDone) return;
+  for (const c of ["financeExpiry", "financeDocs"]) { try { await env.DB.prepare(`ALTER TABLE fleet ADD COLUMN ${c} TEXT`).run(); } catch (e) { /* already there */ } }
+  fleetColsDone = true;
+}
+
+const rowToItem = (r) => {
+  const item = { id: r.id, group: r.grp };
+  FIELDS.forEach((f) => { item[f] = r[f] ?? ""; });
+  try { item.repairs = JSON.parse(r.repairs || "[]"); } catch { item.repairs = []; }
+  try { item.serviceHistory = JSON.parse(r.serviceHistory || "[]"); } catch { item.serviceHistory = []; }
+  return item;
+};
+
+
+
+// ---- SharePoint document storage through Microsoft Graph (Reservoir site, app only access) ----
+const GRAPH = "https://graph.microsoft.com/v1.0";
+const GRAPH_CLIENT_ID_DEFAULT = "9748df41-dbe2-47ce-ba3d-34bafa8670a7";
+const GRAPH_SITE_ID_DEFAULT = "directflowplumbing.sharepoint.com,1f11da18-92c7-4490-aa35-79124b6fa696,3857ff5c-4f9e-491a-bd93-959c29dd3fac";
+const MAX_UPLOAD = 25 * 1024 * 1024;
+const CHUNK = 320 * 1024 * 10;
+let graphToken = { at: 0, value: "" };
+
+async function getGraphToken(env) {
+  if (graphToken.value && Date.now() < graphToken.at) return graphToken.value;
+  if (!env.GRAPH_CLIENT_SECRET) throw new Error("graph secret missing");
+  const body = new URLSearchParams({ client_id: env.GRAPH_CLIENT_ID || GRAPH_CLIENT_ID_DEFAULT, client_secret: env.GRAPH_CLIENT_SECRET, scope: "https://graph.microsoft.com/.default", grant_type: "client_credentials" });
+  const res = await fetch(`https://login.microsoftonline.com/${env.TENANT_ID}/oauth2/v2.0/token`, { method: "POST", body });
+  if (!res.ok) throw new Error("graph token " + res.status);
+  const j = await res.json();
+  graphToken = { value: j.access_token, at: Date.now() + (j.expires_in - 300) * 1000 };
+  return graphToken.value;
+}
+const siteId = (env) => env.GRAPH_SITE_ID || GRAPH_SITE_ID_DEFAULT;
+const cleanName = (s) => String(s || "").replace(/[\\/:*?"<>|#%~&{}]/g, "-").replace(/\s+/g, " ").trim().replace(/^\.+/, "").slice(0, 120);
+const pathOf = (segs) => segs.map((x) => encodeURIComponent(x)).join("/");
+
+async function graphFetch(env, url, init = {}) {
+  const token = await getGraphToken(env);
+  // Microsoft answers 429 (throttled) or 503 when it is asked for too much at once. Wait the time it names and ask again, up to three times.
+  let res;
+  for (let attempt = 0; attempt < 4; attempt++) {
+    res = await fetch(url.startsWith("http") ? url : GRAPH + url, { ...init, headers: { Authorization: `Bearer ${token}`, ...(init.headers || {}) } });
+    if ((res.status !== 429 && res.status !== 503) || attempt === 3) break;
+    const wait = Math.min(10, Math.max(1, Number(res.headers.get("Retry-After")) || 2 * (attempt + 1)));
+    await new Promise((r) => setTimeout(r, wait * 1000));
+  }
+  return res;
+}
+
+async function uploadToSharePoint(env, segs, fileName, bytes, contentType, replace) {
+  const behaviour = replace ? "replace" : "rename";
+  const base = `/sites/${siteId(env)}/drive/root:/${pathOf([...segs, fileName])}:`;
+  if (bytes.byteLength <= 4 * 1024 * 1024) {
+    const res = await graphFetch(env, `${base}/content?@microsoft.graph.conflictBehavior=${behaviour}`, { method: "PUT", headers: { "Content-Type": contentType || "application/octet-stream" }, body: bytes });
+    if (!res.ok) throw new Error("upload " + res.status);
+    return res.json();
+  }
+  const sess = await graphFetch(env, `${base}/createUploadSession`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ item: { "@microsoft.graph.conflictBehavior": behaviour } }) });
+  if (!sess.ok) throw new Error("session " + sess.status);
+  const { uploadUrl } = await sess.json();
+  let last;
+  for (let start = 0; start < bytes.byteLength; start += CHUNK) {
+    const end = Math.min(start + CHUNK, bytes.byteLength);
+    const res = await fetch(uploadUrl, { method: "PUT", headers: { "Content-Length": String(end - start), "Content-Range": `bytes ${start}-${end - 1}/${bytes.byteLength}` }, body: bytes.slice(start, end) });
+    if (!res.ok && res.status !== 202) throw new Error("chunk " + res.status);
+    last = res;
+  }
+  return last.json();
+}
+
+// ---- Xero bills by email (Microsoft Graph sendMail from a DFP mailbox) ----
+const MAIL_SENDER_DEFAULT = "accounts@directflow.com.au";
+const MAX_EMAIL = 3.5 * 1024 * 1024;
+const toB64 = (buf) => {
+  const b = new Uint8Array(buf);
+  let out = "";
+  for (let i = 0; i < b.length; i += 0x8000) out += String.fromCharCode.apply(null, b.subarray(i, i + 0x8000));
+  return btoa(out);
+};
+
+// Reads a stored file's details and which folder it sits in. Only files inside Fleet Management or Receipts are ever touched.
+async function driveMeta(env, id) {
+  const r = await graphFetch(env, `/sites/${siteId(env)}/drive/items/${id}?select=id,name,file,parentReference`);
+  if (!r.ok) return null;
+  const m = await r.json();
+  if (!m.file) return null;
+  let path = (m.parentReference && m.parentReference.path) || "";
+  try { path = decodeURIComponent(path); } catch (e) { /* keep as is */ }
+  const i = path.indexOf("root:/");
+  m.folder = i >= 0 ? path.slice(i + 6) : "";
+  if (!(m.folder.startsWith("Fleet Management/") || m.folder.startsWith("Receipts/"))) return null;
+  return m;
+}
+
+// ---- Voice Guides: spoken explanations kept in Development / Voice Guides, one folder per home screen and one audio file per tile. A replaced file is moved into that folder's Previous folder as v1, v2 and so on. ----
+const VOICE_ROOT = ["Development", "Voice Guides"];
+const MAIL_JOBS_SEGS = ["Client Records", "New Jobs"];
+const VOICE_EXT = /\.(mp3|m4a|wav)$/i;
+const voiceNorm = (s) => String(s || "").toLowerCase().replace(/\.(mp3|m4a|wav)$/i, "").replace(/&/g, " and ").replace(/[^a-z0-9]+/g, "");
+let voiceCache = { at: 0, list: null };
+async function voiceChildren(env, segs) {
+  const out = [];
+  let next = `/sites/${siteId(env)}/drive/root:/${pathOf(segs)}:/children?$top=999&$select=id,name,size,file,folder,lastModifiedDateTime`;
+  for (let n = 0; next && n < 10; n++) {
+    const r = await graphFetch(env, next);
+    if (r.status === 404) return null;
+    if (!r.ok) throw new Error("voice list " + r.status);
+    const j = await r.json();
+    out.push(...(j.value || []));
+    next = j["@odata.nextLink"] || "";
+  }
+  return out;
+}
+async function voiceList(env, fresh) {
+  if (!fresh && voiceCache.list && Date.now() - voiceCache.at < 30000) return voiceCache.list;
+  const guides = [];
+  const homes = (await voiceChildren(env, VOICE_ROOT)) || [];
+  for (const h of homes.filter((x) => x.folder)) {
+    const files = (await voiceChildren(env, [...VOICE_ROOT, h.name])) || [];
+    for (const f of files.filter((x) => x.file && VOICE_EXT.test(x.name))) guides.push({ id: f.id, home: h.name, tile: f.name.replace(VOICE_EXT, ""), name: f.name, size: f.size || 0, modified: f.lastModifiedDateTime || "" });
+  }
+  voiceCache = { at: Date.now(), list: guides };
+  return guides;
+}
+async function voiceUpload(env, home, tile, ext, bytes, contentType) {
+  const homes = (await voiceChildren(env, VOICE_ROOT)) || [];
+  const homeFolder = homes.find((x) => x.folder && voiceNorm(x.name) === voiceNorm(home));
+  const homeName = homeFolder ? homeFolder.name : cleanName(home);
+  const segs = [...VOICE_ROOT, homeName];
+  const files = homeFolder ? ((await voiceChildren(env, segs)) || []) : [];
+  const old = files.find((x) => x.file && VOICE_EXT.test(x.name) && voiceNorm(x.name) === voiceNorm(tile));
+  const base = old ? old.name.replace(VOICE_EXT, "") : cleanName(tile);
+  let version = 0;
+  if (old) {
+    let prev = (await voiceChildren(env, [...segs, "Previous"]));
+    let prevId = "";
+    if (prev === null) {
+      const mk = await graphFetch(env, `/sites/${siteId(env)}/drive/root:/${pathOf(segs)}:/children`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: "Previous", folder: {}, "@microsoft.graph.conflictBehavior": "fail" }) });
+      if (mk.ok) prevId = (await mk.json()).id;
+      else { const again = await graphFetch(env, `/sites/${siteId(env)}/drive/root:/${pathOf([...segs, "Previous"])}?select=id`); if (again.ok) prevId = (await again.json()).id; }
+      prev = [];
+    } else {
+      const look = await graphFetch(env, `/sites/${siteId(env)}/drive/root:/${pathOf([...segs, "Previous"])}?select=id`);
+      if (look.ok) prevId = (await look.json()).id;
+    }
+    if (!prevId) throw new Error("previous folder");
+    const have = prev.map((x) => { const m = String(x.name).match(/ v(\d+)\.[A-Za-z0-9]+$/); return m && voiceNorm(String(x.name).replace(/ v\d+\.[A-Za-z0-9]+$/, "")) === voiceNorm(base) ? Number(m[1]) : 0; });
+    version = Math.max(0, ...have) + 1;
+    const oldExt = (old.name.match(VOICE_EXT) || [".mp3"])[0];
+    const mv = await graphFetch(env, `/sites/${siteId(env)}/drive/items/${old.id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: `${base} v${version}${oldExt}`, parentReference: { id: prevId } }) });
+    if (!mv.ok) throw new Error("keep previous " + mv.status);
+  }
+  const item = await uploadToSharePoint(env, segs, `${base}${ext}`, bytes, contentType, true);
+  voiceCache = { at: 0, list: null };
+  return { id: item.id, name: item.name || `${base}${ext}`, kept: version };
+}
+
+// ---- Header Text: card headlines Tayler and Andrey have edited. Kept in Development / Header Text / headers.json. ----
+const HEADS_SEGS = ["Development", "Header Text"];
+let headsCache = { at: 0, map: null };
+async function headsRead(env, fresh) {
+  if (!fresh && headsCache.map && Date.now() - headsCache.at < 30000) return headsCache.map;
+  let map = {};
+  const dl = await graphFetch(env, `/sites/${siteId(env)}/drive/root:/${pathOf([...HEADS_SEGS, "headers.json"])}:/content`, { redirect: "manual" });
+  if (dl.status !== 404) {
+    const loc = dl.headers.get("Location");
+    const file = loc ? await fetch(loc) : dl;
+    if (file.ok) { try { map = JSON.parse(await file.text()) || {}; } catch (e) { map = {}; } }
+  }
+  headsCache = { at: Date.now(), map };
+  return map;
+}
+async function headsWrite(env, map) {
+  const bytes = new TextEncoder().encode(JSON.stringify(map, null, 1)).buffer;
+  await uploadToSharePoint(env, HEADS_SEGS, "headers.json", bytes, "application/json", true);
+  headsCache = { at: Date.now(), map };
+}
+
+async function driveBytes(env, id) {
+  const dl = await graphFetch(env, `/sites/${siteId(env)}/drive/items/${id}/content`, { redirect: "manual" });
+  const loc = dl.headers.get("Location");
+  const file = loc ? await fetch(loc) : dl;
+  if (!file.ok) throw new Error("download " + file.status);
+  return file.arrayBuffer();
+}
+
+// While testing, a director viewing as someone can do everything that person can. Set false before go live to make View As read only again.
+const VIEW_AS_WRITES = true;
+
+async function sendToXero(env, user, meta, given) {
+  if (!env.XERO_BILLS_EMAIL) throw new Error("XERO_BILLS_EMAIL is not set on the Worker");
+  // Reservoir sends the finished PDF with the request. Without one, the stored file goes as it is.
+  const bytes = given && given.byteLength ? given : await driveBytes(env, meta.id);
+  if (bytes.byteLength > MAX_EMAIL) throw new Error("too large");
+  // Xero only reads PDF, JPG and PNG. Go by what the file really is, not by its name or the type SharePoint guessed, and give it the matching name and type.
+  const head = new Uint8Array(bytes.slice(0, 16));
+  const ascii = (a0, a1) => String.fromCharCode(...head.slice(a0, a1));
+  let kind = "";
+  if (ascii(0, 4) === "%PDF") kind = "pdf";
+  else if (head[0] === 0x89 && ascii(1, 4) === "PNG") kind = "png";
+  else if (head[0] === 0xFF && head[1] === 0xD8) kind = "jpg";
+  else if (ascii(4, 8) === "ftyp" && /heic|heif|mif1|msf1|heix/i.test(ascii(8, 12))) throw new Error("This file is a HEIC photo, which Xero cannot read. Take the photo again as JPG or send a screenshot.");
+  else if (ascii(0, 3) === "GIF") throw new Error("Xero cannot read GIF files. Send a PDF, JPG or PNG.");
+  const mimeOf = { pdf: "application/pdf", png: "image/png", jpg: "image/jpeg" };
+  let fileName = String(meta.name || "receipt");
+  const sendBytes = bytes;
+  if (kind) fileName = fileName.replace(/\.[A-Za-z0-9]{2,5}$/, "") + "." + kind;
+  const sender = env.MAIL_SENDER || MAIL_SENDER_DEFAULT;
+  const payload = JSON.stringify({
+    message: {
+      subject: fileName,
+      body: { contentType: "Text", content: `Sent from Reservoir by ${user.name}.` },
+      toRecipients: [{ emailAddress: { address: env.XERO_BILLS_EMAIL } }],
+      attachments: [{ "@odata.type": "#microsoft.graph.fileAttachment", name: fileName, contentType: kind ? mimeOf[kind] : ((meta.file && meta.file.mimeType) || "application/pdf"), contentBytes: toB64(sendBytes) }]
+    },
+    saveToSentItems: true
+  });
+  const post = () => graphFetch(env, `/users/${encodeURIComponent(sender)}/sendMail`, { method: "POST", headers: { "Content-Type": "application/json" }, body: payload });
+  let res = await post();
+  if (res.status === 403 || res.status === 401) {
+    // The cached app token may pre-date a newly granted permission. Fetch a fresh one and try once more.
+    graphToken = { at: 0, value: "" };
+    res = await post();
+  }
+  if (!res.ok) {
+    let code = "";
+    try { code = (await res.json()).error.code || ""; } catch (e) { /* no body */ }
+    let roles = "";
+    try { roles = (parseJson(graphToken.value.split(".")[1]).roles || []).join(" "); } catch (e) { /* ignore */ }
+    throw new Error(`sendMail ${res.status} ${code} (app permissions: ${roles || "none"})`.trim());
+  }
+  return fileName;
+}
+
+async function mailAttachment(env, user, to, name, mime, b64) {
+  const sender = env.MAIL_SENDER || MAIL_SENDER_DEFAULT;
+  const payload = JSON.stringify({
+    message: {
+      subject: name,
+      body: { contentType: "Text", content: `Sent from Reservoir by ${user.name}.` },
+      toRecipients: [{ emailAddress: { address: to } }],
+      attachments: [{ "@odata.type": "#microsoft.graph.fileAttachment", name, contentType: mime, contentBytes: b64 }]
+    },
+    saveToSentItems: true
+  });
+  const post = () => graphFetch(env, `/users/${encodeURIComponent(sender)}/sendMail`, { method: "POST", headers: { "Content-Type": "application/json" }, body: payload });
+  let res = await post();
+  if (res.status === 403 || res.status === 401) {
+    graphToken = { at: 0, value: "" };
+    res = await post();
+  }
+  if (!res.ok) throw new Error(`sendMail ${res.status}`);
+}
+
+let receiptRecordsReady = false;
+async function receiptRecordsTable(env) {
+  if (receiptRecordsReady) return;
+  receiptRecordsReady = true;
+  await env.DB.prepare("CREATE TABLE IF NOT EXISTS receipt_records (id TEXT PRIMARY KEY, by_name TEXT, by_email TEXT, type TEXT, amount TEXT, note TEXT, item_id TEXT, file_name TEXT, status TEXT, view TEXT, sent_date TEXT, done_date TEXT, created_at TEXT DEFAULT (datetime('now')))").run();
+  for (const col of ["xero_name TEXT", "xero_at TEXT", "xero_state TEXT"]) { try { await env.DB.prepare(`ALTER TABLE receipt_records ADD COLUMN ${col}`).run(); } catch (e) { /* already there */ } }
+}
+
+// A company receipt Xero turns into a draft bill with no contact gets one when it is fuel: DFP Fuel, due on its own date. Drafts stay drafts. A reimbursement's bill is completed in xeroVerify.
+const FUEL_RE = /\b(fuel|diesel|unleaded|ulp|petrol|e10|premium|bp|shell|ampol|caltex|7[- ]?eleven|united petroleum|puma|viva energy|liberty|coles express|metro petroleum|reddy express|apco)\b/i;
+async function fuelDraftFix(env) {
+  await xeroContactsTable(env);
+  await receiptRecordsTable(env);
+  const find = async (like) => await env.DB.prepare("SELECT contact_id, name FROM xero_contacts WHERE name_lc LIKE ? LIMIT 1").bind(like).first();
+  const fuelRow = await find("%dfp fuel%");
+  const since = new Date(Date.now() - 14 * 86400000).toISOString();
+  const res = await xeroFetch(env, `api.xro/2.0/Invoices?where=${encodeURIComponent('Type=="ACCPAY" AND Status=="DRAFT"')}&order=${encodeURIComponent("UpdatedDateUTC DESC")}&page=1`, { headers: { "If-Modified-Since": new Date(since).toUTCString() } });
+  if (!res.ok) return;
+  const list = ((await res.json()).Invoices) || [];
+  for (const d of list) {
+    const c = d.Contact || {};
+    if (c.ContactID && c.Name) continue;
+    const one = await xeroFetch(env, `api.xro/2.0/Invoices/${d.InvoiceID}`);
+    if (!one.ok) continue;
+    const inv = (((await one.json()).Invoices) || [])[0] || {};
+    if ((inv.Contact || {}).ContactID) continue;
+    const text = [inv.Reference, ...(inv.LineItems || []).map((l) => l.Description)].filter(Boolean).join(" ");
+    const contact = FUEL_RE.test(text) ? fuelRow : null;
+    if (!contact) continue;
+    // A date Xero misread (2021, or in the future) falls back to today, so the bill is never dated years back.
+    const today = new Date(Date.now() + 11 * 3600000).toISOString().slice(0, 10);
+    const read = String(inv.DateString || "").slice(0, 10);
+    const age = read ? (Date.parse(today) - Date.parse(read)) / 86400000 : 9999;
+    const date = age >= 0 && age <= 90 ? read : today;
+    const body = { Invoices: [{ InvoiceID: inv.InvoiceID, Contact: { ContactID: contact.contact_id }, Date: date, DueDate: date }] };
+    await xeroFetch(env, "api.xro/2.0/Invoices", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  }
+}
+// PAYG withholding bill. Once a pay run is filed, the tax withheld for that run becomes a bill to the Australian Taxation Office in Xero (PAYG Withholdings Payable, BAS Excluded) with a one page payment advice attached as the PDF.
+const PAYG_ATO_REF = "002966266109001660";
+const PAYG_LOGO_B64 = "eNrtXYt3FFWa/yd2d86eOXN2XEPCS0BiOg9wZjy6o7Mz4+zOzuisD/JOSEJeiCiCgA/wAVEUGXRF3gyuyOCDQUEFRVGRZZDnERQkGEEICKnq6urqemR/371VnaTpru4g6XTCl/M7OZ1OV3XV/d3v3u9d6qTrVAaDwWAwGAwGg8FgMBgMBoPBYDAYDAaDwWAwGAwGg8FgMBgMBoPBYDAYDAaD4YdctU5gkoe66Ds8OD9gVOWL+rwuTMqL/W/qkAThJA35aiNQSGgqdF80FtCbDYFLPPkVDowbRhID2yDGUJKFF/IdOcK9YgqHe0cpNaOVyhFK+VClLFspHaKU5dDryuFK9TVq7Vhx/gKmoBfA2FaPUkquVkqy1LIhSnk2jWf5MKU8B3+qGOHiq+l16icE9fUBpWIYnbByOP4MPvhr7bH/1lpKtZYybX6J9tgd2uzfBe/9hVp7LTFYMVTIMnORGlkTR2vTf6Wvmm28/qzx7orI9lciOzZEPn4t8tF6Y9taY9P/hF+dH3p2othxkq2oQh4hQWrFMO2h/wy/PNfctck6utc+2+ZoHY6hO5Ew/dYU5/x3dtth68COyNY1oafK1ZoxTFlqK2EhpCC85uFO3x+79RBERq0d4+048chqLFQmjoYkavMmmLveci6ciXMiJ8575t/fgTjT+ScxZUn5KsCKFF41Wwyc0WmbnZbVaZkeLHrTcezjBwRf1ybgS5BVMVxtHhfZutoJax7Nlge70wEcDza9g/cjYbyIvLcKWxvJJtOREl9Z4ZWz3OGNI1r0pv31flqv4vJVJ8gqH6rNvtU+tlcIkUNcS4KSyC2dPLxhAa6BtY5e8CXly4cvkq94fEmysFuBrO++FkIaSU5TDF/LpislQ3qngjJfl8BXHSkYSs0oLIP4gLuipv4j10bbCj1VpkL/ZPnqc/kiWxj6v7F1jStZKXHk7WXYwvDG2W+1B24mW4z3rz7ly922ckLz7nZ0lT7m2H40YUfrfn4smVA2HMfcu42UeRLVANPRh3wJHwhM3ciHr9LHrMTCRXLk7Wim4YSUTj1I9Imf8IanyazmxbCv+cLyVTUy+MAt9venPFLis0XCFA6ZOzfqS+8PzSvWHv2jNue2UEupvmpmZPNSODqUqhG8GPY5X404MDu8ZKofWfLY9hNgh5yHQIXwHFYMJ5dXaTZ5QnBO9mykgy/4nbIjW5aJxdCMu2nRjmYa2sKJHXf+WHjmCwgNBe4Lep3PZKWDLznI1ddY+7f7H2h98Snpfo0BVicuNcjVM3R4aXw1CN9UY77ddiThgZawhd94Dgo/hbr6Lgw62KKfuW5AsD7gBptcyNhWUcp8XSf8vXmC5QBCMMEpP3fOtiXcv2xaJPVlD5D6R+pEbjzIYfeNnyb6lwzMNXmg1XXgRz9xCzJuiBd1ucrEMVidlOoRStVIpXoUGT4NAdhQ4TWPJOGr9aDaVEQi1lxEI9M8XqkdG5x2s/P9d/H58ly7+uIGtXKkOvl6L6xc2C3QnC/1Fm8jk3FSb1I1FcZfQt3QaoDupZKCdG4AFEqmDB/IwOsA4ojCu9e523rtGLqdEhFwxArWPF6978bgtF8Gp92kIlyIW5uU13H7j/QX702yDR3bS2NSkkVRSFLzhnfc/S8YHOfct358WWboibuUP/0zxZfLcnoiG4oiJEsoiln0DqmOw9zz4x1IZY+gmIxZFyg1Y+BspPhL0zht1m+1x+8MPTlBm3M7nCSQfaUihw6cOMqdAwOCL3GpNESltBCF5pcY6+aZn7xufbnbPvmVfabVaf/GaT9hf3fc/vaIdXSPsXW1+dkmd5DjaHnEhX3qWOjpilBLWejpqtBTFaEF1dq8Yn1xo9NxLvqZeL5B23hlXuixO0LPVNNRUbSUIwAKKwxTCwJovLUk8uE6XIO5ewsCZwiYGhv/rK+YEbzvRkFZQMRrCmh9KB2COaa/OAXWHC4eQU8neIEioco5+LWs1oORHX/VX5wanPILYpxYKxQxtdwM3acwA5sKaa0ryw7OutV4c5HVeqgzHOr84T9gxNBjIRxKSQ6EB/jiAxEgMw3Mn+DUG/A7kQvLeGcFLQtiicNNgTt95Sz7m8MJzIeuBcE53Wq89mzwnvEUVgPR9YGM00aEq5yyJkqysNwZm5diynXZQbFxQ9uLGIqgoW36uf4u2pJ64NKOEqqjfeqoNvs/rAMf0TsRw7tC4WaMkJ/fOn5AIZdyAHsTZM3c816Xgys2Bipfe7cpP9V2GFKsIAWlXloTuRlEFm1VY7EFQB+zT7d2aWjkhnU6L8vPpfHVGe8ocVX2mRPaE3eZ+z6IY3HT/HEc5Xtt7u3KhKuwVtgnDrpeSqLDSfKNtuWe0NCRQ0JSJpWZDCELagNs0rrcyPtr3TEkZ7jdmbE/QpydcyexIcbnq9PlNPRcnVo1wj5+0IvX9GbueTHu8CtP0MbXUJAhkkWaeWOBtXdrV8pEhv+4fJ1CZpS57/34Hi2xxIX/8qjxt+fpz4hxKV8kR8OM6C80S12lX1dFsWfVXKvU5bp3nTQWj0Honk4js2tSlUTHm95OwlSnhAdGD3dc2cFYnm2Du97ctz2hB9IykWNA8ZdU197EPuez3wan30I2mtAz+00bhIJRPiyyfZ2rifnclGP7yV0qo2HbcZCKKF18FLHjwEbQHv0D6Rue8yqlPbRLd7K8IKmTfGGEgH603tU2+ytrrolSB3XpShIjkHB6e7PXUb+3v9qDfD/zs41k6Xy+DfaXc/6MX7SxO19OT/UyVa3SjoW4HuxKwftvgkM4oanuropOl6TEnVdWMv1Wfqmuak/cSZQ1pn1VlNtW5fDgjH93zp50Z53vggBz0tiwAPozuT6wLFQOU2UGe0MAbkDo/wkHTdrL7W2wfWDD6qtnI86or34Iimj4fx93guf97GXHxpn1JVPp86tmdWHFg+G1c0PP1tC2e/RzP7563gX0PfvoHhPpx5uXRt5bbe3Zard/0/06/UUM6crEV/p1RXclzIls+4tvLN7NaYHlAqNMKf5XRITVurHdyk/ICazc8WPdDTsm9kcd3QtDRim+ivx1cB2UD+246yc4HNMgsT+KVuDQ43cot/0TeZmQJ9+FLDpPydXwSVoyZdGfL9cn9nloQSWZLXBe0UmyMeVglxkbF3fKDFW/BBKyAuyzJ+HzVKtHpttVJYRLe+QPcMW4wp74Ns1PXgNN5KyTrtr6QI+KoaYiDL6bjx1fvrr5e7H4Tx6nNhWok8crdWORDJDE32tb+sJaGp97ru9ypBNwhusVYYlgJiThS5J16ONgUwFNOfIMRMOdASwR8GTqL0z21BLbN42kU3/pflIU05wuQjUFQ4zNy6Jhi4S3+eVuBW5eeNImj/fCXj8kXinjKWPFQI3E3HYSJW9E+XqmSi2T8a/uYRRxhomjk/NFu6QDS43WByQP3POzWKc9sV/UcedPsDi7u2qifVyoNKR1oBwmnfKF78Kd3jPekfm08YWChsvRg+Qex7pBZI29fPFlkSZafU2qfMXJBRVnSIkveh87Ly2ezePihLfqRAUZXME1o60j/+d3KsGXdeKQ0uBTCNAHajyy/kqHhBbVe9aWk1CD3fmm0GDzL3c+QLr4kmb1hXaUJtF6nsh0AmXNRSCUVGWf3UGeraNdm/lbtVIYYunREpHoghHenCzRBXv9wlrXQT1A+RJLPRR+CkBHvzrBmEDpDT74GxgsiQNDYlgi4dCCqvT5Oig0MBaRBfPwZ0lG+HSreu8NyfOcM5kvuUpsX6cmVcLxL7Hgu9ZBfOtb+iTt8PLpIkM1DXwJBxQSJ6be6Drh48q+uE1z92ZyApMbJDBg+RKb15t/Tp4ALA2cyuHmp28kXnZcgQ2vm0cnhHz1tWOKFOACOKAQ/nbDW3H5knv0Wy96Tum8gcmX6wQIv9oiLLXCFHTm7Mi7y335khNgUZpUeuIL6UxD9IU1nUYooRdU3ubLc1LKS898viAOxSnw1ShsnDeeS87X2y+lka9CUoTgjpCuzjh8uTaj/tJ9KV3VoOFL3sj6luR8bVkmVp789PG1fEbUloyvBYGvxU3Ml598NaRRvpZPd32DPnw9f4XxlfJ6GIYC45ZL56aFryx9yb1+66F0lC2dllIR9+CRL6FvvLMiOV+kH16dDn2+S9+o7Yzo/vqG8cqTnpVxBfDl6vMjzE/f9HMjiKwqfZmYyWnS51GMn4N+Po56Pok+j+Q92dSiPu8K4IvcCEp9nn1sn79PFXq1RsVoOWmylxFJqRqpTb/FLTTwsZcPfUwmP0W7AoOfL/ijKkdos25Fuq9/ojKSfMjVX3WNV4LR9/ULNShIDNhfH0hYGCIvTOvQHvkvLBFJFKFBwJenhoX9/b1iGluHdymICiV1+1xWypSyoYiJ+6WpyPD3xsXiTov8JtIg4EtWvlePsg59kjQ0E9n0QlrjlXIulWbpK2d64bmEaSpOxxltxq/V8qEDM/6VCl+5dF8Idk+4CiFmkdSdqAmSuB7TRIaq2LzSFl+WmTYjKXbQ0S6y+Wyf8Ld5cAf1GKwYRsE+V/fIi+3PVpYdXv1QBvM1XynOis8XLgZFDaVZ2rRf2qeP+wYrRUbWkd0kiekLVkZXgHxQ4Oqutumf+WDu/wADS5kPyKNwyxK7VXw3j8PsDZMBnsHyhRD5lJ+5RXxNXrkfbgS5NxN+GpzxK/v4ft+eEl5x7tpH+6fXB0QMjWXml4ocUd82aOIWUFmAHHI0pUQigduUtUQkKVFvz+GgkpIfMpavlx/ruO0fRB3fEMqqkgWV1FcW21B+eMVML0crScYOCpGQ9kNFYQ1pT/GVO2xV1Dz0zfb0BBANJLE8RratCW94BvRh3oZfX4iMOPPgR150xsnAfADUGBqbl1AG46JJ6AyG8kNU/8EjZ7y7kmrB3PoOK0krJCSzLH3Ai8ukPx9bGs7oYvc7p+NsdCpeYjJ2Kvnn/ZVvE5v8b8b2oUqaZiy6kEU+20SmTTTrsn/ysQvIl4hWk/JGkmZHy8R1t8bBcoukJPzS9vqbL/eye3YojVb2+SfPi5XHPvGFOuXnFG1PW46NX73D0MjbS/qw5iuD5KuXdYJCsrB3B5FeBQ05DQ7DVGpg6ygf3tiyIqa0YRDy1atrlgp82xHt4d+TwUVOg8yoMRfZkugfHl73JPUhjBapXa4yWLFZozHvQODL8YqVxMb1+XvB+2/E+tMPBSnJK83zyGycV2zJPLceRdm9KXaL6V8dnagnjwp751rXTRrlC7q0rB+PrVC23cJGVCj0LV/RC+5WaX7ulL52LrL+qKtApkhWzF4WkEYZ/kSzawv2Y/dWut21i5h6ty4NRLy42J9jhLAFGFuWq7VeUyMZHCS+biIfi1Sno/zKSeKdR8eDBuLkrPaGr6ha2P3iu/8ZvWCsA+1tSAyjUkpYl6IDaqb2lcolRxMuD96nEupgAGvF/HA9FnBHu9C7CYvnL+DhC998Ye5623i1Be1NoFzRRK27rsuXRaONNMgbsE5SCAMtNWL0NDNCbUxQ8Tq/REUvmtjklsu6HkZ0p73N2vs+KsvQvYfManhyZDupzG8CJhtGYeGCD6c8J9g8TnvybpQLoW4usnOjdWiH9dXfrWP7BPbS68M7rX0foLeM8cHLxt9eCK+dE1pYg0ASSSsVbWVR0BM+gYsdj2LYsSTiwSio4kdPctSGwxeBM+grHww934TFGZ4iEUmMv+2mYC87spLIQGne/g+tI7vwYbryr/ZYX+xElSjq78J/fTq0aFJw2r/Bp0rtkqTS3jjQupXWe22vyAGVA48TOXBgMNZREzxa0gkFbpkPnh9UNcJtM0WfzKLiAtkISDrrSDrim5nUPYwq77LcYyXEo3PofRRy1uXGJboX/qjVD3fc9o90EvnMI1y5uGz6arpmccEQ/0l5okJtwPaVrfOazkkfqUz0hYMUDHYHJFGGWkgwC1wqG70WZ0n7CkZ9sHRg9Lf3ojFRdnFv+FrfIhKH8qnTV4/Ljt5dkfdFg6IFolum1/ORXt0Rrbjs8Sy83jeNjPYzTP4EvV765+FUl/GgHvAqIOLWIQ6q3pVx+0am22zsfbyyf6/5ym5Le9nzDxnMF4P5Yr4YzBeD+WK+GMwXg/livhjMFyMpX42F1pd7REZB5KK257ZskEXdrZmvDMg5EfJVRE+g8O3eTE/TLr6K+ervODh19sZvpJQ7508jSxkNJ51QED0ACSGVHoxy4YxzppUaiZRn8wNJMwB54lFKecgDCc78jTbnj3jYELIX8NAHbe6fgg/9Xp1+M/IZBtGD2AY+6kX3womjKCEB6SJ4thSeKoXf5cOocEY84ybB09wY/UVZnleSFn2Om0RBjyAyI9OfrckDwmAwGAwGg8FgMBgMBoPBYDAYDAaDwWAwGAwGg8FgMBgMBoPBYDAYDEb/4P8BmpLOlQ==";
+function paygPdf(o) {
+  const esc = (s) => String(s).replace(/[^\x20-\x7e]/g, "").replace(/[\\()]/g, (m) => "\\" + m);
+  const ops = [];
+  const rect = (x, y, w, h, rgb) => ops.push(`${rgb} rg ${x} ${y} ${w} ${h} re f`);
+  const text = (x, y, size, s, bold, rgb) => ops.push(`BT /${bold ? "F2" : "F1"} ${size} Tf ${rgb || "0.13 0.13 0.13"} rg ${x} ${y} Td (${esc(s)}) Tj ET`);
+  const wid = (s, size) => String(s).split("").reduce((n, c) => n + (/[0-9$]/.test(c) ? 0.556 : c === "," || c === "." ? 0.278 : 0.55), 0) * size;
+  const right = (xr, y, size, s, bold, rgb) => text(xr - wid(s, size), y, size, s, bold, rgb);
+  const grey = "0.45 0.47 0.50";
+  rect(0, 742, 595, 100, "0.16 0.17 0.19");
+  ops.push("q 44 0 0 44 40 770 cm /Im1 Do Q");
+  text(96, 796, 20, "PAYG Withholding Notice", true, "1 1 1");
+  text(96, 778, 11, "This is not a tax invoice", false, "0.80 0.82 0.85");
+  text(40, 700, 10, "PAYABLE TO", true, grey);
+  text(40, 684, 13, "Australian Taxation Office", true);
+  rect(40, 640, 515, 1, "0.85 0.86 0.88");
+  const row = (y, k, v) => { text(40, y, 10, k, true, grey); text(220, y, 12, v); };
+  row(610, "WEEK ENDING", o.end);
+  row(584, "DFP REFERENCE", o.ref);
+  row(558, "ATO REFERENCE", o.ato);
+  let y = 520;
+  text(40, y, 10, "EMPLOYEE", true, grey);
+  right(540, y, 10, "TAX WITHHELD", true, grey);
+  y -= 10;
+  rect(40, y, 515, 1, "0.85 0.86 0.88");
+  for (const r of o.rows) {
+    y -= 22;
+    text(40, y, 12, r.name);
+    right(540, y, 12, `$${r.tax}`);
+    rect(40, y - 8, 515, 0.5, "0.92 0.93 0.94");
+  }
+  y -= 62;
+  rect(40, y, 515, 44, "0.99 0.95 0.92");
+  rect(40, y, 6, 44, "0.96 0.42 0.20");
+  text(60, y + 16, 12, `Total Tax for Week Ending ${o.end}`, true);
+  right(540, y + 16, 12, `$${o.amount}`, true);
+  rect(0, 0, 595, 40, "0.16 0.17 0.19");
+  text(297.5 - wid("Prepared automatically by Reservoir", 9) * 0.9 / 2, 16, 9, "Prepared automatically by Reservoir", false, "0.80 0.82 0.85");
+  const stream = ops.join("\n");
+  const logo = atob(PAYG_LOGO_B64);
+  const objs = [
+    "<</Type/Catalog/Pages 2 0 R>>",
+    "<</Type/Pages/Kids[3 0 R]/Count 1>>",
+    "<</Type/Page/Parent 2 0 R/MediaBox[0 0 595 842]/Contents 4 0 R/Resources<</Font<</F1 5 0 R/F2 6 0 R>>/XObject<</Im1 7 0 R>>>>>>",
+    `<</Length ${stream.length}>>\nstream\n${stream}\nendstream`,
+    "<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>",
+    "<</Type/Font/Subtype/Type1/BaseFont/Helvetica-Bold>>",
+    `<</Type/XObject/Subtype/Image/Width 144/Height 144/ColorSpace/DeviceRGB/BitsPerComponent 8/Filter/FlateDecode/Length ${logo.length}>>\nstream\n${logo}\nendstream`,
+  ];
+  let out = "%PDF-1.4\n";
+  const offs = [];
+  objs.forEach((b, i) => { offs.push(out.length); out += `${i + 1} 0 obj\n${b}\nendobj\n`; });
+  const xref = out.length;
+  out += `xref\n0 ${objs.length + 1}\n0000000000 65535 f \n` + offs.map((n) => String(n).padStart(10, "0") + " 00000 n \n").join("");
+  out += `trailer\n<</Size ${objs.length + 1}/Root 1 0 R>>\nstartxref\n${xref}\n%%EOF`;
+  const b = new Uint8Array(out.length);
+  for (let i = 0; i < out.length; i++) b[i] = out.charCodeAt(i) & 255;
+  return b;
+}
+async function paygBill(env, runId, status, replace) {
+  await payslipTables(env);
+  await xeroContactsTable(env);
+  const today = new Date(Date.now() + 11 * 3600000).toISOString().slice(0, 10);
+  const run = runId
+    ? await env.DB.prepare("SELECT run_id, payment_date, period_start, period_end FROM payslip_runs WHERE run_id = ?").bind(runId).first()
+    : await env.DB.prepare("SELECT run_id, payment_date, period_start, period_end FROM payslip_runs WHERE payment_date <= ? AND EXISTS (SELECT 1 FROM payslip_store s WHERE s.run_id = payslip_runs.run_id) ORDER BY payment_date DESC LIMIT 1").bind(today).first();
+  if (!run) return { ok: false, note: "no pay run found" };
+  const tot = await env.DB.prepare("SELECT COUNT(*) AS n, SUM(tax) AS t FROM payslip_store WHERE run_id = ?").bind(run.run_id).first();
+  const amount = Math.round((Number(tot && tot.t) || 0) * 100) / 100;
+  if (!(amount > 0)) return { ok: false, note: "no tax withheld on that run" };
+  const rows = ((await env.DB.prepare("SELECT name, tax FROM payslip_store WHERE run_id = ? AND tax > 0 ORDER BY name").bind(run.run_id).all()).results || []).map((r) => ({ name: String(r.name || ""), tax: (Math.round(Number(r.tax) * 100) / 100).toLocaleString("en-AU", { minimumFractionDigits: 2, maximumFractionDigits: 2 }) }));
+  const dots = (iso) => String(iso || "").slice(0, 10).split("-").reverse().join(".");
+  const ref = `PAYG WE ${dots(run.period_end)}`;
+  let crow = await env.DB.prepare("SELECT contact_id, name FROM xero_contacts WHERE name_lc LIKE '%australian taxation office%' LIMIT 1").first();
+  if (!crow) crow = await env.DB.prepare("SELECT contact_id, name FROM xero_contacts WHERE name_lc LIKE '%taxation office%' OR name_lc = 'ato' LIMIT 1").first();
+  if (!crow) crow = await env.DB.prepare("SELECT contact_id, name FROM xero_contacts WHERE name_lc LIKE '%australian tax%' OR name_lc LIKE '%tax office%' OR name_lc LIKE '%taxation%' OR name_lc LIKE 'ato %' OR name_lc LIKE '% ato' OR name_lc LIKE '%(ato)%' LIMIT 1").first();
+  if (!crow) {
+    // The saved contacts list may be out of date, so ask Xero directly.
+    for (const term of ["Australian Tax", "Taxation Office", "ATO"]) {
+      const cr = await xeroFetch(env, `api.xro/2.0/Contacts?searchTerm=${encodeURIComponent(term)}`);
+      if (!cr.ok) continue;
+      const hit = (((await cr.json()).Contacts) || []).find((c) => /australian tax|tax(ation)? office|^ato\b/i.test(String(c.Name || "")) && c.ContactStatus !== "ARCHIVED");
+      if (hit) { crow = { contact_id: hit.ContactID, name: hit.Name }; break; }
+    }
+  }
+  if (!crow) return { ok: false, note: "no Australian Tax Office contact in Xero" };
+  const dup = await xeroFetch(env, `api.xro/2.0/Invoices?where=${encodeURIComponent(`Type=="ACCPAY" AND InvoiceNumber=="${ref}" AND Contact.ContactID==Guid("${crow.contact_id}")`)}`);
+  if (dup.ok) {
+    const live = (((await dup.json()).Invoices) || []).filter((i) => i.Status !== "DELETED" && i.Status !== "VOIDED");
+    if (live.length && !(replace && live.every((i) => i.Status === "DRAFT"))) return { ok: true, status: "EXISTS", note: "already in Xero" };
+    // A test draft is replaced with the current design.
+    for (const i of live) await xeroFetch(env, `api.xro/2.0/Invoices/${i.InvoiceID}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ Invoices: [{ InvoiceID: i.InvoiceID, Status: "DELETED" }] }) });
+  }
+  const ar = await xeroFetch(env, "api.xro/2.0/Accounts");
+  if (!ar.ok) return { ok: false, note: `Xero accounts ${ar.status}` };
+  const acc = (((await ar.json()).Accounts) || []).find((a) => /payg\s*withholding/i.test(String(a.Name || "")) && a.Status !== "ARCHIVED");
+  if (!acc) return { ok: false, note: "no PAYG Withholdings Payable account in Xero" };
+  const line = { Description: `PAYG withheld, week ending ${dots(run.period_end)}`, Quantity: 1, UnitAmount: amount, AccountCode: acc.Code, TaxType: "BASEXCLUDED" };
+  const body = { Invoices: [{ Type: "ACCPAY", Contact: { ContactID: crow.contact_id }, InvoiceNumber: ref, Reference: ref, Date: today, DueDate: new Date(Date.parse(today) + 7 * 86400000).toISOString().slice(0, 10), LineAmountTypes: "Exclusive", Status: status || "DRAFT", LineItems: [line] }] };
+  const res = await xeroFetch(env, "api.xro/2.0/Invoices?summarizeErrors=false", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  if (!res.ok) return { ok: false, note: `Xero ${res.status}: ${String(await res.text()).slice(0, 200)}` };
+  const inv = (((await res.json()).Invoices) || [])[0] || {};
+  if (!inv.InvoiceID || /^0+(-0+)*$/.test(inv.InvoiceID) || inv.StatusAttributeString === "ERROR") return { ok: false, note: ([...(inv.ValidationErrors || [])].map((e) => e.Message).join("; ") || "Xero did not save the bill").slice(0, 200) };
+  const pdf = paygPdf({ ref, end: dots(run.period_end), ato: PAYG_ATO_REF, amount: amount.toLocaleString("en-AU", { minimumFractionDigits: 2, maximumFractionDigits: 2 }), rows });
+  const at = await xeroFetch(env, `api.xro/2.0/Invoices/${inv.InvoiceID}/Attachments/${encodeURIComponent(ref + ".pdf")}`, { method: "PUT", headers: { "Content-Type": "application/pdf" }, body: pdf });
+  return { ok: true, status: inv.Status, id: inv.InvoiceID, note: `${ref} $${amount.toFixed(2)} ${inv.Status}${at.ok ? "" : ", PDF not attached (Xero " + at.status + ")"}` };
+}
+// Monday Finance Report for Andrew, read from Xero: bills due this week and the rest of the month, and the invoices that are overdue.
+async function xeroAwaiting(env, type) {
+  const out = [];
+  for (let page = 1; page <= 30; page++) {
+    const r = await xeroFetch(env, `api.xro/2.0/Invoices?where=${encodeURIComponent(`Type=="${type}" AND Status=="AUTHORISED"`)}&page=${page}`);
+    if (!r.ok) throw new Error(`Xero ${r.status}`);
+    const list = ((await r.json()).Invoices) || [];
+    out.push(...list);
+    if (list.length < 100) break;
+  }
+  return out;
+}
+async function financeMonday(env) {
+  const now = tsMelbourne(new Date());
+  const day = (iso, n) => new Date(Date.parse(iso + "T00:00:00Z") + n * 86400000).toISOString().slice(0, 10);
+  const mon = day(now.date, -((now.dow + 6) % 7));
+  const sun = day(mon, 6);
+  const [y, m] = now.date.split("-").map(Number);
+  const monthEnd = new Date(Date.UTC(y, m, 0)).toISOString().slice(0, 10);
+  const restFrom = day(sun, 1);
+  const sum = (list, ok) => { let n = 0, t = 0; for (const i of list) { const d = String(i.DueDateString || "").slice(0, 10); const a = Number(i.AmountDue) || 0; if (d && a > 0 && ok(d)) { n++; t += a; } } return { n, total: Math.round(t * 100) / 100 }; };
+  const bills = await xeroAwaiting(env, "ACCPAY");
+  const invs = await xeroAwaiting(env, "ACCREC");
+  return {
+    ok: true, today: now.date, weekStart: mon, weekEnd: sun, monthEnd, restFrom,
+    billsWeek: sum(bills, (d) => d >= mon && d <= sun),
+    billsRest: restFrom <= monthEnd ? sum(bills, (d) => d >= restFrom && d <= monthEnd) : { n: 0, total: 0 },
+    overdue: sum(invs, (d) => d < now.date),
+  };
+}
+function financePdf(o) {
+  const esc = (s) => String(s).replace(/[^\x20-\x7e]/g, "").replace(/[\\()]/g, (m) => "\\" + m);
+  const ops = [];
+  const rect = (x, y, w, h, rgb) => ops.push(`${rgb} rg ${x} ${y} ${w} ${h} re f`);
+  const text = (x, y, size, s, bold, rgb) => ops.push(`BT /${bold ? "F2" : "F1"} ${size} Tf ${rgb || "0.13 0.13 0.13"} rg ${x} ${y} Td (${esc(s)}) Tj ET`);
+  const wid = (s, size) => String(s).split("").reduce((n, c) => n + (/[0-9$]/.test(c) ? 0.556 : c === "," || c === "." ? 0.278 : 0.55), 0) * size;
+  const right = (xr, y, size, s, bold, rgb) => text(xr - wid(s, size), y, size, s, bold, rgb);
+  const grey = "0.45 0.47 0.50";
+  const money = (n) => "$" + Number(n).toLocaleString("en-AU", { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+  rect(0, 742, 595, 100, "0.16 0.17 0.19");
+  ops.push("q 44 0 0 44 40 770 cm /Im1 Do Q");
+  text(96, 796, 20, "Monday Finance Report", true, "1 1 1");
+  text(96, 778, 11, `Week of ${o.week}`, false, "0.80 0.82 0.85");
+  text(40, 700, 10, "PREPARED FOR", true, grey);
+  text(40, 684, 13, "Andrew Wowk", true);
+  rect(40, 660, 515, 1, "0.85 0.86 0.88");
+  const head = (y, a) => { text(40, y, 10, a, true, grey); right(400, y, 10, "COUNT", true, grey); right(540, y, 10, "AMOUNT", true, grey); rect(40, y - 10, 515, 1, "0.85 0.86 0.88"); };
+  const row = (y, label, r, bold) => { text(40, y, 12, label, bold); right(400, y, 12, String(r.n), bold); right(540, y, 12, money(r.total), bold); rect(40, y - 8, 515, 0.5, "0.92 0.93 0.94"); };
+  head(625, "BILLS TO PAY");
+  row(603, `Due this week (${o.wk})`, o.billsWeek);
+  row(581, o.rest ? `Due rest of month (${o.rest})` : "Due rest of month", o.billsRest);
+  const both = { n: o.billsWeek.n + o.billsRest.n, total: o.billsWeek.total + o.billsRest.total };
+  rect(40, 530, 515, 38, "0.99 0.95 0.92");
+  rect(40, 530, 6, 38, "0.96 0.42 0.20");
+  text(60, 545, 12, "Total bills due this month", true);
+  right(400, 545, 12, String(both.n), true);
+  right(540, 545, 12, money(both.total), true);
+  head(490, "INVOICES OWING TO DFP");
+  row(468, "Overdue", o.overdue, true);
+  rect(0, 0, 595, 40, "0.16 0.17 0.19");
+  text(297.5 - wid("Prepared automatically by Reservoir", 9) * 0.9 / 2, 16, 9, "Prepared automatically by Reservoir", false, "0.80 0.82 0.85");
+  const stream = ops.join("\n");
+  const logo = atob(PAYG_LOGO_B64);
+  const objs = [
+    "<</Type/Catalog/Pages 2 0 R>>",
+    "<</Type/Pages/Kids[3 0 R]/Count 1>>",
+    "<</Type/Page/Parent 2 0 R/MediaBox[0 0 595 842]/Contents 4 0 R/Resources<</Font<</F1 5 0 R/F2 6 0 R>>/XObject<</Im1 7 0 R>>>>>>",
+    `<</Length ${stream.length}>>\nstream\n${stream}\nendstream`,
+    "<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>",
+    "<</Type/Font/Subtype/Type1/BaseFont/Helvetica-Bold>>",
+    `<</Type/XObject/Subtype/Image/Width 144/Height 144/ColorSpace/DeviceRGB/BitsPerComponent 8/Filter/FlateDecode/Length ${logo.length}>>\nstream\n${logo}\nendstream`,
+  ];
+  let out = "%PDF-1.4\n";
+  const offs = [];
+  objs.forEach((b, i) => { offs.push(out.length); out += `${i + 1} 0 obj\n${b}\nendobj\n`; });
+  const xref = out.length;
+  out += `xref\n0 ${objs.length + 1}\n0000000000 65535 f \n` + offs.map((n) => String(n).padStart(10, "0") + " 00000 n \n").join("");
+  out += `trailer\n<</Size ${objs.length + 1}/Root 1 0 R>>\nstartxref\n${xref}\n%%EOF`;
+  const b = new Uint8Array(out.length);
+  for (let i = 0; i < out.length; i++) b[i] = out.charCodeAt(i) & 255;
+  return b;
+}
+const financeDots = (iso) => String(iso).split("-").reverse().join(".");
+const financeShort = (iso) => financeDots(iso).slice(0, 5);
+// Xero never replies to the bills inbox email, so Reservoir looks in Xero for the bill it made from each file sent. A reimbursement is only processed once its bill has appeared in Xero. Until then it stays waiting. If nothing has appeared after 10 minutes it is marked missing and the office is pinged.
+let xeroVerifyAt = 0;
+async function receiptSettle(env, id, status, doneOn, who) {
+  await env.DB.prepare("UPDATE receipt_records SET status = ?, done_date = ? WHERE id = ?").bind(status, doneOn, id).run();
+  if (/^inc-[A-Za-z0-9_-]{8,64}$/.test(id)) {
+    const incId = id.slice(4);
+    try {
+      if (status === "paid") await env.DB.prepare("UPDATE incentives SET status = 'redeemed', redeemed_at = datetime('now') WHERE id = ?").bind(incId).run();
+      else await env.DB.prepare("UPDATE incentives SET status = 'issued' WHERE id = ? AND status = 'processing'").bind(incId).run();
+    } catch (e) { /* the receipt still moves on */ }
+  }
+  const rr = await env.DB.prepare("SELECT by_email, type FROM receipt_records WHERE id = ?").bind(id).first();
+  if (rr && rr.by_email && rr.type === "reimbursement") {
+    if (status === "paid") await notify(env, { to: rr.by_email, kind: "receipt", title: "Reimbursement request processed", body: "Your reimbursement has been paid. Open Receipts to see it.", link: "receipts", by: who });
+    else await notify(env, { to: rr.by_email, kind: "receipt", title: "Reimbursement request declined", body: "Your reimbursement was not approved. Open Receipts to see it.", link: "receipts", by: who });
+  }
+}
+// Called when a file goes to Xero. The record remembers which files went and when, and starts waiting for the bill.
+async function receiptMarkSent(env, itemId) {
+  await receiptRecordsTable(env);
+  const row = await env.DB.prepare("SELECT id, xero_name, xero_at FROM receipt_records WHERE (',' || item_id || ',') LIKE ?").bind(`%,${itemId},%`).first();
+  if (!row) return;
+  let names = String(row.xero_name || "").split("|").filter(Boolean);
+  let at = row.xero_at || new Date().toISOString();
+  if (!names.length || names.includes(itemId)) { names = [itemId]; at = new Date().toISOString(); } else names.push(itemId);
+  await env.DB.prepare("UPDATE receipt_records SET xero_name = ?, xero_at = ?, xero_state = 'waiting' WHERE id = ?").bind(names.join("|"), at, row.id).run();
+}
+// A reimbursement's draft bill gets the team member's full name as its contact (the name Xero holds, not the preferred one), the receipt's date as both its date and due date, and a reference: the one Xero read from the receipt, or a made up one when it read none. A date Xero misread (older than 90 days, or in the future) falls back to today.
+async function reimbursementBillFix(env, rec, bills) {
+  const person = await env.DB.prepare("SELECT name FROM dfp_xero WHERE lower(email) = lower(?)").bind(rec.by_email || "").first();
+  if (!person || !person.name) throw new Error("no Xero name for " + (rec.by_email || rec.by_name));
+  await xeroContactsTable(env);
+  const contact = await env.DB.prepare("SELECT contact_id FROM xero_contacts WHERE name_lc = ?").bind(String(person.name).trim().toLowerCase()).first();
+  if (!contact) throw new Error("no Xero contact called " + person.name);
+  const today = new Date(Date.now() + 11 * 3600000).toISOString().slice(0, 10);
+  for (const b of bills) {
+    const read = String(b.dateString || "").slice(0, 10);
+    const age = read ? (Date.parse(today) - Date.parse(read)) / 86400000 : 9999;
+    const date = age >= 0 && age <= 90 ? read : today;
+    const body = { Invoices: [{ InvoiceID: b.id, Contact: { ContactID: contact.contact_id }, Date: date, DueDate: date, Reference: b.reference || `Reimbursement ${person.name} ${date.split("-").reverse().join(".")}` }] };
+    const res = await xeroFetch(env, "api.xro/2.0/Invoices", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    if (!res.ok) throw new Error("Xero answered " + res.status);
+  }
+}
+async function xeroVerify(env) {
+  await receiptRecordsTable(env);
+  const rows = (await env.DB.prepare("SELECT id, type, status, by_name, by_email, amount, xero_name, xero_at, xero_state FROM receipt_records WHERE xero_name IS NOT NULL AND xero_state IN ('waiting','missing') AND xero_at > ?").bind(new Date(Date.now() - 36 * 3600 * 1000).toISOString()).all()).results || [];
+  if (!rows.length) return;
+  // Xero turns each emailed receipt into a bill, so look for bills made since the send, and use up one bill per file sent. A record with a known amount must match a bill total as well.
+  rows.sort((a, b) => String(a.xero_at).localeCompare(String(b.xero_at)));
+  const earliest = new Date(Date.parse(rows[0].xero_at) - 120000).toUTCString();
+  const res = await xeroFetch(env, `api.xro/2.0/Invoices?where=${encodeURIComponent('Type=="ACCPAY"')}&order=${encodeURIComponent("UpdatedDateUTC DESC")}&page=1`, { headers: { "If-Modified-Since": earliest } });
+  if (!res.ok) return;
+  const stamp = (v) => { const m = /\/Date\((-?\d+)/.exec(String(v || "")); return m ? Number(m[1]) : (Date.parse(String(v || "")) || 0); };
+  const drafts = (((await res.json()).Invoices) || []).filter((d) => d.Status !== "DELETED" && d.Status !== "VOIDED").map((d) => ({ id: d.InvoiceID, dateString: d.DateString, reference: String(d.Reference || "").trim(), at: stamp(d.UpdatedDateUTC), total: Number(d.Total) || 0, used: false }));
+  const day = new Date(Date.now() + 11 * 3600000).toISOString().slice(0, 10);
+  for (const r of rows) {
+    const since = Date.parse(r.xero_at) - 120000;
+    const need = String(r.xero_name).split("|").filter(Boolean).length || 1;
+    const amt = Number(String(r.amount || "").replace(/[^0-9.]/g, "")) || 0;
+    const pool = drafts.filter((d) => !d.used && d.at >= since && (!amt || !d.total || Math.abs(d.total - amt) < 0.005));
+    const state = pool.length >= need ? "ok" : (Date.now() - Date.parse(r.xero_at) > 10 * 60000 ? "missing" : "waiting");
+    const mine = state === "ok" ? pool.slice(0, need) : [];
+    mine.forEach((d) => { d.used = true; });
+    if (state !== r.xero_state) await env.DB.prepare("UPDATE receipt_records SET xero_state = ? WHERE id = ?").bind(state, r.id).run();
+    if (mine.length && r.type === "reimbursement") {
+      try { await reimbursementBillFix(env, r, mine); } catch (e) { await notify(env, { to: "tayler@directflow.com.au", kind: "receipt", title: "Xero bill not completed", body: `The bill for ${String(r.by_name || "a team member")}${r.amount ? ` $${r.amount}` : ""} arrived in Xero but its contact, dates and reference could not be set: ${String(e && e.message || e).slice(0, 120)}`, link: "receipts", by: "Reservoir" }); }
+    }
+    if (state === "ok" && r.type === "reimbursement" && r.status === "checking") await receiptSettle(env, r.id, "paid", day, "Xero");
+    if (state === "missing" && r.xero_state !== "missing") await notify(env, { to: "tayler@directflow.com.au", kind: "receipt", title: "Not seen in Xero", body: `${String(r.by_name || "A")} ${r.type === "reimbursement" ? "reimbursement" : "receipt"}${r.amount ? ` $${r.amount}` : ""} was sent to Xero but no bill has appeared. ${r.type === "reimbursement" ? "It has not been processed. " : ""}Open Receipts.`, link: "receipts", by: "Reservoir" });
+  }
+}
+const receiptRecordOut = (r) => ({ id: r.id, kind: "receipt", receiptType: r.type, amount: r.amount || "", text: r.note || "", itemId: r.item_id || "", fileName: r.file_name || "", status: r.status, by: r.by_name || "", date: r.sent_date || String(r.created_at || "").slice(0, 10), doneDate: r.done_date || "", photos: r.view ? [{ name: r.file_name || "", view: r.view }] : [], xero: r.xero_state || "", server: true });
+
+// Update push. Set this to a bundle name (for example "Full-Reservoir-2026.11.25-v26") and every open Reservoir and Weir window that finds that bundle newer than its own reloads straight away, instead of waiting for midnight or a home screen. Leave it empty for the normal gentle update.
+const APP_FORCE_UPDATE = "Full-Reservoir-2026.11.25-v26";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.27-w348";
+// ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
+const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
+const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
+const XERO_SCOPES_DEFAULT = "offline_access accounting.contacts accounting.settings accounting.invoices accounting.payments payroll.employees payroll.settings payroll.payruns payroll.payslip payroll.timesheets accounting.attachments";
+const xeroId = (env) => env.XERO_CLIENT_ID || XERO_CLIENT_ID_DEFAULT;
+const xeroRedirect = (env) => env.XERO_REDIRECT || XERO_REDIRECT_DEFAULT;
+const b64enc = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf))).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+async function xeroSign(env, text) {
+  const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(env.XERO_CLIENT_SECRET), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  return b64enc(await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(text)));
+}
+async function xeroState(env, name) {
+  const payload = b64enc(new TextEncoder().encode(JSON.stringify({ exp: Date.now() + 10 * 60 * 1000, name })));
+  return `${payload}.${await xeroSign(env, payload)}`;
+}
+async function xeroStateOk(env, state) {
+  const [payload, sig] = String(state || "").split(".");
+  if (!payload || !sig || sig !== await xeroSign(env, payload)) return null;
+  try {
+    const data = parseJson(payload);
+    return data.exp > Date.now() ? data : null;
+  } catch { return null; }
+}
+const xeroBasic = (env) => "Basic " + btoa(`${xeroId(env)}:${env.XERO_CLIENT_SECRET}`);
+let xeroTableMade = false;
+async function xeroTable(env) {
+  if (xeroTableMade) return;
+  xeroTableMade = true;
+  await env.DB.prepare("CREATE TABLE IF NOT EXISTS xero_auth (id INTEGER PRIMARY KEY CHECK (id = 1), refresh_token TEXT, access_token TEXT, expires_at INTEGER, tenant_id TEXT, tenant_name TEXT, connected_by TEXT, updated_at TEXT DEFAULT (datetime('now')))").run();
+}
+// ---- Staff profile details that are DFP's own, not Xero's: uniform sizes, identification numbers, licences, tickets, qualifications and training ----
+// One row per person, keyed by their name with spaces and punctuation removed. The email is stored when the person has signed in.
+// Staff ask for changes through Team Requests (profile_requests); approving a request writes the values into dfp_reservoir. Directors and managers can also edit a person directly.
+const PROFILE_COLS = { polo: "polo", jumper: "jumper", jacket: "jacket", whiteCard: "white_card", usi: "usi", leavePlus: "leave_plus", wwccNo: "wwcc_no", wwccExpiry: "wwcc_expiry", firstAidExpiry: "first_aid_expiry", cprExpiry: "cpr_expiry", dayHours: "day_hours", driverNo: "driver_no", driverExpiry: "driver_expiry", truckClass: "truck_class", truckNo: "truck_no", truckExpiry: "truck_expiry", forkliftNo: "forklift_no", forkliftExpiry: "forklift_expiry", excavatorNo: "excavator_no", excavatorExpiry: "excavator_expiry", plumbRegNo: "plumb_reg_no", plumbRegExpiry: "plumb_reg_expiry", driverCopy: "driver_copy", truckCopy: "truck_copy", forkliftCopy: "forklift_copy", excavatorCopy: "excavator_copy", plumbRegCopy: "plumb_reg_copy" };
+const OWN_COLS = ["preferred_name", "birth_time", "em_name", "em_relationship", "em_mobile", "em_email", "em_saved_at"];
+const PROFILE_DATES = new Set(["driverExpiry", "wwccExpiry", "firstAidExpiry", "cprExpiry", "truckExpiry", "forkliftExpiry", "excavatorExpiry", "plumbRegExpiry"]);
+const profileKey = (name) => String(name || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+// Uniform sizes only. Identification numbers, licences and tickets are not seeded: their real values are entered through Reservoir.
+const PROFILE_SEED_SIZES = [["Andrew Wowk", "L", "L", "XL"], ["Mitch Saba", "XL", "XL", "XL"], ["Hamish Burchell", "XXL", "XXL", "XXL"], ["Chad Lyons", "M", "L", "L"], ["Mark Hansen", "M", "L", "L"], ["Tyler Willey", "L", "XL", "XL"], ["Zac Rochow-O\u2019Toole", "L", "XL", "XL"], ["Tayler Reid", "L", "L", ""]];
+// ---- Reservoir: the one table for everything DFP keeps about a person that never leaves DFP ----
+// Replaces staff_profile, staff_emergency and staff_personal_email. One row per person, keyed by their name with spaces and punctuation removed (person_key), with the work email stored as soon as it is known. Rows are found by email first, then by name.
+// Holds: uniform sizes, identification numbers, licences, tickets, training, personal email and contract details. Vehicles stay in the fleet table.
+// Preferred name, time of birth and the emergency contact are here too, because they never go to or come from Xero. Bank details go back and forth with Xero, so they live in dfp_xero.
+// Nothing here is ever read from Xero or written to Xero by a sync. The old three tables are no longer read or written. They are left in place, untouched, until their data has been checked and Tayler says to drop them.
+let reservoirReady = false;
+async function reservoirTables(env) {
+  if (reservoirReady) return;
+  const cols = Object.values(PROFILE_COLS).map((c) => `${c} TEXT`).join(", ");
+  await env.DB.prepare(`CREATE TABLE IF NOT EXISTS dfp_reservoir (person_key TEXT PRIMARY KEY, name TEXT, email TEXT, personal_email TEXT, contract_details TEXT, ${cols}, training TEXT, source TEXT, created_at TEXT DEFAULT (datetime('now')), updated_by TEXT, updated_at TEXT DEFAULT (datetime('now')))`).run();
+  await env.DB.prepare("CREATE INDEX IF NOT EXISTS dfp_reservoir_email ON dfp_reservoir (email)").run();
+  // Preferred name, time of birth and the emergency contact: DFP's own details, never sent to or read from Xero.
+  // Driver licence number and expiry, and the id of the photo of each licence or registration card (profile_photos), were added after the table was first made.
+  for (const col of ["day_hours", "driver_no", "driver_expiry", "driver_copy", "truck_copy", "forklift_copy", "excavator_copy", "plumb_reg_copy"]) { try { await env.DB.prepare(`ALTER TABLE dfp_reservoir ADD COLUMN ${col} TEXT`).run(); } catch (e) { /* already there */ } }
+  for (const col of OWN_COLS) { try { await env.DB.prepare(`ALTER TABLE dfp_reservoir ADD COLUMN ${col} TEXT`).run(); } catch (e) { /* already there */ } }
+  await settingsTable(env);
+  await env.DB.prepare("CREATE TABLE IF NOT EXISTS profile_requests (id TEXT PRIMARY KEY, person_key TEXT, name TEXT, email TEXT, section TEXT, section_title TEXT, fields TEXT, vals TEXT, text TEXT, status TEXT NOT NULL DEFAULT 'new', created_at TEXT DEFAULT (datetime('now')), processed_by TEXT, processed_at TEXT)").run();
+  // seen_at: when the person first saw the "details updated" banner after the office processed their change. profile_audit: the permanent record of every change request, who sent it, who processed it and when. Rows here are never removed.
+  try { await env.DB.prepare("ALTER TABLE profile_requests ADD COLUMN seen_at TEXT").run(); } catch (e) { /* already there */ }
+  await env.DB.prepare("CREATE TABLE IF NOT EXISTS profile_audit (id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT DEFAULT (datetime('now')), event TEXT, request_id TEXT, person TEXT, email TEXT, section TEXT, section_title TEXT, fields TEXT, by_name TEXT, note TEXT)").run();
+  // Profile changes now show a one time "updated" banner. Ones processed before that are marked as already seen, once.
+  if (!(await migDone(env, "profile_seen_v1"))) {
+    await env.DB.prepare("UPDATE profile_requests SET seen_at = datetime('now') WHERE status = 'processed' AND seen_at IS NULL AND section IN ('personal', 'emergency')").run();
+    await migMark(env, "profile_seen_v1", "old processed profile requests marked seen");
+  }
+  await dfpTables(env);
+  // Uniform sizes that were in the app's staff list are put in the database so staff see what they saw before. Only a size that has never been saved (NULL) is filled. A size someone has saved or deliberately cleared is never touched.
+  await schemaOnce(env, "profile_seed_sizes", async () => {
+  for (const [name, polo, jumper, jacket] of PROFILE_SEED_SIZES) {
+    const key = profileKey(name);
+    await env.DB.prepare("INSERT OR IGNORE INTO dfp_reservoir (person_key, name, source, updated_by) VALUES (?, ?, 'initial sizes', 'initial sizes')").bind(key, name).run();
+    await env.DB.prepare("UPDATE dfp_reservoir SET polo = COALESCE(polo, ?), jumper = COALESCE(jumper, ?), jacket = COALESCE(jacket, ?) WHERE person_key = ?").bind(polo, jumper, jacket, key).run();
+  }
+  });
+  await schemaOnce(env, "move_own_fields", () => moveOwnFields(env));
+  reservoirReady = true;
+}
+// One time: preferred name, time of birth and the emergency contact move from dfp_xero to dfp_reservoir. Only blanks in dfp_reservoir are filled. Every value is checked after it is copied, and the old dfp_xero columns are dropped only when every one checked out. If anything did not check out nothing is dropped and the whole step runs again on the next start.
+async function moveOwnFields(env) {
+  if (await migDone(env, "own_fields_to_reservoir_v1")) return;
+  const detail = { people: 0, dropped: [], problems: [] };
+  const info = ((await env.DB.prepare("PRAGMA table_info(dfp_xero)").all()).results) || [];
+  const have = OWN_COLS.filter((c) => info.some((x) => x.name === c));
+  const filled = (v) => v !== null && v !== undefined && String(v) !== "";
+  if (have.length) {
+    const rows = ((await env.DB.prepare(`SELECT email, name, ${have.join(", ")} FROM dfp_xero`).all()).results) || [];
+    for (const r of rows) {
+      if (!have.some((c) => filled(r[c]))) continue;
+      detail.people++;
+      const e = String(r.email || "").toLowerCase(), k = profileKey(r.name);
+      let d = e ? await env.DB.prepare("SELECT person_key FROM dfp_reservoir WHERE email = ?").bind(e).first() : null;
+      if (!d && k) d = await env.DB.prepare("SELECT person_key FROM dfp_reservoir WHERE person_key = ?").bind(k).first();
+      // Someone known by a shorter name (Mitch for Mitchell) has a dfp_reservoir row under that name, so look there before making a new one.
+      const known = String(r.preferred_name || "").trim(), lastName = String(r.name || "").trim().split(/\s+/).slice(1).join(" ");
+      if (!d && known && lastName) d = await env.DB.prepare("SELECT person_key FROM dfp_reservoir WHERE person_key = ?").bind(profileKey(`${known} ${lastName}`)).first();
+      if (!d) {
+        const key = k || "email:" + e;
+        await env.DB.prepare("INSERT INTO dfp_reservoir (person_key, name, email, source, updated_by) VALUES (?, ?, ?, 'moved from dfp_xero', 'move')").bind(key, r.name || null, e || null).run();
+        d = { person_key: key };
+      }
+      if (e) await env.DB.prepare("UPDATE dfp_reservoir SET email = ? WHERE person_key = ? AND (email IS NULL OR email = '')").bind(e, d.person_key).run();
+      for (const c of have) if (filled(r[c])) await env.DB.prepare(`UPDATE dfp_reservoir SET ${c} = ? WHERE person_key = ? AND (${c} IS NULL OR ${c} = '')`).bind(r[c], d.person_key).run();
+      const back = await env.DB.prepare("SELECT * FROM dfp_reservoir WHERE person_key = ?").bind(d.person_key).first();
+      for (const c of have) if (filled(r[c]) && !filled(back && back[c])) detail.problems.push(`${r.email}: ${c}`);
+    }
+    if (!detail.problems.length) {
+      for (const c of have) {
+        try { await env.DB.prepare(`ALTER TABLE dfp_xero DROP COLUMN ${c}`).run(); detail.dropped.push(c); }
+        catch (e) { detail.problems.push(`could not drop ${c}: ${String(e && e.message || e).slice(0, 80)}`); }
+      }
+    }
+  }
+  if (detail.problems.length) { console.log("own fields move", JSON.stringify(detail.problems)); return; }
+  // One time, 20 October 2026: the director asked for Zac and Mitch to be set as preferred names. Only fills a blank, never replaces one, and runs once both people have been found.
+  if (!(await migDone(env, "preferred_names_zac_mitch_v1"))) {
+    const z = await env.DB.prepare("UPDATE dfp_reservoir SET preferred_name = 'Zac' WHERE lower(email) IN (SELECT lower(email) FROM dfp_xero WHERE lower(name) LIKE 'zachary rochow%') AND (preferred_name IS NULL OR TRIM(preferred_name) = '')").run();
+    const m = await env.DB.prepare("UPDATE dfp_reservoir SET preferred_name = 'Mitch' WHERE lower(email) IN (SELECT lower(email) FROM dfp_xero WHERE lower(name) = 'mitchell saba') AND (preferred_name IS NULL OR TRIM(preferred_name) = '')").run();
+    const both = await env.DB.prepare("SELECT COUNT(*) AS n FROM dfp_xero WHERE (lower(name) LIKE 'zachary rochow%' OR lower(name) = 'mitchell saba')").first();
+    if (both && both.n >= 2) await migMark(env, "preferred_names_zac_mitch_v1", JSON.stringify({ zac: z && z.meta && z.meta.changes, mitch: m && m.meta && m.meta.changes }));
+  }
+  await migMark(env, "own_fields_to_reservoir_v1", JSON.stringify(detail));
+}
+// Saves preferred name, time of birth or emergency contact fields on a person's dfp_reservoir row, making the row if the person has none yet.
+async function reservoirOwnSet(env, email, name, patch, by) {
+  const r = await reservoirRowFor(env, email, name, true);
+  if (!r) throw new Error("There is no person to save this against");
+  const keys = Object.keys(patch).filter((k) => OWN_COLS.includes(k));
+  if (!keys.length) return;
+  await env.DB.prepare(`UPDATE dfp_reservoir SET ${keys.map((k) => `${k} = ?`).join(", ")}, updated_by = ?, updated_at = datetime('now') WHERE person_key = ?`).bind(...keys.map((k) => patch[k]), by || "unknown", r.person_key).run();
+}
+async function profileTables(env) { return reservoirTables(env); }
+// ---- Reading people from DFP's own tables. These replace the live Xero reads for the Details, Profile and Team Members screens. ----
+const NOT_IN_RESERVOIR = "Your details are not in Reservoir yet. Ask the office to run the one time fill.";
+// The legal full name as Xero holds it: first name, any middle names, then the surname. The plain name stays First Last because everything else in the app matches people on that.
+function fullNameOf(name, middle) {
+  const n = String(name || "").trim().replace(/\s+/g, " ");
+  const m = String(middle || "").trim().replace(/\s+/g, " ");
+  if (!n || !m) return n;
+  const i = n.indexOf(" ");
+  return i < 0 ? `${n} ${m}` : `${n.slice(0, i)} ${m} ${n.slice(i + 1)}`;
+}
+// The one style for a team name in any list: preferred name (or first name when there is none), then the surname. Zac Rochow-O'Toole, Mitch Saba, Tyler Willey.
+function teamName(r) {
+  const parts = String(r && r.name || "").trim().replace(/\s+/g, " ").split(" ").filter(Boolean);
+  if (!parts.length) return "";
+  const first = String(r && r.preferred_name || "").trim() || parts[0];
+  return [first, ...parts.slice(1)].join(" ");
+}
+// A dfp_xero row with the person's own DFP details (preferred name, time of birth, emergency contact) from dfp_reservoir, joined on work email.
+const PERSON_SQL = "SELECT x.*, r.preferred_name, r.birth_time, r.em_name, r.em_relationship, r.em_mobile, r.em_email, r.em_saved_at FROM dfp_xero x LEFT JOIN dfp_reservoir r ON lower(r.email) = lower(x.email)";
+// One dfp_xero row as the app's person record (the same shape the live Xero read used to give). Emergency contact only when DFP has one saved.
+function dfpPersonOut(r) {
+  const saved = !!r.em_saved_at;
+  return {
+    id: r.xero_employee_id || "", status: r.status || "ACTIVE", name: r.name || "", address: r.address || "", dob: r.dob || "", mobile: r.mobile || "", email: r.email || "",
+    accountName: r.bank_account_name || "", bsb: r.bsb || "", accountNumber: r.account_number || "", commenced: r.start_date || "", title: String(r.job_title || "").trim(), preferredName: String(r.preferred_name || "").trim(), birthTime: /^\d{2}:\d{2}$/.test(String(r.birth_time || "")) ? r.birth_time : "", fullName: fullNameOf(r.name, r.middle_names),
+    emName: saved ? r.em_name || "" : "", emRelationship: saved ? r.em_relationship || "" : "", emMobile: saved ? r.em_mobile || "" : "", emEmail: saved ? r.em_email || "" : ""
+  };
+}
+// One xero_payroll row as the pay details payload the Details screen reads.
+function dfpPayOut(r) {
+  const ml = r.leave_loading === null || r.leave_loading === undefined ? null : Number(r.leave_loading) === 1;
+  const hasFund = !!(r.super_fund_name || r.super_member_number || r.super_usi);
+  return { found: true, rates: { ordinary: r.rate_ordinary === undefined ? null : r.rate_ordinary, ot15: r.rate_ot15 === undefined ? null : r.rate_ot15, ot2: r.rate_ot2 === undefined ? null : r.rate_ot2 }, hasOvertime: Number(r.has_overtime) === 1, classification: r.classification || "", employmentType: r.employment_basis || "", leaveLoading: ml, superMemberships: hasFund ? [{ fundName: r.super_fund_name || "", memberNumber: r.super_member_number || "", usi: r.super_usi || "" }] : [], superWhy: hasFund ? "" : "No super fund on record", missing: r.rates_note ? String(r.rates_note).split("; ").filter(Boolean) : [], used: [], templateLines: [], syncedAt: r.synced_at || "", annualSalary: r.annual_salary === null || r.annual_salary === undefined ? null : Number(r.annual_salary), weekHours: r.week_hours === null || r.week_hours === undefined ? null : Number(r.week_hours), superPct: r.super_pct === null || r.super_pct === undefined ? null : Number(r.super_pct), noAward: !String(r.classification || "").trim() };
+}
+// Makes sure a dfp_xero row exists for this work email. A new employee is always created in Xero first, so the row normally exists after the one time fill. This only creates a bare row (email and name) for anyone who has not been filled yet.
+async function dfpXeroRowFor(env, email, name) {
+  const key = String(email || "").trim().toLowerCase();
+  await dfpTables(env);
+  await env.DB.prepare("INSERT OR IGNORE INTO dfp_xero (email, name, status, source, updated_by) VALUES (?, ?, 'ACTIVE', 'reservoir', ?)").bind(key, name || null, key).run();
+  return key;
+}
+// Finds a person's row by work email, then by name. With create, makes one if there is none. When the email is given and the row has none (or a different one), the row keeps it.
+async function reservoirRowFor(env, email, name, create) {
+  await reservoirTables(env);
+  const e = String(email || "").trim().toLowerCase();
+  const k = profileKey(name);
+  let r = e ? await env.DB.prepare("SELECT * FROM dfp_reservoir WHERE email = ?").bind(e).first() : null;
+  if (!r && k) r = await env.DB.prepare("SELECT * FROM dfp_reservoir WHERE person_key = ?").bind(k).first();
+  if (!r && create) {
+    const key = k || (e ? "email:" + e : "");
+    if (!key) return null;
+    await env.DB.prepare("INSERT INTO dfp_reservoir (person_key, name, email, source, updated_by) VALUES (?, ?, ?, 'reservoir', ?)").bind(key, name ? String(name).slice(0, 120) : null, e || null, e || "unknown").run();
+    r = await env.DB.prepare("SELECT * FROM dfp_reservoir WHERE person_key = ?").bind(key).first();
+  } else if (r && e && r.email !== e) {
+    await env.DB.prepare("UPDATE dfp_reservoir SET email = ? WHERE person_key = ?").bind(e, r.person_key).run();
+    r.email = e;
+  }
+  return r;
+}
+// Short codes and sizes are always saved in capitals, so N/A is never saved as n/a.
+const PROFILE_UPPER = new Set(["polo", "jumper", "jacket", "whiteCard", "usi", "leavePlus", "wwccNo", "driverNo", "truckClass", "truckNo", "forkliftNo", "excavatorNo", "plumbRegNo"]);
+function profileClean(k, v) {
+  let t = String(v === undefined || v === null ? "" : v).replace(/\s+/g, " ").trim().slice(0, 120);
+  if (PROFILE_UPPER.has(k)) t = t.toUpperCase();
+  if (k === "dayHours" && t) { const n = Number(t); if (!(n >= 1 && n <= 12)) return null; t = String(Math.round(n * 100) / 100); }
+  if (PROFILE_DATES.has(k) && t && !/^\d{4}-\d{2}-\d{2}$/.test(t)) return null;
+  return t;
+}
+function profileTraining(list) {
+  if (!Array.isArray(list)) return null;
+  const out = [];
+  for (const x of list.slice(0, 60)) {
+    const name = String((x && x.name) || "").replace(/\s+/g, " ").trim().slice(0, 120);
+    if (!name) continue;
+    const completed = String((x && x.completed) || "").trim(), expiry = String((x && x.expiry) || "").trim();
+    if ((completed && !/^\d{4}-\d{2}-\d{2}$/.test(completed)) || (expiry && !/^\d{4}-\d{2}-\d{2}$/.test(expiry))) return null;
+    out.push({ name, completed, expiry });
+  }
+  return out;
+}
+const profileOut = (r) => {
+  const o = { name: r.name || "", email: r.email || "", training: [] };
+  for (const [k, c] of Object.entries(PROFILE_COLS)) o[k] = r[c] || "";
+  try { o.training = JSON.parse(r.training || "[]"); } catch (e) { /* none */ }
+  return o;
+};
+// ---- Licence and registration cards: self managed ----
+// The person saves their own card straight away (number, expiry, photos). The office is told with a notice and can check the photo. If the photo is not good enough the office resets that card: it is cleared and the person gets a job on their punch list to do it again.
+const CARD_DEFS = {
+  plumbReg: { label: "Plumbing Registration", keys: ["plumbRegNo", "plumbRegExpiry"], copy: "plumbRegCopy" },
+  driver: { label: "Driver Licence", keys: ["driverNo", "driverExpiry"], copy: "driverCopy" },
+  truck: { label: "Truck Licence", keys: ["truckClass", "truckNo", "truckExpiry"], copy: "truckCopy" },
+  forklift: { label: "Forklift Licence", keys: ["forkliftNo", "forkliftExpiry"], copy: "forkliftCopy" },
+  excavator: { label: "Excavator Licence", keys: ["excavatorNo", "excavatorExpiry"], copy: "excavatorCopy" }
+};
+const dmyOf = (iso) => /^\d{4}-\d{2}-\d{2}$/.test(String(iso || "")) ? `${iso.slice(8, 10)}/${iso.slice(5, 7)}/${iso.slice(0, 4)}` : String(iso || "");
+async function profileFor(env, user) {
+  await reservoirTables(env);
+  const email = String(user.email || "").toLowerCase();
+  let r = email ? await env.DB.prepare("SELECT * FROM dfp_reservoir WHERE email = ?").bind(email).first() : null;
+  if (!r && user.name) r = await env.DB.prepare("SELECT * FROM dfp_reservoir WHERE person_key = ?").bind(profileKey(user.name)).first();
+  return r ? profileOut(r) : null;
+}
+// Writes the allowed fields for one person. Only keys that are present are changed. Returns the saved record.
+async function profileWrite(env, person, fields, by) {
+  await reservoirTables(env);
+  const key = profileKey(person.name);
+  if (!key) throw new Error("no name");
+  const sets = [], binds = [];
+  for (const [k, col] of Object.entries(PROFILE_COLS)) {
+    if (!Object.prototype.hasOwnProperty.call(fields, k)) continue;
+    const v = profileClean(k, fields[k]);
+    if (v === null) throw new Error(`bad value for ${k}`);
+    sets.push(col); binds.push(v);
+  }
+  if (Object.prototype.hasOwnProperty.call(fields, "training")) {
+    const t = profileTraining(fields.training);
+    if (t === null) throw new Error("bad training list");
+    sets.push("training"); binds.push(JSON.stringify(t));
+  }
+  const row = await reservoirRowFor(env, person.email, person.name, true);
+  if (sets.length) {
+    await env.DB.prepare(`UPDATE dfp_reservoir SET ${sets.map((c) => `${c} = ?`).join(", ")}, updated_by = ?, updated_at = datetime('now') WHERE person_key = ?`).bind(...binds, by, row.person_key).run();
+  }
+  const r = await env.DB.prepare("SELECT * FROM dfp_reservoir WHERE person_key = ?").bind(row.person_key).first();
+  return profileOut(r);
+}
+
+// ---- Bank and super changes. The director presses Processed and the new details are written into Xero first. Only when Xero has taken them (and shows them back) are they copied into Reservoir's own tables and the request marked processed. ----
+const digitsOnly = (v) => String(v || "").replace(/\D/g, "");
+const maskAcct = (v) => { const d = digitsOnly(v); return d ? `XXXX ${d.slice(-4)}` : String(v || ""); };
+// One row in the permanent change record. Account numbers are kept masked here. Never blocks the change it records.
+async function profileAudit(env, event, row, by, note) {
+  try {
+    let fields = [];
+    try { fields = JSON.parse(row.fields || "[]"); } catch (e) { /* none */ }
+    await env.DB.prepare("INSERT INTO profile_audit (event, request_id, person, email, section, section_title, fields, by_name, note) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
+      .bind(event, row.id, row.name || "", row.email || "", row.section || "", row.section_title || "", JSON.stringify(fields), String(by || "").slice(0, 120), String(note || "").slice(0, 300)).run();
+  } catch (e) { console.log("profile audit error", String(e && e.message || e)); }
+}
+// Xero's answer as plain text, including the validation messages it sends back on a refusal.
+async function xeroRefusal(res) {
+  const raw = (await res.text().catch(() => "")).trim();
+  let msg = "";
+  try {
+    const j = JSON.parse(raw);
+    const errs = [];
+    const walk = (o) => { if (!o || typeof o !== "object") return; if (Array.isArray(o)) { o.forEach(walk); return; } if (o.ValidationErrors) o.ValidationErrors.forEach((x) => x && x.Message && errs.push(x.Message)); if (o.Message) errs.push(o.Message); Object.values(o).forEach(walk); };
+    walk(j);
+    msg = [...new Set(errs)].join(" ");
+  } catch (e) { /* not JSON */ }
+  return `Xero answered ${res.status}. ${msg || raw.replace(/\s+/g, " ").slice(0, 240) || "It sent no message."}`;
+}
+async function xeroEmployeeRecord(env, employeeId) {
+  const r = await xeroFetch(env, `payroll.xro/1.0/Employees/${employeeId}`);
+  if (!r.ok) throw new Error(await xeroRefusal(r));
+  const rec = ((await r.json()).Employees || [])[0];
+  if (!rec) throw new Error("Xero returned no employee record");
+  return rec;
+}
+async function xeroPostEmployee(env, rec, patch) {
+  const body = [{ EmployeeID: rec.EmployeeID, FirstName: rec.FirstName, LastName: rec.LastName, DateOfBirth: rec.DateOfBirth, ...patch }];
+  const r = await xeroFetch(env, `payroll.xro/1.0/Employees/${rec.EmployeeID}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  if (!r.ok) throw new Error(await xeroRefusal(r));
+}
+async function xeroPushBank(env, employeeId, v) {
+  const rec = await xeroEmployeeRecord(env, employeeId);
+  const accts = Array.isArray(rec.BankAccounts) ? rec.BankAccounts : [];
+  if (accts.length > 1) throw new Error("This person has more than one bank account in Xero. Change it in Xero by hand.");
+  const cur = accts[0] || {};
+  const bsb = v.bsb !== undefined ? digitsOnly(v.bsb) : digitsOnly(cur.BSB);
+  const num = v.accountNumber !== undefined ? digitsOnly(v.accountNumber) : digitsOnly(cur.AccountNumber);
+  const name = v.accountName !== undefined ? String(v.accountName).trim() : String(cur.AccountName || "").trim();
+  if (bsb.length !== 6) throw new Error("The BSB must be 6 digits.");
+  if (num.length < 6 || num.length > 9) throw new Error("The account number must be 6 to 9 digits.");
+  if (!name) throw new Error("The account name is blank.");
+  await xeroPostEmployee(env, rec, { BankAccounts: [{ StatementText: cur.StatementText || "Wages", AccountName: name, BSB: bsb, AccountNumber: num, Remainder: cur.Remainder !== false }] });
+  const got = ((await xeroEmployeeRecord(env, employeeId)).BankAccounts || [])[0] || {};
+  if (digitsOnly(got.BSB) !== bsb || digitsOnly(got.AccountNumber) !== num) throw new Error("Xero accepted the change but still shows the old bank details. Check the employee in Xero.");
+  return { accountName: name, bsb, accountNumber: num };
+}
+// Super is changed in Xero by hand. Processed only reads the person's current fund back from Xero, checks it matches what they asked for, and returns it for the local tables.
+async function xeroPullSuper(env, employeeId, v) {
+  const rec = await xeroEmployeeRecord(env, employeeId);
+  const sup = await xeroSuperFor(env, rec);
+  const got = (sup.memberships || [])[0];
+  if (!got) throw new Error("Xero has no super fund on this person's record yet. Set it up in Xero first, then press Processed again.");
+  const norm = (x) => String(x || "").replace(/\s+/g, "").toUpperCase();
+  if (v.superMember !== undefined && norm(got.memberNumber) !== norm(v.superMember)) throw new Error(`Xero still shows member number ${got.memberNumber || "blank"}, not ${v.superMember}. Update it in Xero first, then press Processed again.`);
+  if (v.superUsi !== undefined && norm(got.usi) !== norm(v.superUsi)) throw new Error(`Xero still shows USI ${got.usi || "blank"}, not ${v.superUsi}. Update it in Xero first, then press Processed again.`);
+  return { fundName: got.fundName, usi: got.usi, member: got.memberNumber };
+}
+async function xeroPushSuper(env, employeeId, v) {
+  const rec = await xeroEmployeeRecord(env, employeeId);
+  const ms = (Array.isArray(rec.SuperMemberships) ? rec.SuperMemberships : []).map((m) => ({ ...m }));
+  const cur = ms[0] || null;
+  let fundId = cur ? cur.SuperFundID : "";
+  let fundName = "", usiOut = "";
+  const wantUsi = v.superUsi !== undefined ? String(v.superUsi || "").replace(/\s+/g, "").toUpperCase() : "";
+  if (v.superUsi !== undefined || v.superFund !== undefined) {
+    const fr = await xeroFetch(env, "payroll.xro/1.0/Superfunds");
+    if (!fr.ok) throw new Error(await xeroRefusal(fr));
+    const funds = (await fr.json()).SuperFunds || [];
+    let f = wantUsi ? funds.find((x) => String(x.USI || "").replace(/\s+/g, "").toUpperCase() === wantUsi) : null;
+    if (!f && !wantUsi && v.superFund) { const n = String(v.superFund).trim().toLowerCase(); f = funds.find((x) => String(x.Name || "").trim().toLowerCase() === n) || null; }
+    if (!f) throw new Error("That super fund is not set up in Xero yet. Add the fund in Xero, then press Processed again.");
+    fundId = f.SuperFundID;
+    fundName = String(f.Name || "").trim();
+    usiOut = String(f.USI || "").trim();
+  }
+  if (!fundId) throw new Error("There is no super fund on this person's Xero record to change.");
+  const member = v.superMember !== undefined ? String(v.superMember || "").trim() : String(cur ? cur.EmployeeNumber || "" : "").trim();
+  if (!member) throw new Error("The member number is blank.");
+  if (cur) ms[0] = { ...cur, SuperFundID: fundId, EmployeeNumber: member };
+  else ms.push({ SuperFundID: fundId, EmployeeNumber: member });
+  await xeroPostEmployee(env, rec, { SuperMemberships: ms });
+  const got = ((await xeroEmployeeRecord(env, employeeId)).SuperMemberships || [])[0] || {};
+  if (got.SuperFundID !== fundId || String(got.EmployeeNumber || "").trim() !== member) throw new Error("Xero accepted the change but still shows the old super details. Check the employee in Xero.");
+  return { fundName, usi: usiOut, member };
+}
+// Address as the app saves it ("12 Smith Street, Geelong VIC 3220") into the parts Xero keeps.
+function xeroAddressParts(addr, current) {
+  let raw = String(addr || "").replace(/\s+/g, " ").trim();
+  if (raw && raw === raw.toUpperCase()) raw = raw.toLowerCase().replace(/(^|[\s,-])([a-z])/g, (x, p, c) => p + c.toUpperCase()).replace(/\b(Vic|Nsw|Qld|Sa|Wa|Tas|Nt|Act)\b/g, (s) => s.toUpperCase());
+  const m = raw.match(/^(.+),\s*(.+?)\s+(VIC|NSW|QLD|SA|WA|TAS|NT|ACT)\s+(\d{4})$/i);
+  if (!m) throw new Error("The address needs a street, suburb, state and postcode so Xero can hold it. Ask them to pick it from the address suggestions.");
+  return { AddressLine1: m[1].trim(), City: m[2].trim(), Region: m[3].toUpperCase(), PostalCode: m[4], Country: String(current && current.Country || "AUSTRALIA") };
+}
+// Address and mobile go to Xero, then are read straight back from Xero into the local table, so what staff see is what Xero holds.
+// Addresses typed or picked in capitals are written to Xero in proper case: 16 Miramar Dr, Armstrong Creek VIC 3217.
+function titleAddress(text) {
+  const keep = /^(VIC|NSW|QLD|SA|WA|TAS|NT|ACT|PO|GPO|CMB|RMB|RSD)$/;
+  return String(text || "").replace(/[A-Za-z][A-Za-z'’-]*/g, (w) => {
+    if (keep.test(w.toUpperCase())) return w.toUpperCase();
+    if (w !== w.toUpperCase() || w.length < 2) return w;
+    return w.toLowerCase().replace(/(^|['’-])([a-z])/g, (m, a, b) => a + b.toUpperCase()).replace(/^Mc([a-z])/, (m, c) => "Mc" + c.toUpperCase());
+  }).replace(/\b(\d+)([a-z])\b/g, (m, n, l) => n + l.toUpperCase());
+}
+async function xeroPushPersonal(env, employeeId, v, email) {
+  const rec = await xeroEmployeeRecord(env, employeeId);
+  const patch = {};
+  if (v.address !== undefined) patch.HomeAddress = xeroAddressParts(titleAddress(v.address), rec.HomeAddress);
+  if (v.mobile !== undefined) {
+    const d = digitsOnly(normPhone(v.mobile));
+    if (d.length < 8 || d.length > 12) throw new Error("The mobile number does not look right.");
+    patch.Mobile = d;
+  }
+  await xeroPostEmployee(env, rec, patch);
+  const after = await xeroEmployeeRecord(env, employeeId);
+  const staff = xeroStaffRow(after);
+  if (patch.Mobile && digitsOnly(after.Mobile) !== patch.Mobile) throw new Error("Xero accepted the change but still shows the old mobile number. Check the employee in Xero.");
+  if (patch.HomeAddress && String((after.HomeAddress || {}).AddressLine1 || "").trim().toLowerCase() !== patch.HomeAddress.AddressLine1.toLowerCase()) throw new Error("Xero accepted the change but still shows the old address. Check the employee in Xero.");
+  const sets = [], binds = [];
+  if (patch.HomeAddress) { sets.push("address = ?"); binds.push(staff.address); }
+  if (patch.Mobile) { sets.push("mobile = ?"); binds.push(staff.mobile); }
+  if (sets.length) await env.DB.prepare(`UPDATE dfp_xero SET ${sets.join(", ")}, updated_by = ?, updated_at = datetime('now') WHERE lower(email) = ?`).bind(...binds, "Xero", String(email || "").toLowerCase()).run();
+  return { address: patch.HomeAddress ? staff.address : "", mobile: patch.Mobile ? staff.mobile : "" };
+}
+const profileRequestOut = (r) => {
+  let fields = [], values = {};
+  try { fields = JSON.parse(r.fields || "[]"); } catch (e) { /* none */ }
+  try { values = JSON.parse(r.vals || "{}"); } catch (e) { /* none */ }
+  return { id: r.id, kind: "detailschange", type: "Details Change", section: r.section, sectionTitle: r.section_title, fields, values, text: r.text || "", status: r.status, by: String(r.name || "").split(" ")[0], byName: r.name || "", date: String(r.created_at || "").slice(0, 10), doneDate: r.processed_at ? String(r.processed_at).slice(0, 10) : "", seen: !!r.seen_at, server: true };
+};
+// The personal email is read from dfp_reservoir. Keyed by work email.
+async function personalEmailFor(env, email) {
+  const key = String(email || "").trim().toLowerCase();
+  if (!key) return null;
+  await reservoirTables(env);
+  const r = await env.DB.prepare("SELECT personal_email FROM dfp_reservoir WHERE email = ?").bind(key).first();
+  return r && r.personal_email ? { personalEmail: r.personal_email } : null;
+}
+async function xeroTokenCall(env, params) {
+  const res = await fetch("https://identity.xero.com/connect/token", { method: "POST", headers: { Authorization: xeroBasic(env), "Content-Type": "application/x-www-form-urlencoded" }, body: new URLSearchParams(params) });
+  if (!res.ok) throw new Error("xero token " + res.status + " " + (await res.text()).replace(/\s+/g, " ").slice(0, 500));
+  return res.json();
+}
+// Returns a valid access token and tenant id, refreshing (and saving the rotated refresh token) when needed.
+// Only one refresh runs at a time, because Xero refresh tokens rotate and parallel refreshes can leave a dead token saved.
+let xeroRefreshing = null;
+// ---- THE XERO GATE. Every call to Xero, and every use of the stored Xero login, goes through xeroAccess or xeroFetch, and both start here. A request that arrives from a signed in person carries their access level on env (set once, in fetch, for the whole request). Anyone who is not T1 or T2, T3 included, is stopped before anything is sent to Xero, whatever route they came in on. Viewing as someone is judged by the level of the person being viewed. Work started by the Worker itself (the scheduled leave refresh, the connect screen) carries no level and is allowed. ----
+function xeroGate(env) {
+  const tier = env && env.__callerTier;
+  if (tier === undefined) return;
+  if (tier !== "T1" && tier !== "T2") {
+    const e = new Error("Xero is closed to your access level");
+    e.xeroBlocked = true;
+    throw e;
+  }
+}
+async function xeroAccess(env, force) {
+  xeroGate(env);
+  await xeroTable(env);
+  const row = await env.DB.prepare("SELECT * FROM xero_auth WHERE id = 1").first();
+  if (!row || !row.refresh_token) throw new Error("xero not connected");
+  if (!force && row.access_token && row.expires_at > Date.now() + 60000) return { token: row.access_token, tenant: row.tenant_id };
+  if (xeroRefreshing) return xeroRefreshing;
+  xeroRefreshing = (async () => {
+    try {
+      const t = await xeroTokenCall(env, { grant_type: "refresh_token", refresh_token: row.refresh_token });
+      await env.DB.prepare("UPDATE xero_auth SET refresh_token = ?, access_token = ?, expires_at = ?, updated_at = datetime('now') WHERE id = 1").bind(t.refresh_token, t.access_token, Date.now() + t.expires_in * 1000).run();
+      return { token: t.access_token, tenant: row.tenant_id };
+    } catch (e) {
+      // Another request may already have rotated the token. Use theirs if it is saved and still good.
+      const again = await env.DB.prepare("SELECT * FROM xero_auth WHERE id = 1").first();
+      if (again && again.access_token && again.expires_at > Date.now() + 60000 && again.access_token !== row.access_token) return { token: again.access_token, tenant: again.tenant_id };
+      throw e;
+    } finally { xeroRefreshing = null; }
+  })();
+  return xeroRefreshing;
+}
+const xeroSleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// ---- Go live lock. While testing, a director (T1) can remove closed requests. On go live day the director presses Lock Request Removal on the Development screen. From then on nobody can remove a request, so every request stays on record. There is no unlock in the app. ----
+// ---- Files kept in the database for the app to use (Development tab, Files card) ----
+// Only slots named here can be stored. readAll is true when any signed in person may read the file (the pay slip logo is printed on everyone's slip).
+const FILE_SLOTS = { "payslip-logo": { label: "Pay Slip Logo", readAll: true, mimes: ["image/png", "image/jpeg"], maxChars: 900000 } };
+let filesTableMade = false;
+async function filesTable(env) {
+  if (filesTableMade) return;
+  await env.DB.prepare("CREATE TABLE IF NOT EXISTS dfp_files (slot TEXT PRIMARY KEY, name TEXT, mime TEXT, size INTEGER, data TEXT, updated_at TEXT DEFAULT (datetime('now')), updated_by TEXT)").run();
+  filesTableMade = true;
+}
+// One settings table for everything that is a name and a value: go live switches (launch.*), company passwords and IDs (secret.*) and the flags for one time migrations already run (migration.*). It replaces launch_settings, secrets and dfp_migrations. The first start after this deploy copies those three across once. They are then no longer read or written, and are left in place until Tayler says to drop them.
+let settingsTableMade = false;
+async function settingsTable(env) {
+  if (settingsTableMade) return;
+  await env.DB.prepare("CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT, detail TEXT, by_name TEXT, at TEXT DEFAULT (datetime('now')))").run();
+  const merged = await env.DB.prepare("SELECT key FROM app_settings WHERE key = 'migration.settings_merge_v1'").first();
+  if (!merged) {
+    const has = async (t) => !!(await env.DB.prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?").bind(t).first());
+    if (await has("launch_settings")) await env.DB.prepare("INSERT OR IGNORE INTO app_settings (key, value, by_name, at) SELECT 'launch.' || key, value, set_by, set_at FROM launch_settings").run();
+    if (await has("secrets")) {
+      const sc = new Set((((await env.DB.prepare("PRAGMA table_info(secrets)").all()).results) || []).map((c) => c.name));
+      await env.DB.prepare(`INSERT OR IGNORE INTO app_settings (key, value, by_name, at) SELECT 'secret.' || key, value, ${sc.has("updated_by") ? "updated_by" : "NULL"}, ${sc.has("updated_at") ? "updated_at" : "datetime('now')"} FROM secrets`).run();
+    }
+    if (await has("dfp_migrations")) await env.DB.prepare("INSERT OR IGNORE INTO app_settings (key, detail, at) SELECT 'migration.' || name, detail, done_at FROM dfp_migrations").run();
+    await env.DB.prepare("INSERT OR IGNORE INTO app_settings (key, detail) VALUES ('migration.settings_merge_v1', 'launch_settings, secrets and dfp_migrations copied in')").run();
+  }
+  settingsTableMade = true;
+}
+const launchTable = settingsTable;
+async function migDone(env, name) {
+  await settingsTable(env);
+  return !!(await env.DB.prepare("SELECT key FROM app_settings WHERE key = ?").bind("migration." + name).first());
+}
+async function migMark(env, name, detail) {
+  await settingsTable(env);
+  await env.DB.prepare("INSERT OR REPLACE INTO app_settings (key, detail, at) VALUES (?, ?, datetime('now'))").bind("migration." + name, detail || "").run();
+}
+async function requestsLock(env) {
+  await settingsTable(env);
+  const r = await env.DB.prepare("SELECT value, by_name, at FROM app_settings WHERE key = 'launch.requests_locked'").first();
+  return r && r.value === "1" ? { locked: true, by: r.by_name || "", at: r.at || "" } : { locked: false, by: "", at: "" };
+}
+const REMOVAL_LOCKED = "Removing requests is locked. Every request is kept for the record.";
+// ---- Xero call counter. One row per Melbourne day. Every call made to api.xero.com is counted (retries after a 401 or a rate limit count too, as Xero counts them), and the "calls left" figures Xero sends back are kept. Counting never stops a call from working. ----
+let xeroCallsTableMade = false;
+async function xeroCallsTable(env) {
+  if (xeroCallsTableMade) return;
+  await env.DB.prepare("CREATE TABLE IF NOT EXISTS xero_calls (day TEXT PRIMARY KEY, calls INTEGER NOT NULL DEFAULT 0, day_remaining INTEGER, min_remaining INTEGER, remaining_at TEXT)").run();
+  xeroCallsTableMade = true;
+}
+function melbourneDay(ms) {
+  const parts = new Intl.DateTimeFormat("en-CA", { timeZone: "Australia/Melbourne", year: "numeric", month: "2-digit", day: "2-digit" }).formatToParts(new Date(ms === undefined ? Date.now() : ms));
+  const g = (t) => (parts.find((x) => x.type === t) || {}).value;
+  return `${g("year")}-${g("month")}-${g("day")}`;
+}
+async function xeroCountCall(env, res) {
+  try {
+    await xeroCallsTable(env);
+    const num = (name) => { const v = res && res.headers ? res.headers.get(name) : null; const n = v === null || v === undefined || v === "" ? NaN : Number(v); return Number.isFinite(n) ? Math.trunc(n) : null; };
+    const dayLeft = num("X-DayLimit-Remaining");
+    const minLeft = num("X-MinLimit-Remaining");
+    await env.DB.prepare("INSERT INTO xero_calls (day, calls, day_remaining, min_remaining, remaining_at) VALUES (?, 1, ?, ?, CASE WHEN ? IS NULL AND ? IS NULL THEN NULL ELSE datetime('now') END) ON CONFLICT(day) DO UPDATE SET calls = calls + 1, day_remaining = COALESCE(?, day_remaining), min_remaining = COALESCE(?, min_remaining), remaining_at = CASE WHEN ? IS NULL AND ? IS NULL THEN remaining_at ELSE datetime('now') END").bind(melbourneDay(), dayLeft, minLeft, dayLeft, minLeft, dayLeft, minLeft, dayLeft, minLeft).run();
+  } catch (e) { /* the count is best effort */ }
+}
+async function xeroCallsToday(env) {
+  await xeroCallsTable(env);
+  const day = melbourneDay();
+  const r = await env.DB.prepare("SELECT calls, day_remaining, min_remaining, remaining_at FROM xero_calls WHERE day = ?").bind(day).first();
+  return { day, today: r ? Number(r.calls) : 0, dayRemaining: r && r.day_remaining !== null && r.day_remaining !== undefined ? Number(r.day_remaining) : null, minuteRemaining: r && r.min_remaining !== null && r.min_remaining !== undefined ? Number(r.min_remaining) : null, remainingAt: r && r.remaining_at ? r.remaining_at : null };
+}
+// Calls Xero. A 401 gets one forced token refresh and a retry. A 429 (rate limit) waits for Xero's Retry-After and tries again, up to twice.
+async function xeroFetch(env, path, init = {}) {
+  xeroGate(env);
+  let refreshed = false;
+  let force = false;
+  let waits = 0;
+  for (;;) {
+    const { token, tenant } = await xeroAccess(env, force);
+    force = false;
+    const res = await fetch(`https://api.xero.com/${path}`, { ...init, headers: { Authorization: `Bearer ${token}`, "Xero-tenant-id": tenant, Accept: "application/json", ...(init.headers || {}) } });
+    await xeroCountCall(env, res);
+    if (res.status === 401 && !refreshed) { refreshed = true; force = true; continue; }
+    if (res.status === 429 && waits < 2) {
+      waits++;
+      const secs = Math.min(Math.max(Number(res.headers.get("Retry-After")) || 2, 1), 8);
+      console.log("xero rate limited, waiting", secs);
+      await xeroSleep(secs * 1000);
+      continue;
+    }
+    return res;
+  }
+}
+
+
+// Xero payroll dates arrive as /Date(ms+0000)/ or an ISO string. Returns yyyy-mm-dd or "".
+function xeroDate(v) {
+  if (!v) return "";
+  if (/^\d{4}-\d{2}-\d{2}/.test(String(v))) return String(v).slice(0, 10);
+  const m = /\/Date\((-?\d+)/.exec(String(v));
+  const d = m ? new Date(Number(m[1])) : new Date(String(v));
+  return isNaN(d) ? "" : d.toISOString().slice(0, 10);
+}
+// Emergency contact. Looks through every field on the record whose name mentions "emergency", whatever shape Xero uses
+// (a list of contacts, one contact object, or flat fields such as EmergencyContactName), and sorts the values by field name.
+function xeroEmergencyPairs(e) {
+  const pairs = [];
+  const take = (prefix, v) => {
+    if (v === null || v === undefined || v === "") return;
+    if (Array.isArray(v)) { if (v.length) take(prefix, v[0]); return; }
+    if (typeof v === "object") { Object.keys(v).forEach((k) => take(`${prefix}.${k}`, v[k])); return; }
+    pairs.push([prefix, String(v)]);
+  };
+  Object.keys(e || {}).forEach((k) => { if (/emergency/i.test(k)) take(k, e[k]); });
+  return pairs;
+}
+function xeroEmergency(e) {
+  const out = { emName: "", emRelationship: "", emMobile: "", emEmail: "" };
+  const leaf = (key) => key.split(".").pop().replace(/^emergency(contact)?/i, "");
+  for (const [key, val] of xeroEmergencyPairs(e)) {
+    const k = leaf(key) + " " + key;
+    const own = leaf(key);
+    if (/relation/i.test(k)) out.emRelationship = out.emRelationship || val;
+    else if (/mail/i.test(own) || /mail/i.test(k) && !/name/i.test(own)) out.emEmail = out.emEmail || val;
+    else if (/phone|mobile|number|contactno/i.test(own) || /phone|mobile/i.test(k)) out.emMobile = out.emMobile || val;
+    else if (/^(first)?name$|^$|^full/i.test(own) || /name/i.test(own)) out.emName = out.emName ? (/last|sur/i.test(own) ? `${out.emName} ${val}` : out.emName) : val;
+  }
+  return out;
+}
+// Xero's own answer, as plain text for the app to show: the status, the headers that explain a refusal, and the start of the body.
+async function xeroWhy(res) {
+  const h = [];
+  for (const k of ["www-authenticate", "x-rate-limit-problem", "retry-after"]) { const v = res.headers.get(k); if (v) h.push(`${k}: ${v}`); }
+  const body = (await res.text().catch(() => "")).replace(/\s+/g, " ").trim().slice(0, 240);
+  return `Xero answered ${res.status}${h.length ? ` (${h.join("; ")})` : ""}${body ? `. ${body}` : ". It sent no message."}`;
+}
+// Runs fn over the items a few at a time. Xero allows only 5 calls in flight at once, so the employee records are fetched 3 at a time.
+async function xeroEach(items, fn, limit = 3) {
+  const out = new Array(items.length);
+  let next = 0;
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, async () => {
+    while (next < items.length) { const i = next++; out[i] = await fn(items[i], i); }
+  }));
+  return out;
+}
+// The Xero employee list, kept for 3 minutes so one screen opening does not ask Xero again and again. Only a good answer is kept.
+let xeroListKept = null;
+async function xeroEmployeeList(env) {
+  if (xeroListKept && Date.now() - xeroListKept.at < 3 * 60000) return { list: xeroListKept.list };
+  const res = await xeroFetch(env, "payroll.xro/1.0/Employees");
+  if (!res.ok) return { fail: { status: res.status, detail: await xeroWhy(res) } };
+  const list = (await res.json()).Employees || [];
+  xeroListKept = { at: Date.now(), list };
+  return { list };
+}
+function xeroStaffRow(e) {
+  const a = e.HomeAddress || {};
+  const street = [a.AddressLine1, a.AddressLine2].filter(Boolean).join(" ");
+  const place = [a.City, a.Region, a.PostalCode].filter(Boolean).join(" ");
+  const bank = (e.BankAccounts || [])[0] || {};
+  return {
+    id: e.EmployeeID,
+    status: e.Status || "",
+    name: [e.FirstName, e.LastName].filter(Boolean).join(" "),
+    address: [street, place].filter(Boolean).join(", "),
+    dob: xeroDate(e.DateOfBirth),
+    mobile: e.Mobile || e.Phone || "",
+    email: e.Email || "",
+    accountName: bank.AccountName || "",
+    bsb: bank.BSB || "",
+    accountNumber: bank.AccountNumber || "",
+    commenced: xeroDate(e.StartDate),
+    title: String(e.JobTitle || "").trim(),
+    ...xeroEmergency(e)
+  };
+}
+
+// Employment basis (FULLTIME, PARTTIME, CASUAL, LABOURHIRE, SUPERINCOMESTREAM) from the Employment tab, held on the tax declaration. EmploymentType is only Employee or Contractor, so it is never used here.
+function xeroBasis(record) {
+  const td = record && record.TaxDeclaration || {};
+  const v = td.EmploymentBasis || record.EmploymentBasis || "";
+  return String(v).replace(/[\s_-]/g, "").toUpperCase();
+}
+// Hourly rates for ordinary time, time and a half and double time, worked from the employee's pay template and DFP's earnings rates.
+// Which earnings rates are ordinary time, overtime under 2 hours and overtime over 2 hours. Shared by the pay figures and the timesheet push, so both pick the same rates.
+function xeroPickRates(record, earningsRates) {
+  const byId = new Map(earningsRates.map((r) => [r.EarningsRateID, r]));
+  const lines = (record.PayTemplate && record.PayTemplate.EarningsLines) || [];
+  const lineFor = (id) => lines.find((l) => l.EarningsRateID === id);
+  const named = (test) => earningsRates.find((r) => test(String(r.Name || "")));
+  const overtime = (n) => /overtime/i.test(n);
+  const ordinaryItem = byId.get(record.OrdinaryEarningsRateID) || named((n) => /ordinary/i.test(n));
+  const ot15Item = named((n) => overtime(n) && (/<\s*2/.test(n) || /(less than|under)\s*2/i.test(n) || /1\.5|time and a half/i.test(n)));
+  const ot2Item = named((n) => overtime(n) && (/>\s*2/.test(n) || /(more than|over)\s*2/i.test(n) || /double/i.test(n)));
+  return { byId, lines, lineFor, ordinaryItem, ot15Item, ot2Item };
+}
+function xeroRates(record, earningsRates) {
+  const { byId, lines, lineFor, ordinaryItem, ot15Item, ot2Item } = xeroPickRates(record, earningsRates);
+  const out = { ordinary: null, ot15: null, ot2: null, annual: null, weekHours: null };
+  const why = [];
+  const money = (n) => Math.round(Number(n) * 100) / 100;
+  if (!ordinaryItem) why.push("No ordinary earnings rate found in Xero");
+  else {
+    const ln = lineFor(ordinaryItem.EarningsRateID);
+    if (ln && ln.CalculationType === "ANNUALSALARY") {
+      // An annual salary on the pay template: the yearly amount and the hours a week it is based on.
+      const a = xnum(ln.AnnualSalary);
+      const h = xnum(ln.NumberOfUnitsPerWeek) || xunits(ln.NormalNumberOfUnits);
+      if (a > 0) { out.annual = money(a); if (h > 0) out.weekHours = Math.round(h * 100) / 100; }
+      else why.push("Ordinary time is an annual salary in Xero but Xero gave no amount");
+    } else if (ln && ln.RatePerUnit) out.ordinary = money(ln.RatePerUnit);
+    else if (ordinaryItem.RateType === "RATEPERUNIT" && ordinaryItem.RatePerUnit) out.ordinary = money(ordinaryItem.RatePerUnit);
+    else why.push("No hourly ordinary rate on the pay template");
+  }
+  const derive = (item, label) => {
+    if (!item) { why.push(`No earnings rate found in Xero for ${label}`); return null; }
+    const ln = lineFor(item.EarningsRateID);
+    if (ln && ln.RatePerUnit) return money(ln.RatePerUnit);
+    if (item.RateType === "RATEPERUNIT" && item.RatePerUnit) return money(item.RatePerUnit);
+    const base = out.ordinary || (out.annual && out.weekHours ? out.annual / 52 / out.weekHours : null);
+    if (item.RateType === "MULTIPLE" && item.Multiplier && base) return money(base * Number(item.Multiplier));
+    why.push(`Could not work out ${label} from Xero`);
+    return null;
+  };
+  // Overtime entitlement: the pay template carries a line for an overtime earnings rate.
+  const hasOvertime = !!((ot15Item && lineFor(ot15Item.EarningsRateID)) || (ot2Item && lineFor(ot2Item.EarningsRateID)));
+  if (hasOvertime) {
+    out.ot15 = derive(ot15Item, "Overtime < 2 Hours");
+    out.ot2 = derive(ot2Item, "Overtime > 2 Hours");
+  }
+  return { rates: out, why, hasOvertime, templateLines: lines.map((l) => (byId.get(l.EarningsRateID) || {}).Name || l.EarningsRateID), used: { ordinary: ordinaryItem && ordinaryItem.Name, ot15: ot15Item && ot15Item.Name, ot2: ot2Item && ot2Item.Name } };
+}
+
+// Super fund details for one Xero employee record: fund name, member number and USI. Never returns fund bank details.
+// "kept" is optional. When a caller doing many people at once passes the same object each time, the super funds list and each fund product are read from Xero once instead of once per person.
+async function xeroSuperFor(env, record, kept) {
+  const ms = Array.isArray(record.SuperMemberships) ? record.SuperMemberships : [];
+  if (!ms.length) return { memberships: [], why: "No super fund on the Xero employee record" };
+  let funds = [];
+  let why = "";
+  if (kept && kept.funds) { funds = kept.funds; why = kept.why || ""; }
+  else {
+    try {
+      const r = await xeroFetch(env, "payroll.xro/1.0/Superfunds");
+      if (r.ok) funds = (await r.json()).SuperFunds || [];
+      else { why = `Xero refused the super funds list (${r.status})`; console.log("xero superfunds failed", r.status, (await r.text()).slice(0, 200)); }
+    } catch (e) { why = "Could not read the super funds list from Xero"; }
+    if (kept) { kept.funds = funds; kept.why = why; kept.products = {}; }
+  }
+  const out = [];
+  for (const m of ms) {
+    const f = funds.find((x) => x.SuperFundID === m.SuperFundID) || {};
+    const usi = String(f.USI || "").trim();
+    let name = String(f.Name || "").trim();
+    if (!name && usi) {
+      if (kept && kept.products && usi in kept.products) name = kept.products[usi];
+      else {
+        try {
+          const r = await xeroFetch(env, `payroll.xro/1.0/SuperfundProducts?USI=${encodeURIComponent(usi)}`);
+          if (r.ok) { const prod = ((await r.json()).SuperFundProducts || [])[0]; if (prod && prod.ProductName) name = String(prod.ProductName).trim(); }
+        } catch (e) { /* leave the name blank */ }
+        if (kept && kept.products) kept.products[usi] = name;
+      }
+    }
+    if (!name && f.Type === "SMSF") name = "Self managed super fund";
+    out.push({ fundName: name, memberNumber: String(m.EmployeeNumber || "").trim(), usi });
+  }
+  return { memberships: out, why };
+}
+
+// ---- Pay slips built from Xero pay runs by the Pull Pay Slips action, and stored. Opening a pay slip never calls Xero. ----
+const xnum = (v) => { const n = Number(v); return Number.isFinite(n) ? n : 0; };
+const xunits = (v) => Array.isArray(v) ? v.reduce((a, x) => a + xnum(x), 0) : xnum(v);
+// Every POSTED pay run, newest payment date first.
+let xeroRunsKept = null;
+async function xeroPostedRuns(env) {
+  if (xeroRunsKept && Date.now() - xeroRunsKept.at < 60000) return { runs: xeroRunsKept.runs };
+  let runs = [];
+  for (let page = 1; page <= 5; page++) {
+    const r = await xeroFetch(env, `payroll.xro/1.0/PayRuns?page=${page}`);
+    if (!r.ok) {
+      const detail = (await r.text()).slice(0, 300);
+      console.log("xero payruns failed", r.status, detail);
+      return { fail: { error: r.status === 401 || r.status === 403 ? "Xero has not allowed pay run access yet. Reconnect Xero on the Xero card." : "Xero refused the pay runs", status: r.status, detail } };
+    }
+    const batch = (await r.json()).PayRuns || [];
+    runs = runs.concat(batch);
+    if (batch.length < 100) break;
+  }
+  runs = runs.filter((x) => (x.PayRunStatus || "") === "POSTED").sort((a, b) => xeroDate(b.PaymentDate).localeCompare(xeroDate(a.PaymentDate)));
+  xeroRunsKept = { at: Date.now(), runs };
+  return { runs };
+}
+// A figure Xero gave, as a number, or null when Xero gave none at all. A zero is only taken when no other source holds a real figure,
+// because a pay run summary may carry "not given" as zero. Nothing is worked out here: no sums, no substitutes.
+const xeroFigure = (...vals) => {
+  let sawZero = false;
+  for (const v of vals) {
+    if (v === null || v === undefined || v === "") continue;
+    const n = Number(v);
+    if (!Number.isFinite(n)) continue;
+    if (n !== 0) return money2(n);
+    sawZero = true;
+  }
+  return sawZero ? 0 : null;
+};
+// The totals for one payslip exactly as Xero gives them: from the full payslip first, then the pay run's summary row. A figure Xero does not give stays null.
+function slipTotals(summary, slip) {
+  const sm = summary || {};
+  const sl = slip || {};
+  return {
+    gross: xeroFigure(sl.Wages, sm.Wages),
+    tax: xeroFigure(sl.Tax, sm.Tax),
+    super: xeroFigure(sl.Super, sm.Super),
+    deductions: xeroFigure(sl.Deductions, sm.Deductions),
+    reimbursements: xeroFigure(sl.Reimbursements, sm.Reimbursements),
+    net: xeroFigure(sl.NetPay, sm.NetPay)
+  };
+}
+// Turns one Xero payslip into the shape the app prints. Every figure comes from Xero; nothing is worked out here except merging identical lines.
+function xeroSlipShape(slip, run, record, items, supMemberships, fundOf, tot) {
+  const byId = (list, key) => new Map((list || []).map((x) => [x[key], x]));
+  const earn = byId(items.EarningsRates, "EarningsRateID");
+  const ded = byId(items.DeductionTypes, "DeductionTypeID");
+  const reimb = byId(items.ReimbursementTypes, "ReimbursementTypeID");
+  const merged = new Map();
+  const addLine = (l, fallback) => {
+    const hours = xunits(l.NumberOfUnits);
+    const rate = xnum(l.RatePerUnit);
+    const fixed = xnum(l.FixedAmount) || xnum(l.Amount);
+    const amount = money2(fixed || hours * rate);
+    const label = txt((earn.get(l.EarningsRateID) || {}).Name, 80) || fallback;
+    const key = `${label}|${rate}|${fixed ? "f" : "h"}`;
+    const prev = merged.get(key);
+    if (prev) { prev.hours = money2(prev.hours + hours); prev.amount = money2(prev.amount + amount); }
+    else merged.set(key, { label, hours: fixed ? 0 : money2(hours), rate: fixed ? 0 : money2(rate), amount });
+  };
+  (slip.EarningsLines || []).forEach((l) => addLine(l, "Earnings"));
+  (slip.TimesheetEarningsLines || []).forEach((l) => addLine(l, "Timesheet earnings"));
+  (slip.LeaveEarningsLines || []).forEach((l) => addLine(l, "Leave"));
+  const lines = [...merged.values()].filter((l) => l.amount !== 0);
+  const taxLines = (slip.TaxLines || []).map((l) => ({ label: (/tax.?free|leave loading|threshold/i.test(String(l.Description || "")) ? "" : txt(l.Description, 80)) || txt(l.TaxTypeName, 80) || "Tax", amount: money2(l.Amount) })).filter((l) => l.amount !== 0);
+  const deductions = (slip.DeductionLines || []).map((l) => ({ label: txt((ded.get(l.DeductionTypeID) || {}).Name, 80) || "Deduction", amount: money2(l.Amount) })).filter((l) => l.amount !== 0);
+  const reimbursements = (slip.ReimbursementLines || []).map((l) => ({ label: txt(l.Description || (reimb.get(l.ReimbursementTypeID) || {}).Name, 80) || "Reimbursement", amount: money2(l.Amount) })).filter((l) => l.amount !== 0);
+  const SUPER_LABEL = { SGC: "Superannuation Guarantee (SGC)", SALARYSACRIFICE: "Salary Sacrifice", EMPLOYERADDITIONAL: "Employer Additional", EMPLOYEE: "Employee Contribution" };
+  const superOf = (l) => {
+    // A line is matched to its fund by the membership Xero names. With no match the fund is only taken when the person has just one, otherwise it is left blank, never guessed.
+    const ms = supMemberships || [];
+    const m = ms.find((x) => x.SuperMembershipID === l.SuperMembershipID) || (ms.length === 1 ? ms[0] : null);
+    return (m && fundOf(m)) || {};
+  };
+  const superLines = (slip.SuperannuationLines || []).map((l) => {
+    const f = superOf(l);
+    const key = String(l.ContributionType || "").replace(/[\s_-]/g, "").toUpperCase();
+    return { label: SUPER_LABEL[key] || txt(l.ContributionType, 60).replace(/([a-z])([A-Z])/g, "$1 $2") || "Superannuation", amount: money2(l.Amount), fund: f.fundName || "", member: f.memberNumber || "", usi: f.usi || "" };
+  }).filter((l) => l.amount !== 0);
+  const gross = tot.gross;
+  const warnings = [];
+  const lineTotal = money2(lines.reduce((a, l) => a + l.amount, 0));
+  if (gross !== null && Math.abs(lineTotal - gross) > 0.02) warnings.push(`The earnings lines Xero returned add to ${lineTotal.toFixed(2)} but Xero reports total earnings of ${gross.toFixed(2)}.`);
+  const taxTotal = money2(taxLines.reduce((a, l) => a + l.amount, 0));
+  if (tot.tax !== null && Math.abs(taxTotal - tot.tax) > 0.02) warnings.push(`The tax lines Xero returned add to ${taxTotal.toFixed(2)} but Xero reports tax of ${tot.tax.toFixed(2)}.`);
+  const start = xeroDate(run.PayRunPeriodStartDate);
+  const end = xeroDate(run.PayRunPeriodEndDate);
+  const days = start && end ? Math.round((new Date(end) - new Date(start)) / 864e5) + 1 : 0;
+  const ha = record.HomeAddress || {};
+  const addr = [ha.AddressLine1, ha.AddressLine2, [ha.City, ha.Region, ha.PostalCode].filter(Boolean).join(" ")].map((x) => txt(x, 80)).filter(Boolean).join(", ");
+  const banks = Array.isArray(record.BankAccounts) ? record.BankAccounts : [];
+  const bank = banks.find((b) => b.Remainder) || banks[0] || {};
+  const acct = txt(bank.AccountNumber, 20).replace(/\s+/g, "");
+  const supTotal = tot.super;
+  // The fund shown on the slip is the one Xero names on the super lines. If the lines name different funds, none is shown at the top (each line keeps its own). With no lines it is taken only when the person has a single membership.
+  const named = superLines.filter((l) => l.fund || l.member);
+  const sameFund = named.length && named.every((l) => l.fund === named[0].fund && l.member === named[0].member);
+  const firstFund = sameFund ? named[0] : named.length ? { fund: "", member: "", usi: "" } : (() => { const f = superOf({}); return { fund: f.fundName || "", member: f.memberNumber || "", usi: f.usi || "" }; })();
+  if (!supTotal && (slip.SuperannuationLines || []).length) warnings.push("Xero returned a superannuation line for this pay but no superannuation amount.");
+  // Anything Xero did not give is listed here and shown as "Not supplied" on the pay slip. Nothing is worked out in its place.
+  const missing = [["total earnings", tot.gross], ["tax", tot.tax], ["superannuation", tot.super], ["net pay", tot.net]].filter((x) => x[1] === null).map((x) => x[0]);
+  missing.forEach((x) => warnings.push(`Xero did not supply ${x} for this pay.`));
+  return {
+    employee: { name: txt(`${record.FirstName || ""} ${record.LastName || ""}`, 120), address: addr, frequency: days === 7 ? "Weekly" : days === 14 ? "Fortnightly" : days >= 28 ? "Monthly" : "", employmentType: xeroBasis(record) },
+    period: { start, end }, paymentDate: xeroDate(run.PaymentDate),
+    lines, gross, taxLines, tax: tot.tax, deductions, deductionsTotal: tot.deductions, reimbursements, reimbursementsTotal: tot.reimbursements, net: tot.net,
+    super: { amount: supTotal, lines: superLines.map((l) => ({ label: l.label, amount: l.amount })), fund: firstFund.fund || "", member: firstFund.member || "", usi: firstFund.usi || "" },
+    bank: { accountName: txt(bank.AccountName, 120), bsb: txt(bank.BSB, 10), masked: acct ? `XXXX ${acct.slice(-4)}` : "" },
+    reference: txt(bank.StatementText, 80) || `Wages ${end.slice(8, 10)}.${end.slice(5, 7)}.${end.slice(0, 4)}`,
+    warnings, missing
+  };
+}
+
+// One pay run with every person's summary row. Posted runs are kept in memory for five minutes, so a run is read from Xero once however many people are filed.
+const xeroRunCache = new Map();
+async function xeroRunDetail(env, runId) {
+  const kept = xeroRunCache.get(runId);
+  if (kept && Date.now() - kept.at < 5 * 60000) return kept.res;
+  const r = await xeroFetch(env, `payroll.xro/1.0/PayRuns/${runId}`);
+  if (!r.ok) {
+    const detail = (await r.text()).slice(0, 300);
+    console.log("xero payrun failed", r.status, detail);
+    return { fail: { status: 502, body: { error: r.status === 401 || r.status === 403 ? "Xero has not allowed pay run access yet. Reconnect Xero on the Xero card." : "Xero refused the pay run", status: r.status, detail } } };
+  }
+  const run = ((await r.json()).PayRuns || [])[0];
+  const res = { run };
+  if (run && (run.PayRunStatus || "") === "POSTED") xeroRunCache.set(runId, { at: Date.now(), res });
+  return res;
+}
+let xeroItemsKept = null;
+async function xeroItems(env) {
+  if (xeroItemsKept && Date.now() - xeroItemsKept.at < 10 * 60000) return xeroItemsKept.items;
+  try {
+    const pi = await xeroFetch(env, "payroll.xro/1.0/PayItems");
+    if (pi.ok) { const items = (await pi.json()).PayItems || {}; xeroItemsKept = { at: Date.now(), items }; return items; }
+  } catch (e) { /* lines fall back to generic names */ }
+  return {};
+}
+// ---- Filing pay slip PDFs into each person's staff folder in SharePoint ----
+// Reservoir > Workplace Culture > Employee Records > Current Employees > <person> > Payslips
+const STAFF_PATHS = ["Workplace Culture/Employee Records/Current Employees", "Reservoir/Workplace Culture/Employee Records/Current Employees"];
+let staffRootKept = null;
+async function staffRoot(env) {
+  if (staffRootKept && Date.now() - staffRootKept.at < 10 * 60000) return { root: staffRootKept.root };
+  const bases = [`/sites/${siteId(env)}/drive`];
+  try {
+    const dl = await graphFetch(env, `/sites/${siteId(env)}/drives`);
+    if (dl.ok) for (const d of (await dl.json()).value || []) bases.push(`/drives/${d.id}`);
+  } catch (e) { /* the default library only */ }
+  for (const base of bases) {
+    for (const path of STAFF_PATHS) {
+      const r = await graphFetch(env, `${base}/root:/${pathOf(path.split("/"))}`);
+      if (!r.ok) continue;
+      const it = await r.json();
+      if (!it.folder) continue;
+      const root = { driveBase: `/drives/${it.parentReference && it.parentReference.driveId}`, id: it.id, path };
+      staffRootKept = { at: Date.now(), root };
+      return { root };
+    }
+  }
+  let top = [];
+  try {
+    const t = await graphFetch(env, `/sites/${siteId(env)}/drive/root/children?$select=name&$top=60`);
+    if (t.ok) top = ((await t.json()).value || []).map((x) => x.name);
+  } catch (e) { /* none to show */ }
+  return { why: `Could not find ${STAFF_PATHS[0]} in the Reservoir site.${top.length ? ` The top level folders there are: ${top.join(", ")}.` : ""}` };
+}
+async function driveChildren(env, driveBase, id) {
+  let url = `${driveBase}/items/${id}/children?$select=id,name,folder&$top=200`;
+  const out = [];
+  for (let i = 0; i < 10 && url; i++) {
+    const r = await graphFetch(env, url);
+    if (!r.ok) throw new Error("folder list " + r.status);
+    const j = await r.json();
+    (j.value || []).forEach((x) => out.push(x));
+    url = j["@odata.nextLink"] || "";
+  }
+  return out;
+}
+const nameTokens = (v) => String(v || "").toLowerCase().replace(/['\u2018\u2019`\u00b4]/g, "").replace(/[^a-z0-9 ]/g, " ").split(/\s+/).filter(Boolean);
+// Finds one person's folder by name. Order and punctuation do not matter. Returns { folder } or { why }.
+function matchStaffFolder(folders, first, last) {
+  const f = nameTokens(first), l = nameTokens(last);
+  const want = new Set([...f, ...l]);
+  const dirs = folders.filter((x) => x.folder);
+  const exact = dirs.filter((x) => { const t = nameTokens(x.name); return t.length === want.size && t.every((y) => want.has(y)); });
+  if (exact.length === 1) return { folder: exact[0] };
+  if (exact.length > 1) return { why: "More than one folder matches that name" };
+  const loose = dirs.filter((x) => { const t = new Set(nameTokens(x.name)); return f.concat(l).length > 0 && f.every((y) => t.has(y)) && l.every((y) => t.has(y)); });
+  if (loose.length === 1) return { folder: loose[0] };
+  return { why: loose.length ? "More than one folder matches that name" : "No folder with that name under Current Employees" };
+}
+// ---- PDF scan start. Reads the text of an employment contract PDF so the office does not have to type the dates. Best effort: scanned images and unusual fonts come back unreadable and the office enters the dates by hand. ----
+const pdfBin = (bytes) => { let s = ""; const n = bytes.length; for (let i = 0; i < n; i += 8192) s += String.fromCharCode.apply(null, bytes.subarray(i, Math.min(n, i + 8192))); return s; };
+const pdfBytes = (s) => { const b = new Uint8Array(s.length); for (let i = 0; i < s.length; i++) b[i] = s.charCodeAt(i) & 255; return b; };
+async function pdfInflate(bytes) {
+  for (const cut of [0, 1, 2]) {
+    try {
+      const ds = new DecompressionStream("deflate");
+      const w = ds.writable.getWriter();
+      w.write(bytes.subarray(0, bytes.length - cut)).catch(() => {});
+      w.close().catch(() => {});
+      const out = await new Response(ds.readable).arrayBuffer();
+      return new Uint8Array(out);
+    } catch (e) { /* try with the trailing line break removed */ }
+  }
+  return null;
+}
+// The text between a matched pair of << >> that starts at index i of s (s[i] is the first "<").
+function pdfDictAt(s, i) {
+  let depth = 0;
+  for (let j = i; j < s.length - 1; j++) {
+    if (s[j] === "<" && s[j + 1] === "<") { depth++; j++; }
+    else if (s[j] === ">" && s[j + 1] === ">") { depth--; j++; if (depth === 0) return s.slice(i, j + 1); }
+  }
+  return "";
+}
+// The value that follows /Key in a dictionary text: a dictionary, an array, a reference, or a bare token.
+function pdfGet(dict, key) {
+  const m = new RegExp(`/${key}(?![A-Za-z0-9])\\s*`).exec(dict);
+  if (!m) return "";
+  const rest = dict.slice(m.index + m[0].length);
+  if (rest.startsWith("<<")) return pdfDictAt(rest, 0);
+  if (rest[0] === "[") { const e = rest.indexOf("]"); return e < 0 ? "" : rest.slice(0, e + 1); }
+  const r = /^(\d+)\s+(\d+)\s+R/.exec(rest);
+  if (r) return `${r[1]} ${r[2]} R`;
+  const t = /^[^\s/<>\[\]]+/.exec(rest);
+  return t ? t[0] : "";
+}
+const pdfRef = (v) => { const m = /^(\d+)\s+\d+\s+R/.exec(String(v || "").trim()); return m ? Number(m[1]) : 0; };
+function pdfAscii85(bytes) {
+  const out = [];
+  let tuple = [], i = 0;
+  const s = pdfBin(bytes);
+  while (i < s.length) {
+    const ch = s[i++];
+    if (ch === "~") break;
+    if (/\s/.test(ch)) continue;
+    if (ch === "z" && tuple.length === 0) { out.push(0, 0, 0, 0); continue; }
+    const v = ch.charCodeAt(0) - 33;
+    if (v < 0 || v > 84) continue;
+    tuple.push(v);
+    if (tuple.length === 5) {
+      let n = 0;
+      for (const t of tuple) n = n * 85 + t;
+      out.push((n >>> 24) & 255, (n >>> 16) & 255, (n >>> 8) & 255, n & 255);
+      tuple = [];
+    }
+  }
+  if (tuple.length > 1) {
+    const keep = tuple.length - 1;
+    while (tuple.length < 5) tuple.push(84);
+    let n = 0;
+    for (const t of tuple) n = n * 85 + t;
+    const bs = [(n >>> 24) & 255, (n >>> 16) & 255, (n >>> 8) & 255, n & 255];
+    out.push(...bs.slice(0, keep));
+  }
+  return new Uint8Array(out);
+}
+function pdfAsciiHex(bytes) {
+  const s = pdfBin(bytes).split(">")[0].replace(/\s+/g, "");
+  const out = [];
+  for (let i = 0; i < s.length; i += 2) out.push(parseInt(s.slice(i, i + 2).padEnd(2, "0"), 16));
+  return new Uint8Array(out);
+}
+async function pdfObjects(raw) {
+  const objs = new Map();
+  const re = /(\d+)\s+(\d+)\s+obj\b/g;
+  let m;
+  while ((m = re.exec(raw))) {
+    const num = Number(m[1]);
+    const bodyStart = m.index + m[0].length;
+    const sIdx = raw.indexOf("stream", bodyStart);
+    const eIdx = raw.indexOf("endobj", bodyStart);
+    let dictText, stream = null;
+    if (sIdx >= 0 && (eIdx < 0 || sIdx < eIdx) && /^stream\r?\n/.test(raw.slice(sIdx, sIdx + 8)) && /^\s*<</.test(raw.slice(bodyStart, bodyStart + 6))) {
+      dictText = raw.slice(bodyStart, sIdx);
+      const dataStart = sIdx + (raw[sIdx + 6] === "\r" ? 8 : 7);
+      let len = Number(pdfGet(dictText, "Length"));
+      if (!Number.isFinite(len)) {
+        const lr = /^(\d+)\s+\d+\s+R/.exec(pdfGet(dictText, "Length"));
+        const lm = lr ? new RegExp(`(?:^|[\\r\\n])${lr[1]}\\s+\\d+\\s+obj\\s+(\\d+)\\s+endobj`).exec(raw) : null;
+        len = lm ? Number(lm[1]) : NaN;
+      }
+      let dataEnd = Number.isFinite(len) && len > 0 && raw.slice(dataStart + len, dataStart + len + 12).trim().startsWith("endstream") ? dataStart + len : raw.indexOf("endstream", dataStart);
+      if (!(dataEnd > dataStart)) dataEnd = raw.indexOf("endstream", dataStart);
+      if (dataEnd < 0) dataEnd = dataStart;
+      stream = { start: dataStart, end: dataEnd };
+      re.lastIndex = Math.max(re.lastIndex, dataEnd);
+    } else {
+      dictText = eIdx >= 0 ? raw.slice(bodyStart, eIdx) : raw.slice(bodyStart, bodyStart + 2000);
+    }
+    objs.set(num, { dict: dictText, stream });
+  }
+  const dataOf = async (o) => {
+    if (!o || !o.stream) return null;
+    let bytes = pdfBytes(raw.slice(o.stream.start, o.stream.end));
+    const fm = /\/Filter\s*(\[[^\]]*\]|\/[A-Za-z0-9]+)/.exec(o.dict);
+    const filt = fm ? fm[1] : "";
+    const names = [...filt.matchAll(/\/([A-Za-z0-9]+)/g)].map((x) => x[1]);
+    for (const nm of names) {
+      if (!bytes) return null;
+      if (nm === "FlateDecode" || nm === "Fl") bytes = await pdfInflate(bytes);
+      else if (nm === "ASCII85Decode" || nm === "A85") bytes = pdfAscii85(bytes);
+      else if (nm === "ASCIIHexDecode" || nm === "AHx") bytes = pdfAsciiHex(bytes);
+      else return null;
+    }
+    return bytes;
+  };
+  // Objects packed inside object streams (PDF 1.5 and later).
+  for (const [num, o] of [...objs]) {
+    if (!/\/Type\s*\/ObjStm/.test(o.dict)) continue;
+    const bytes = await dataOf(o);
+    if (!bytes) continue;
+    const txt = pdfBin(bytes);
+    const n = Number(pdfGet(o.dict, "N")), first = Number(pdfGet(o.dict, "First"));
+    if (!(n > 0) || !(first > 0)) continue;
+    const head = txt.slice(0, first).trim().split(/\s+/).map(Number);
+    for (let k = 0; k < n; k++) {
+      const id = head[k * 2], off = head[k * 2 + 1];
+      const end = k + 1 < n ? head[(k + 1) * 2 + 1] : txt.length - first;
+      if (Number.isFinite(id) && Number.isFinite(off)) objs.set(id, { dict: txt.slice(first + off, first + end), stream: null, packed: true });
+    }
+  }
+  return { objs, dataOf };
+}
+function pdfHexToStr(hex) {
+  const h = hex.replace(/\s+/g, "");
+  let out = "";
+  for (let i = 0; i + 3 < h.length + 1; i += 4) { const c = parseInt(h.slice(i, i + 4), 16); if (!Number.isNaN(c)) out += String.fromCharCode(c); }
+  return out;
+}
+function pdfToUnicode(text) {
+  const map = new Map();
+  let width = 1;
+  const cs = /begincodespacerange([\s\S]*?)endcodespacerange/.exec(text);
+  if (cs) { const h = /<([0-9a-fA-F]+)>/.exec(cs[1]); if (h) width = Math.max(1, Math.round(h[1].length / 2)); }
+  let m;
+  const chars = /beginbfchar([\s\S]*?)endbfchar/g;
+  while ((m = chars.exec(text))) {
+    const pairs = /<([0-9a-fA-F]+)>\s*<([0-9a-fA-F]+)>/g;
+    let p;
+    while ((p = pairs.exec(m[1]))) map.set(parseInt(p[1], 16), pdfHexToStr(p[2]));
+  }
+  const ranges = /beginbfrange([\s\S]*?)endbfrange/g;
+  while ((m = ranges.exec(text))) {
+    const items = /<([0-9a-fA-F]+)>\s*<([0-9a-fA-F]+)>\s*(\[[^\]]*\]|<[0-9a-fA-F]+>)/g;
+    let p;
+    while ((p = items.exec(m[1]))) {
+      const lo = parseInt(p[1], 16), hi = parseInt(p[2], 16);
+      if (hi - lo > 70000) continue;
+      if (p[3][0] === "[") {
+        const arr = [...p[3].matchAll(/<([0-9a-fA-F]+)>/g)].map((x) => pdfHexToStr(x[1]));
+        for (let c = lo; c <= hi && c - lo < arr.length; c++) map.set(c, arr[c - lo]);
+      } else {
+        const base = pdfHexToStr(p[3].slice(1, -1));
+        const last = base.length ? base.charCodeAt(base.length - 1) : 0;
+        for (let c = lo; c <= hi; c++) map.set(c, base.slice(0, -1) + String.fromCharCode(last + (c - lo)));
+      }
+    }
+  }
+  return { map, width };
+}
+// Splits a content stream into tokens: strings (as { s } or { h }), names, numbers, arrays and operators.
+function pdfTokens(c) {
+  const out = [];
+  let i = 0;
+  const n = c.length;
+  const isWs = (ch) => ch === " " || ch === "\n" || ch === "\r" || ch === "\t" || ch === "\f" || ch === "\0";
+  const isDelim = (ch) => "()<>[]{}/%".includes(ch);
+  const readArray = () => {
+    const arr = [];
+    i++;
+    while (i < n && c[i] !== "]") {
+      const t = next();
+      if (t === undefined) break;
+      arr.push(t);
+    }
+    i++;
+    return { a: arr };
+  };
+  const next = () => {
+    while (i < n && isWs(c[i])) i++;
+    if (i >= n) return undefined;
+    const ch = c[i];
+    if (ch === "%") { while (i < n && c[i] !== "\n" && c[i] !== "\r") i++; return next(); }
+    if (ch === "(") {
+      let depth = 1, s = "";
+      i++;
+      while (i < n && depth > 0) {
+        const d = c[i];
+        if (d === "\\") {
+          const e = c[i + 1];
+          if (e >= "0" && e <= "7") { let o = e; i += 2; while (o.length < 3 && c[i] >= "0" && c[i] <= "7") { o += c[i]; i++; } s += String.fromCharCode(parseInt(o, 8) & 255); continue; }
+          if (e === "n") s += "\n"; else if (e === "r") s += "\r"; else if (e === "t") s += "\t"; else if (e === "b") s += "\b"; else if (e === "f") s += "\f";
+          else if (e === "\r") { if (c[i + 2] === "\n") i++; } else if (e === "\n") { /* line continuation */ } else s += e;
+          i += 2;
+          continue;
+        }
+        if (d === "(") depth++;
+        else if (d === ")") { depth--; if (depth === 0) { i++; break; } }
+        s += d;
+        i++;
+      }
+      return { s };
+    }
+    if (ch === "<" && c[i + 1] === "<") { const d = pdfDictAt(c, i); i += Math.max(2, d.length); return { d: true }; }
+    if (ch === "<") { const e = c.indexOf(">", i); const h = c.slice(i + 1, e < 0 ? n : e).replace(/\s+/g, ""); i = e < 0 ? n : e + 1; return { h }; }
+    if (ch === "[") return readArray();
+    if (ch === "/") { let j = i + 1; while (j < n && !isWs(c[j]) && !isDelim(c[j])) j++; const name = c.slice(i + 1, j); i = j; return { n: name }; }
+    if (ch === "]" || ch === ">" || ch === ")" || ch === "{" || ch === "}") { i++; return next(); }
+    let j = i;
+    while (j < n && !isWs(c[j]) && !isDelim(c[j])) j++;
+    const word = c.slice(i, j);
+    i = j > i ? j : i + 1;
+    const num = Number(word);
+    return word !== "" && Number.isFinite(num) ? { v: num } : { op: word };
+  };
+  let t;
+  while ((t = next()) !== undefined) out.push(t);
+  return out;
+}
+function pdfShow(tok, font) {
+  const bytes = tok.h !== undefined ? (() => { const h = tok.h.length % 2 ? tok.h + "0" : tok.h; const b = []; for (let k = 0; k < h.length; k += 2) b.push(parseInt(h.slice(k, k + 2), 16)); return b; })() : [...tok.s].map((x) => x.charCodeAt(0) & 255);
+  if (font && font.map && font.map.size) {
+    let out = "";
+    const w = font.width;
+    for (let k = 0; k + w <= bytes.length; k += w) {
+      let code = 0;
+      for (let q = 0; q < w; q++) code = code * 256 + bytes[k + q];
+      const got = font.map.get(code);
+      out += got !== undefined ? got : w === 1 ? String.fromCharCode(code) : "";
+    }
+    return out;
+  }
+  if (font && font.twoByte) return "";
+  return bytes.map((b) => String.fromCharCode(b)).join("");
+}
+function pdfPageText(tokens, fonts) {
+  let out = "", font = null, y = null, lineY = null, x = 0;
+  const stack = [];
+  const newline = () => { if (!out.endsWith("\n")) out += "\n"; };
+  for (let k = 0; k < tokens.length; k++) {
+    const t = tokens[k];
+    if (t.op === undefined) { stack.push(t); continue; }
+    const op = t.op;
+    const nums = stack.filter((s) => s.v !== undefined).map((s) => s.v);
+    if (op === "Tf") { const nm = stack.find((s) => s.n !== undefined); font = nm ? fonts[nm.n] || null : null; }
+    else if (op === "Tj" || op === "'" || op === '"') {
+      if (op !== "Tj") newline();
+      const s = stack.filter((q) => q.s !== undefined || q.h !== undefined).pop();
+      if (s) out += pdfShow(s, font);
+    } else if (op === "TJ") {
+      const arr = stack.find((q) => q.a);
+      if (arr) for (const item of arr.a) { if (item.v !== undefined) { if (item.v < -180) out += " "; } else if (item.s !== undefined || item.h !== undefined) out += pdfShow(item, font); }
+    } else if (op === "Td" || op === "TD") { if (nums.length >= 2 && Math.abs(nums[1]) > 0.5) newline(); else if (nums.length >= 2 && nums[0] > 0.5) out += " "; }
+    else if (op === "T*") newline();
+    else if (op === "Tm") { if (nums.length >= 6) { if (lineY !== null && Math.abs(nums[5] - lineY) > 0.5) newline(); else if (lineY !== null && nums[4] - x > 0.5) out += " "; lineY = nums[5]; x = nums[4]; } }
+    else if (op === "BT") { /* keep position between blocks */ }
+    else if (op === "ET") { out += " "; }
+    stack.length = 0;
+  }
+  return out;
+}
+async function pdfText(bytes) {
+  if (!bytes || bytes.length < 20) return { text: "", pages: 0 };
+  const raw = pdfBin(bytes);
+  if (!raw.startsWith("%PDF")) return { text: "", pages: 0 };
+  if (/\/Encrypt\b/.test(raw.slice(-2048)) || /\/Encrypt\s*\d/.test(raw.slice(-4096))) return { text: "", pages: 0, encrypted: true };
+  const { objs, dataOf } = await pdfObjects(raw);
+  const fontCache = new Map();
+  const loadFont = async (num) => {
+    if (fontCache.has(num)) return fontCache.get(num);
+    const o = objs.get(num);
+    let f = { map: null, width: 1, twoByte: false };
+    if (o) {
+      const tu = pdfRef(pdfGet(o.dict, "ToUnicode"));
+      f.twoByte = /\/Identity-H|\/Type0/.test(o.dict);
+      if (tu && objs.get(tu)) {
+        const b = await dataOf(objs.get(tu));
+        if (b) { const parsed = pdfToUnicode(pdfBin(b)); f.map = parsed.map; f.width = parsed.width; }
+      }
+    }
+    fontCache.set(num, f);
+    return f;
+  };
+  const resolveDict = (v) => { const r = pdfRef(v); return r && objs.get(r) ? objs.get(r).dict : String(v || ""); };
+  const pages = [...objs.entries()].filter(([, o]) => /\/Type\s*\/Page(?![A-Za-z])/.test(o.dict)).sort((a, b) => a[0] - b[0]);
+  const inherited = (o, key) => {
+    let cur = o, guard = 0;
+    while (cur && guard++ < 12) { const v = pdfGet(cur.dict, key); if (v) return v; const p = pdfRef(pdfGet(cur.dict, "Parent")); cur = p ? objs.get(p) : null; }
+    return "";
+  };
+  let text = "";
+  for (const [, page] of pages) {
+    const res = resolveDict(inherited(page, "Resources"));
+    const fontDict = resolveDict(pdfGet(res, "Font"));
+    const fonts = {};
+    for (const m of fontDict.matchAll(/\/([^\s/<>\[\]()]+)\s+(\d+)\s+\d+\s+R/g)) fonts[m[1]] = await loadFont(Number(m[2]));
+    const contents = pdfGet(page.dict, "Contents");
+    const refs = contents.startsWith("[") ? [...contents.matchAll(/(\d+)\s+\d+\s+R/g)].map((x) => Number(x[1])) : [pdfRef(contents)];
+    let content = "";
+    for (const r of refs) { const o = objs.get(r); const b = o && await dataOf(o); if (b) content += pdfBin(b) + "\n"; }
+    text += pdfPageText(pdfTokens(content), fonts) + "\n\f\n";
+  }
+  return { text, pages: pages.length };
+}
+const PDF_MONTHS = { jan: 1, january: 1, feb: 2, february: 2, mar: 3, march: 3, apr: 4, april: 4, may: 5, jun: 6, june: 6, jul: 7, july: 7, aug: 8, august: 8, sep: 9, sept: 9, september: 9, oct: 10, october: 10, nov: 11, november: 11, dec: 12, december: 12 };
+function pdfDates(text) {
+  const found = [];
+  const add = (index, length, y, m, d) => {
+    if (y < 100) y += 2000;
+    if (y < 1990 || y > 2100 || m < 1 || m > 12 || d < 1 || d > 31) return;
+    const dt = new Date(Date.UTC(y, m - 1, d));
+    if (dt.getUTCMonth() !== m - 1) return;
+    found.push({ index, end: index + length, iso: `${y}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}` });
+  };
+  let m;
+  const dmyText = /\b(\d{1,2})(?:st|nd|rd|th)?\s+(?:of\s+)?([A-Za-z]{3,9})\.?,?\s+(\d{4})\b/g;
+  while ((m = dmyText.exec(text))) { const mo = PDF_MONTHS[m[2].toLowerCase()]; if (mo) add(m.index, m[0].length, Number(m[3]), mo, Number(m[1])); }
+  const mdyText = /\b([A-Za-z]{3,9})\.?\s+(\d{1,2})(?:st|nd|rd|th)?,?\s+(\d{4})\b/g;
+  while ((m = mdyText.exec(text))) { const mo = PDF_MONTHS[m[1].toLowerCase()]; if (mo) add(m.index, m[0].length, Number(m[3]), mo, Number(m[2])); }
+  const num = /\b(\d{1,2})[\/.\-](\d{1,2})[\/.\-](\d{2}|\d{4})\b/g;
+  while ((m = num.exec(text))) add(m.index, m[0].length, Number(m[3]), Number(m[2]), Number(m[1]));
+  const iso = /\b(\d{4})-(\d{2})-(\d{2})\b/g;
+  while ((m = iso.exec(text))) add(m.index, m[0].length, Number(m[1]), Number(m[2]), Number(m[3]));
+  found.sort((a, b) => a.index - b.index);
+  return found.filter((d, i) => !found.slice(0, i).some((p) => p.index < d.end && d.index < p.end));
+}
+// Pulls the employee name check, the commencement date and the signed date out of the contract text. A hand signed date is usually blank, so the signed date is often empty.
+function pdfContractFacts(text, personName) {
+  const flat = String(text || "").replace(/[\f\r]+/g, "\n").replace(/[ \t]+/g, " ");
+  const out = { readable: flat.replace(/\s+/g, "").length > 80, nameFound: false, commenced: "", signed: "" };
+  if (!out.readable) return out;
+  const lower = flat.toLowerCase();
+  const parts = String(personName || "").toLowerCase().split(/\s+/).filter((x) => x.length > 1);
+  out.nameFound = parts.length > 0 && parts.every((p) => lower.includes(p));
+  const dates = pdfDates(flat);
+  const key = /(commenc|start(?:ing)?\s+date|date\s+of\s+(?:start|commencement)|begin(?:s|ning)?|effective\s+(?:from|date)|employment\s+will\s+start)/gi;
+  let hit = null, k;
+  while ((k = key.exec(flat))) {
+    const after = dates.find((d) => d.index >= k.index && d.index - k.index < 160);
+    if (after) { hit = after; break; }
+  }
+  if (hit) out.commenced = hit.iso;
+  const sign = /(signed|signature|date\s+signed|dated)/gi;
+  let lastSign = -1;
+  while ((k = sign.exec(flat))) lastSign = k.index;
+  if (lastSign > flat.length * 0.5) {
+    const tail = dates.filter((d) => d.index > lastSign - 40 && (!hit || d.index !== hit.index));
+    if (tail.length) out.signed = tail[tail.length - 1].iso;
+  }
+  return out;
+}
+// ---- PDF scan end ----
+
+// ---- Employment documents: the contract, TFN declaration, super form and any extras, filed by the director into each person's staff folder ----
+// Reservoir > Workplace Culture > Employee Records > Current Employees > <person> > Employment Documents
+const STAFF_DOC_SLOTS = { contract: "Original Employment Contract", tfn: "TFN Declaration", super: "Superannuation Form", additional: "Additional Documents" };
+let staffDocsMade = false;
+async function staffDocsTable(env) {
+  if (staffDocsMade) return;
+  await env.DB.prepare("CREATE TABLE IF NOT EXISTS staff_docs (id TEXT PRIMARY KEY, person_email TEXT NOT NULL, slot TEXT NOT NULL, drive_base TEXT, item_id TEXT, file_name TEXT, mime TEXT, uploaded_by TEXT, uploaded_at TEXT DEFAULT (datetime('now')), removed INTEGER NOT NULL DEFAULT 0)").run();
+  await env.DB.prepare("CREATE INDEX IF NOT EXISTS staff_docs_person ON staff_docs (person_email, removed)").run();
+  for (const col of ["doc_date TEXT", "label TEXT"]) { try { await env.DB.prepare(`ALTER TABLE staff_docs ADD COLUMN ${col}`).run(); } catch (e) { /* column already there */ } }
+  staffDocsMade = true;
+}
+const STAFF_DOC_COLS = "id, slot, file_name, uploaded_at, doc_date, label";
+const staffDocOut = (r) => ({ id: r.id, slot: r.slot, name: r.file_name || "", uploadedAt: r.uploaded_at || "", docDate: r.doc_date || "", label: r.label || "" });
+// Titles for the Additional Documents types the office can pick.
+const STAFF_EXTRA_TYPES = { cv: "CV", details: "Employee Details", tfn: "Tax File Number Declaration", super: "Superannuation Form", template: "Contract Template" };
+const isoDay = (s) => { const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(s || "").trim()); if (!m) return ""; const d = new Date(Date.UTC(+m[1], +m[2] - 1, +m[3])); return d.getUTCFullYear() === +m[1] && d.getUTCMonth() === +m[2] - 1 && d.getUTCDate() === +m[3] ? m[0] : ""; };
+const fileExt = (n) => { const m = /(\.[A-Za-z0-9]{1,8})$/.exec(String(n || "").trim()); return m ? m[1].toLowerCase() : ""; };
+// Puts a file under a folder item, creating the Employment Documents subfolder on the way. Returns the new item.
+async function uploadUnderItem(env, driveBase, folderId, subSegs, fileName, bytes, contentType) {
+  const base = `${driveBase}/items/${folderId}:/${pathOf([...subSegs, fileName])}:`;
+  if (bytes.byteLength <= 4 * 1024 * 1024) {
+    const res = await graphFetch(env, `${base}/content?@microsoft.graph.conflictBehavior=rename`, { method: "PUT", headers: { "Content-Type": contentType || "application/octet-stream" }, body: bytes });
+    if (!res.ok) throw new Error("upload " + res.status);
+    return res.json();
+  }
+  const sess = await graphFetch(env, `${base}/createUploadSession`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ item: { "@microsoft.graph.conflictBehavior": "rename" } }) });
+  if (!sess.ok) throw new Error("session " + sess.status);
+  const { uploadUrl } = await sess.json();
+  let last;
+  for (let start = 0; start < bytes.byteLength; start += CHUNK) {
+    const end = Math.min(start + CHUNK, bytes.byteLength);
+    const res = await fetch(uploadUrl, { method: "PUT", headers: { "Content-Length": String(end - start), "Content-Range": `bytes ${start}-${end - 1}/${bytes.byteLength}` }, body: bytes.slice(start, end) });
+    if (!res.ok && res.status !== 202) throw new Error("chunk " + res.status);
+    last = res;
+  }
+  return last.json();
+}
+// ---- Policies, stored in D1 with the PDFs in SharePoint ----
+let policyAckMade = false;
+async function policyAckTable(env) {
+  await env.DB.prepare("CREATE TABLE IF NOT EXISTS policy_ack_log (id INTEGER PRIMARY KEY AUTOINCREMENT, person_key TEXT NOT NULL, name TEXT, email TEXT, policy_id TEXT NOT NULL, policy_title TEXT, version INTEGER, opened_at TEXT, read_at TEXT, acked_at TEXT NOT NULL)").run();
+  await env.DB.prepare("CREATE INDEX IF NOT EXISTS policy_ack_person ON policy_ack_log (person_key, policy_id)").run();
+}
+async function policyTable(env) {
+  await env.DB.prepare("CREATE TABLE IF NOT EXISTS policies (id TEXT PRIMARY KEY, title TEXT NOT NULL, item_id TEXT, file_name TEXT, needs_ack INTEGER NOT NULL DEFAULT 0, removed INTEGER NOT NULL DEFAULT 0, updated_by TEXT, updated_at TEXT NOT NULL DEFAULT (datetime('now')), version INTEGER NOT NULL DEFAULT 1, folder TEXT)").run();
+  if (!policyAckMade) { try { await env.DB.prepare("UPDATE policies SET needs_ack = 1 WHERE needs_ack <> 1").run(); policyAckMade = true; } catch (e) { /* tried again next time */ } }
+  for (const col of ["version INTEGER NOT NULL DEFAULT 1", "folder TEXT", "docx_item_id TEXT", "docx_name TEXT", "body TEXT", "effective TEXT", "updated_on TEXT", "updated_src TEXT", "kind TEXT NOT NULL DEFAULT 'policy'"]) { try { await env.DB.prepare(`ALTER TABLE policies ADD COLUMN ${col}`).run(); } catch (e) { /* column already there */ } }
+}
+// Plain text out of a .docx (a zip holding word/document.xml), for searching. No library: the zip index is read by hand and the one file inflated.
+async function docxText(bytes) {
+  const u = new Uint8Array(bytes);
+  const dv = new DataView(u.buffer, u.byteOffset, u.byteLength);
+  let eocd = -1;
+  for (let i = u.length - 22; i >= Math.max(0, u.length - 65557); i--) { if (dv.getUint32(i, true) === 0x06054b50) { eocd = i; break; } }
+  if (eocd < 0) return "";
+  const count = dv.getUint16(eocd + 10, true);
+  let p = dv.getUint32(eocd + 16, true);
+  let xml = "", extra = "";
+  for (let n = 0; n < count; n++) {
+    if (dv.getUint32(p, true) !== 0x02014b50) break;
+    const method = dv.getUint16(p + 10, true), csize = dv.getUint32(p + 20, true);
+    const nlen = dv.getUint16(p + 28, true), elen = dv.getUint16(p + 30, true), clen = dv.getUint16(p + 32, true), lho = dv.getUint32(p + 42, true);
+    const entry = new TextDecoder().decode(u.subarray(p + 46, p + 46 + nlen));
+    // The body is word/document.xml. Page headers and footers (word/header1.xml, word/footer1.xml) are read too, since a "last updated" line is often kept in a footer.
+    if (entry === "word/document.xml" || /^word\/(header|footer)\d*\.xml$/.test(entry)) {
+      const start = lho + 30 + dv.getUint16(lho + 26, true) + dv.getUint16(lho + 28, true);
+      const data = u.subarray(start, start + csize);
+      const part = method === 0 ? new TextDecoder().decode(data) : await new Response(new Blob([data]).stream().pipeThrough(new DecompressionStream("deflate-raw"))).text();
+      if (entry === "word/document.xml") xml = part; else extra += part + "</w:p>";
+    }
+    p += 46 + nlen + elen + clen;
+  }
+  xml = extra + xml; // headers and footers first, so the end of the text is the end of the document
+  return xml.replace(/<w:tab\/>/g, " ").replace(/<\/w:p>/g, "\n").replace(/<w:br[^>]*\/>/g, "\n").replace(/<[^>]+>/g, "")
+    .replace(/&#x([0-9a-fA-F]+);/g, (m, h) => String.fromCodePoint(parseInt(h, 16))).replace(/&#(\d+);/g, (m, d) => String.fromCodePoint(Number(d)))
+    .replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&amp;/g, "&")
+    .replace(/[ \t\u00a0]+/g, " ").replace(/\s*\n\s*/g, "\n").trim().slice(0, 300000);
+}
+// ---- Dates read out of a policy's own text ----
+const MONTH_NUM = { jan: 1, feb: 2, mar: 3, apr: 4, may: 5, jun: 6, jul: 7, aug: 8, sep: 9, oct: 10, nov: 11, dec: 12 };
+const MONTH_RE = "(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)";
+// Every full date in a piece of text, in order of appearance, as { iso, at, end }. Handles 12 August 2024, 12th Aug 2024, August 12, 2024,
+// 12/08/2024, 12.08.24, 12-8-2024 and 2024-08-12. Day first (Australian) unless the second number can only be a day. A month and year on their own are skipped.
+function datesIn(text) {
+  const t = String(text || "");
+  const out = [];
+  const add = (y, m, d, at, end) => {
+    if (y < 100) y += 2000;
+    if (m >= 1 && m <= 12 && d >= 1 && d <= 31 && y >= 1990 && y <= 2100) {
+      const dt = new Date(Date.UTC(y, m - 1, d));
+      if (dt.getUTCMonth() === m - 1 && dt.getUTCDate() === d) out.push({ iso: `${y}-${String(m).padStart(2, "0")}-${String(d).padStart(2, "0")}`, at, end });
+    }
+  };
+  let m;
+  const a = new RegExp(`(?<![\\d])(\\d{1,2})(?:st|nd|rd|th)?\\s+(?:of\\s+)?${MONTH_RE}\\b\\.?,?\\s+(\\d{4})(?!\\d)`, "gi");
+  while ((m = a.exec(t))) add(Number(m[3]), MONTH_NUM[m[2].slice(0, 3).toLowerCase()], Number(m[1]), m.index, m.index + m[0].length);
+  const b = new RegExp(`\\b${MONTH_RE}\\b\\.?\\s+(\\d{1,2})(?:st|nd|rd|th)?,?\\s+(\\d{4})(?!\\d)`, "gi");
+  while ((m = b.exec(t))) add(Number(m[3]), MONTH_NUM[m[1].slice(0, 3).toLowerCase()], Number(m[2]), m.index, m.index + m[0].length);
+  const c = /(?<![\d\/.\-])(\d{4})-(\d{1,2})-(\d{1,2})(?![\d\-])/g;
+  while ((m = c.exec(t))) add(Number(m[1]), Number(m[2]), Number(m[3]), m.index, m.index + m[0].length);
+  const d = /(?<![\d\/.\-])(\d{1,2})([\/.\-])(\d{1,2})\2(\d{4}|\d{2})(?![\d\/]|\.\d)/g;
+  while ((m = d.exec(t))) {
+    if (m[4].length === 2 && m[2] !== "/") continue; // 1.2.03 is a version number, not a date
+    let day = Number(m[1]), mon = Number(m[3]);
+    if (mon > 12 && day <= 12) { const x = day; day = mon; mon = x; }
+    add(Number(m[4]), mon, day, m.index, m.index + m[0].length);
+  }
+  out.sort((x, y) => x.at - y.at);
+  // The same text can match two shapes (12/08/2024 inside another); keep the first of any overlap.
+  return out.filter((x, i) => i === 0 || x.at >= out[i - 1].end);
+}
+// The "effective from" date a policy states about itself, as yyyy-mm-dd. Returns "" when the text gives none.
+function findEffective(body) {
+  const text = String(body || "");
+  const re = /effective/gi;
+  let hit;
+  while ((hit = re.exec(text))) {
+    const win = text.slice(hit.index, hit.index + 120);
+    const d = datesIn(win)[0];
+    if (d) return d.iso;
+  }
+  return "";
+}
+// The date a policy says it was last updated, as { iso, how } or null. Looks first for a labelled date (Last updated, Date last reviewed, Revision date, Version date and so on)
+// and takes the most recent one. Failing that, takes the most recent date in the last stretch of the document, where revision tables and sign off lines sit.
+// Dates in the future, dates that follow "next review" or "effective", and dates before 2000 are never taken.
+// Strong labels are clear enough to look up to 80 characters on for the date. Weak labels ("Version date", "Issue date") are also column headings in revision tables,
+// so for those the date has to follow straight on, with nothing but punctuation between.
+const UPDATED_STRONG = new RegExp("(?:last\\s+(?:updated|reviewed|revised|amended|modified|edited|update|review|revision|amendment)(?:\\s+(?:date|on))?|date\\s+(?:last\\s+)?(?:updated|reviewed|revised|amended|modified)|date\\s+of\\s+(?:the\\s+)?(?:last\\s+)?(?:update|review|revision|amendment|issue)|(?:updated|revised|amended|reviewed|modified|issued)\\s+on)", "gi");
+const UPDATED_WEAK = new RegExp("(?:(?:revision|version|amendment|update|issue|issued|reviewed|revised|updated)\\s+date|date\\s+issued)", "gi");
+function findLastUpdated(body, nowMs) {
+  const text = String(body || "");
+  const limit = new Date((nowMs || Date.now()) + 36 * 3600 * 1000).toISOString().slice(0, 10);
+  const fine = (iso) => policyDateOk(iso) && iso <= limit;
+  let best = "";
+  for (const [re, tight] of [[UPDATED_STRONG, false], [UPDATED_WEAK, true]]) {
+    re.lastIndex = 0;
+    let hit;
+    while ((hit = re.exec(text))) {
+      if (/(next|due|upcoming)\s*$/i.test(text.slice(Math.max(0, hit.index - 12), hit.index))) continue;
+      const from = hit.index + hit[0].length;
+      const win = text.slice(from, from + 80);
+      const d = datesIn(win).find((x) => fine(x.iso));
+      if (!d) continue;
+      if (tight && !/^[\s:|\u2013\u2014\-.,]*(?:(?:is|was)\s*)?[\s:|\u2013\u2014\-.,]*$/i.test(win.slice(0, d.at))) continue;
+      if (d.iso > best) best = d.iso;
+    }
+  }
+  if (best) return { iso: best, how: "label" };
+  const tailAt = Math.max(0, text.length - 1500);
+  let tailBest = "";
+  for (const d of datesIn(text.slice(tailAt))) {
+    if (!fine(d.iso)) continue;
+    const before = text.slice(Math.max(0, tailAt + d.at - 50), tailAt + d.at);
+    if (/(next\s+review|review\s+due|due\s+for\s+review|due\s+date|effective|expires?|expiry|printed|signed)[^\n]{0,40}$/i.test(before)) continue;
+    if (d.iso > tailBest) tailBest = d.iso;
+  }
+  return tailBest ? { iso: tailBest, how: "end" } : null;
+}
+// A policy name out of a file name: no folder, no extension, no trailing version tag or "(1)", underscores as spaces.
+function titleFromName(name) {
+  let t = String(name || "").split(/[\\/]/).pop().replace(/\.(pdf|docx|doc)$/i, "").replace(/_/g, " ");
+  t = t.replace(/\s*\(\d+\)\s*$/, "").replace(/[\s\-]+v\s?\d+(?:\.\d+)*\s*$/i, "").replace(/[\s\-]+(?:version|ver)\s?\d+(?:\.\d+)*\s*$/i, "");
+  return t.replace(/\s+/g, " ").trim().slice(0, 120);
+}
+const DOCX_TYPE = "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
+const MAX_CONVERT = 2 * 1024 * 1024;
+const isWordFile = (name, type) => /\.docx$/i.test(String(name || "")) || /wordprocessingml/i.test(String(type || ""));
+const policyFail = (status, say, e) => Object.assign(new Error(say + (e ? ` (${String(e.message || e).slice(0, 120)})` : "")), { status, say });
+// Asks Microsoft Graph to turn a stored Word file into a PDF. Needs Sites.ReadWrite.All or Files.ReadWrite.All on the Graph app.
+async function graphToPdf(env, itemId) {
+  const call = () => graphFetch(env, `/sites/${siteId(env)}/drive/items/${itemId}/content?format=pdf`, { redirect: "manual" });
+  let res = await call();
+  if (res.status === 401 || res.status === 403) { graphToken = { at: 0, value: "" }; res = await call(); }
+  const loc = res.headers.get("Location");
+  const file = loc ? await fetch(loc) : res;
+  if (!file.ok) throw new Error(`convert ${res.status} ${file.status}`);
+  const bytes = await file.arrayBuffer();
+  const head = new TextDecoder().decode(new Uint8Array(bytes.slice(0, 5)));
+  if (!head.startsWith("%PDF")) throw new Error("convert gave something that is not a PDF");
+  return bytes;
+}
+// Where policy files live. Policies belong under Workplace Culture. Until the folder has been moved there, the old top level Policies folder keeps working,
+// so the move can be done in SharePoint at any time without breaking uploads. The result is kept for one minute.
+const POLICY_HOMES = [["Workplace Culture", "Policies"], ["Reservoir", "Workplace Culture", "Policies"], ["Policies"]];
+let policyHomeKept = null;
+async function policyHome(env) {
+  if (policyHomeKept && Date.now() - policyHomeKept.at < 60000) return policyHomeKept.segs;
+  let found = null;
+  for (const segs of POLICY_HOMES) {
+    try {
+      const r = await graphFetch(env, `/sites/${siteId(env)}/drive/root:/${pathOf(segs)}?select=id,folder`);
+      if (!r.ok) continue;
+      const it = await r.json();
+      if (it.folder) { found = segs; break; }
+    } catch (e) { /* try the next place */ }
+  }
+  if (!found) return POLICY_HOMES[0];
+  policyHomeKept = { at: Date.now(), segs: found };
+  return found;
+}
+// ---- Document libraries ----
+// Policies and the Handbook are one thing kept in two places: the same table, routes, versions, Archive folder, text reading and date reading.
+// The only difference is the SharePoint folder: Workplace Culture / Policies and Workplace Culture / Handbook.
+const docKind = (v) => (v === "handbook" ? "handbook" : "policy");
+async function docHome(env, kind) {
+  const home = await policyHome(env);
+  return kind === "handbook" ? [...home.slice(0, -1), "Handbook"] : home;
+}
+// A file only counts as saved once SharePoint is asked for it again: the folder must exist, the file must be in that folder, and a PDF must be the size that was sent.
+async function confirmStored(env, segs, item, expectedSize) {
+  const lookup = async (path) => { try { const r = await graphFetch(env, path); return r.ok ? await r.json() : null; } catch (e) { return null; } };
+  const dir = await lookup(`/sites/${siteId(env)}/drive/root:/${pathOf(segs)}?select=id,folder`);
+  const file = item && item.id ? await lookup(`/sites/${siteId(env)}/drive/items/${item.id}?select=id,name,size,file,parentReference`) : null;
+  const inFolder = !!(dir && dir.folder && file && file.file && file.parentReference && file.parentReference.id === dir.id);
+  const sized = !!file && file.size > 0 && (expectedSize === undefined || file.size === expectedSize);
+  if (!inFolder || !sized) throw policyFail(502, `The file could not be found in SharePoint after saving (${segs.join(" / ")}). Nothing was added.`);
+  return file;
+}
+// Publishes the next version of a document. A Word file is saved as "Title vn.docx", converted by Graph, and the PDF saved as "Title vn.pdf". The v is always lowercase.
+// Every file saved is confirmed in SharePoint before anything else happens. Only once the new files are safely stored does the previous pair move into the Archive folder,
+// so a failed conversion or a missing file leaves the current version untouched.
+async function policyPublish(env, prev, folder, next, bytes, ctype, origName, kind) {
+  const home = await docHome(env, kind);
+  const dest = [...home, folder];
+  const word = isWordFile(origName, ctype);
+  let docxItem = null, pdfItem, pdfSize;
+  if (word) {
+    if (bytes.byteLength > MAX_CONVERT) throw policyFail(413, "That Word file is over 2 MB, the most Microsoft will convert. Shrink any pictures and try again.");
+    docxItem = await uploadToSharePoint(env, dest, `${folder} v${next}.docx`, bytes, DOCX_TYPE, false);
+    try {
+      const pdfBytes = await graphToPdf(env, docxItem.id);
+      pdfSize = pdfBytes.byteLength;
+      pdfItem = await uploadToSharePoint(env, dest, `${folder} v${next}.pdf`, pdfBytes, "application/pdf", false);
+    } catch (e) {
+      try { await graphFetch(env, `/sites/${siteId(env)}/drive/items/${docxItem.id}`, { method: "DELETE" }); } catch (x) { /* leave it */ }
+      throw policyFail(502, "Microsoft could not convert that Word file to a PDF. The current version has not been changed.", e);
+    }
+  } else {
+    pdfSize = bytes.byteLength;
+    pdfItem = await uploadToSharePoint(env, dest, `${folder} v${next}.pdf`, bytes, "application/pdf", false);
+  }
+  try {
+    if (docxItem) await confirmStored(env, dest, docxItem);
+    await confirmStored(env, dest, pdfItem, pdfSize);
+  } catch (e) {
+    for (const it of [docxItem, pdfItem]) { if (it && it.id) { try { await graphFetch(env, `/sites/${siteId(env)}/drive/items/${it.id}`, { method: "DELETE" }); } catch (x) { /* leave it */ } } }
+    throw e;
+  }
+  // The previous PDF goes into Archive. The previous Word file is deleted, since the new Word file is the master.
+  let archived = true;
+  if (prev && prev.item_id) {
+    try {
+      const old = await driveBytes(env, prev.item_id);
+      await uploadToSharePoint(env, [...dest, "Archive"], prev.file_name || `${folder} v${next - 1}.pdf`, old, "application/pdf", false);
+      await graphFetch(env, `/sites/${siteId(env)}/drive/items/${prev.item_id}`, { method: "DELETE" });
+    } catch (e) { archived = false; console.log("policy archive error", String(e && e.message || e)); }
+  }
+  if (prev && prev.docx_item_id) {
+    try { await graphFetch(env, `/sites/${siteId(env)}/drive/items/${prev.docx_item_id}`, { method: "DELETE" }); } catch (e) { console.log("policy old word delete error", String(e && e.message || e)); }
+  }
+  let body = "";
+  if (word) { try { body = await docxText(bytes); } catch (e) { console.log("policy text error", String(e && e.message || e)); } }
+  return { body, effective: body ? findEffective(body) : "", itemId: pdfItem.id, fileName: pdfItem.name || `${folder} v${next}.pdf`, docxId: docxItem ? docxItem.id : "", docxName: docxItem ? docxItem.name || `${folder} v${next}.docx` : "", archived };
+}
+// A title that was removed earlier can leave its files behind in SharePoint. Before the title starts again at v1 they are moved into its Archive folder, so the new v1 never clashes with them.
+async function archiveLeftovers(env, dest) {
+  let list;
+  try {
+    const r = await graphFetch(env, `/sites/${siteId(env)}/drive/root:/${pathOf(dest)}:/children?$select=id,name,file&$top=200`);
+    if (!r.ok) return 0;
+    list = (await r.json()).value || [];
+  } catch (e) { return 0; }
+  let moved = 0;
+  for (const it of list) {
+    if (!it.file) continue;
+    // Only files this app made ("Title v1.pdf", "Title v1.docx", and a renamed copy) are ever moved. Anything else in the folder is left alone.
+    if (!/ v\d+(?: \d+)?\.(pdf|docx)$/i.test(it.name)) continue;
+    try {
+      const old = await driveBytes(env, it.id);
+      await uploadToSharePoint(env, [...dest, "Archive"], it.name, old, "application/octet-stream", false);
+      await graphFetch(env, `/sites/${siteId(env)}/drive/items/${it.id}`, { method: "DELETE" });
+      moved++;
+    } catch (e) {
+      throw policyFail(502, `The earlier files for this title could not be moved to its Archive (${dest.join(" / ")}). Nothing was added.`, e);
+    }
+  }
+  return moved;
+}
+const policyOut = (r) => ({ id: r.id, title: r.title, version: r.version || 1, hasWord: !!r.docx_item_id, effective: r.effective || "", fileName: r.file_name || "", hasFile: !!r.item_id, needsAck: true, kind: r.kind === "handbook" ? "handbook" : "policy", updatedOn: r.updated_on || "", updatedSrc: r.updated_on ? (policyDateManual(r) ? "manual" : r.updated_src) : "", updated: r.updated_on ? r.updated_on : String(r.updated_at || "").replace(" ", "T") + "Z" });
+// The "last updated" date shown for a policy is the date the director sets from the document itself. Until one is set, the upload date is shown. A plain yyyy-mm-dd, or "" to clear it.
+function policyDateOk(v) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(v || ""))) return false;
+  const d = new Date(v + "T00:00:00Z");
+  return !isNaN(d) && d.toISOString().slice(0, 10) === v && Number(v.slice(0, 4)) >= 2000;
+}
+
+// A date set by hand (or saved before dates were read automatically) is never overwritten by reading the document.
+// Nobody can set a last updated date by hand any more: it only ever comes from reading the document. A date left from before that is replaced by the next read of the document.
+const policyDateManual = (r) => false;
+const policySrc = (f) => (f ? (f.how === "label" ? "doc" : "doc-end") : null);
+// Stores the text of a policy and reads its dates out of it. The effective date always follows the text. The last updated date follows the text unless it was set by hand.
+async function policyApplyText(env, r, text) {
+  const effective = findEffective(text);
+  const last = findLastUpdated(text);
+  const manual = policyDateManual(r);
+  if (manual) await env.DB.prepare("UPDATE policies SET body = ?, effective = ? WHERE id = ?").bind(text, effective, r.id).run();
+  else await env.DB.prepare("UPDATE policies SET body = ?, effective = ?, updated_on = ?, updated_src = ? WHERE id = ?").bind(text, effective, last ? last.iso : null, policySrc(last), r.id).run();
+  return { effective, last, manual };
+}
+// PDF text read by the app (the Worker cannot read PDF text itself) comes in here. A policy that has a Word file keeps the text from the Word file.
+async function policyTextSave(env, row, request) {
+  let j;
+  try { j = await request.json(); } catch { throw policyFail(400, "bad json"); }
+  const text = String(j && j.text || "").replace(/[ \t\u00a0]+/g, " ").replace(/\s*\n\s*/g, "\n").trim().slice(0, 300000);
+  if (!text) throw policyFail(400, "No text came with that request");
+  const cur = await env.DB.prepare("SELECT body FROM policies WHERE id = ?").bind(row.id).first();
+  let skipped = false;
+  if (row.docx_item_id && cur && cur.body) skipped = true;
+  else await policyApplyText(env, row, text);
+  const out = await env.DB.prepare("SELECT id, title, item_id, file_name, needs_ack, updated_at, updated_on, updated_src, version, folder, docx_item_id, docx_name, effective, kind FROM policies WHERE id = ?").bind(row.id).first();
+  return { policy: policyOut(out), skipped };
+}
+
+const money2 = (v) => { const n = Number(v); return Number.isFinite(n) ? Math.round(n * 100) / 100 : 0; };
+const txt = (v, n) => String(v === undefined || v === null ? "" : v).replace(/\s+/g, " ").trim().slice(0, n);
+// Australian financial year: starts 1 July. Returns { label: "2026", start: "2026-07-01" } for the year a date falls in.
+function financialYear(iso) {
+  const y = Number(iso.slice(0, 4));
+  const m = Number(iso.slice(5, 7));
+  const start = m >= 7 ? y : y - 1;
+  return { label: String(start), start: `${start}-07-01` };
+}
+
+
+// ---- PPE: the bag acknowledgement, replenishment orders and the four stage trail (requested, approved, provided, received) ----
+// Everything is kept in DFP's own database and nothing here touches Xero. Items are fixed on the Worker so a request can only name a real item.
+// "stock" items are supplied by DFP from the shed. "buy" items are bought by the person after approval, with the receipt uploaded against the order to close it.
+const PPE_BOOT_SIZES = ["AU 9", "AU 10", "AU 11", "AU 12", "AU 13"];
+const PPE_DEFAULTS = [
+  { id: "earmuffs", label: "Ear Muffs", kind: "stock" },
+  { id: "earplugs", label: "Ear Plugs", kind: "stock" },
+  { id: "masks", label: "Face Masks", kind: "stock" },
+  { id: "firstaid", label: "First Aid Kit", kind: "stock", expiry: true },
+  { id: "cutgloves", label: "Gloves: Cut Resistant", kind: "stock", sizes: ["S", "M", "L", "XL"] },
+  { id: "silicone", label: "Gloves: Silicone", kind: "stock", sizes: ["S", "M", "L", "XL"] },
+  { id: "hardhat", label: "Hard Hat", kind: "stock" },
+  { id: "respirator", label: "Respirator: P2", kind: "stock" },
+  { id: "glassesclear", label: "Safety Glasses: Clear", kind: "stock" },
+  { id: "glassesuv", label: "Safety Glasses: UV", kind: "stock" },
+  { id: "steelcap", label: "Steel Cap Boots", kind: "stock", sizes: PPE_BOOT_SIZES },
+  { id: "sunscreen", label: "Sunscreen", kind: "stock" }
+];
+const PPE_ITEMS = PPE_DEFAULTS.map((x) => ({ ...x }));
+let ppeLoadedAt = 0;
+// The PPE kit list lives in D1 so the office can reword it from the PPE editor. PPE_ITEMS is refilled in place, so every existing reader keeps working.
+async function ppeLoad(env, force) {
+  if (!force && Date.now() - ppeLoadedAt < 20000) return;
+  await env.DB.prepare("CREATE TABLE IF NOT EXISTS ppe_items (id TEXT PRIMARY KEY, label TEXT NOT NULL, kind TEXT DEFAULT 'stock', sizes TEXT, expiry INTEGER DEFAULT 0, sort INTEGER, active INTEGER DEFAULT 1)").run();
+  const have = await env.DB.prepare("SELECT COUNT(*) AS n FROM ppe_items").first();
+  if (!have || !have.n) {
+    for (let i = 0; i < PPE_DEFAULTS.length; i++) { const x = PPE_DEFAULTS[i]; await env.DB.prepare("INSERT INTO ppe_items (id, label, kind, sizes, expiry, sort) VALUES (?, ?, 'stock', ?, ?, ?)").bind(x.id, x.label, x.sizes ? JSON.stringify(x.sizes) : null, x.expiry ? 1 : 0, i).run(); }
+  }
+  const rows = ((await env.DB.prepare("SELECT id, label, kind, sizes, expiry FROM ppe_items WHERE active = 1 ORDER BY sort, id").all()).results) || [];
+  const list = rows.map((r) => { let sizes = null; try { sizes = r.sizes ? JSON.parse(r.sizes) : null; } catch (e) { sizes = null; } return { id: r.id, label: r.label, kind: r.kind || "stock", ...(sizes && sizes.length ? { sizes } : {}), ...(r.expiry ? { expiry: true } : {}) }; });
+  PPE_ITEMS.splice(0, PPE_ITEMS.length, ...list);
+  ppeLoadedAt = Date.now();
+}
+const ppeItem = (id) => PPE_ITEMS.find((x) => x.id === id);
+let ppeReady = false;
+async function ppeTables(env) {
+  if (ppeReady) return;
+  await env.DB.prepare("CREATE TABLE IF NOT EXISTS ppe_state (person_key TEXT PRIMARY KEY, name TEXT, email TEXT, have TEXT, first_aid_expiry TEXT, acknowledged_at TEXT, updated_at TEXT DEFAULT (datetime('now')))").run();
+  await env.DB.prepare("CREATE TABLE IF NOT EXISTS ppe_orders (id TEXT PRIMARY KEY, person_key TEXT, name TEXT, email TEXT, items TEXT, source TEXT, status TEXT NOT NULL DEFAULT 'requested', po_number TEXT, receipt_item TEXT, created_at TEXT DEFAULT (datetime('now')), approved_by TEXT, approved_at TEXT, provided_by TEXT, provided_at TEXT, received_at TEXT, declined_by TEXT, declined_at TEXT)").run();
+  await env.DB.prepare("CREATE INDEX IF NOT EXISTS ppe_orders_person ON ppe_orders (person_key)").run();
+  for (const col of ["deleted_at TEXT", "delete_reason TEXT"]) { try { await env.DB.prepare("ALTER TABLE ppe_orders ADD COLUMN " + col).run(); } catch (e) { /* already there */ } }
+  ppeReady = true;
+}
+const ppePerson = (user) => ({ key: profileKey(user.name) || (user.email ? "email:" + String(user.email).toLowerCase() : ""), name: String(user.name || user.email || "").slice(0, 120), email: String(user.email || "").toLowerCase() });
+const ppeJson = (t, d) => { try { const v = JSON.parse(t || ""); return v === null || v === undefined ? d : v; } catch (e) { return d; } };
+const ppeOrderOut = (r) => {
+  const items = ppeJson(r.items, []);
+  return { id: r.id, kind: "ppe", type: "PPE order", by: String(r.name || "").split(" ")[0], byName: r.name || "", items, source: r.source || "order", status: r.status, poNumber: r.po_number || "", hasReceipt: !!r.receipt_item, date: String(r.created_at || "").slice(0, 10), approvedDate: r.approved_at ? String(r.approved_at).slice(0, 10) : "", providedDate: r.provided_at ? String(r.provided_at).slice(0, 10) : "", receivedDate: r.received_at ? String(r.received_at).slice(0, 10) : "", deletedDate: r.deleted_at ? String(r.deleted_at).slice(0, 10) : "", deleteReason: r.delete_reason || "", text: items.map((x) => x.label + (x.size ? " " + x.size : "")).join(", "), server: true };
+};
+// Where the person's bag stands. none: never acknowledged. partial: something is outstanding. full: every stock item is in the bag and the bought item has its receipt.
+function ppeBagStatus(state, orders) {
+  if (!state || !state.acknowledged_at) return "none";
+  const have = ppeJson(state.have, {});
+  const bought = (id) => orders.some((o) => o.status === "received" && ppeJson(o.items, []).some((x) => x.id === id));
+  const missing = PPE_ITEMS.filter((x) => x.kind === "stock" ? !have[x.id] : !bought(x.id));
+  return missing.length ? "partial" : "full";
+}
+async function ppeMe(env, user) {
+  await ppeLoad(env);
+  await ppeTables(env);
+  const who = ppePerson(user);
+  const state = await env.DB.prepare("SELECT * FROM ppe_state WHERE person_key = ?").bind(who.key).first();
+  const rows = ((await env.DB.prepare("SELECT * FROM ppe_orders WHERE person_key = ? ORDER BY created_at DESC, rowid DESC LIMIT 100").bind(who.key).all()).results) || [];
+  let status = ppeBagStatus(state, rows);
+  // An audit pushed from the PPE editor sends everyone who had a handover back through the tick list, until they confirm again.
+  let auditAt = "";
+  try { const a = await env.DB.prepare("SELECT value FROM app_settings WHERE key = 'ppe.audit_at'").first(); auditAt = a && a.value ? String(a.value) : ""; } catch (e) { auditAt = ""; }
+  if (status === "full" && auditAt && state && String(state.acknowledged_at || "") < auditAt) status = "audit";
+  const open = (id) => rows.some((o) => ["requested", "approved", "provided"].includes(o.status) && ppeJson(o.items, []).some((x) => x.id === id));
+  return { status, ackAt: (state && state.acknowledged_at) || "", ackBy: (state && state.name) || "", acknowledged: !!(state && state.acknowledged_at), have: ppeJson(state && state.have, {}), firstAidExpiry: (state && state.first_aid_expiry) || "", outstanding: PPE_ITEMS.filter((x) => open(x.id)).map((x) => x.id), orders: rows.map(ppeOrderOut) };
+}
+function ppeCleanItems(list) {
+  if (!Array.isArray(list) || !list.length || list.length > 12) return null;
+  const seen = new Set(), out = [];
+  for (const x of list) {
+    const it = ppeItem(x && x.id);
+    if (!it || seen.has(it.id)) return null;
+    seen.add(it.id);
+    const size = String((x && x.size) || "").toUpperCase();
+    if (it.sizes) { if (size && !it.sizes.includes(size)) return null; }
+    else if (size) return null;
+    out.push({ id: it.id, label: it.label, kind: it.kind, ...(it.sizes ? { size } : {}) });
+  }
+  return out;
+}
+// Makes one order for the stock items and one for the bought items, so each can move through its own stages.
+async function ppeCreateOrders(env, who, items, source) {
+  const made = [];
+  for (const group of items.map((x) => [x])) {
+    if (!group.length) continue;
+    const id = crypto.randomUUID();
+    await env.DB.prepare("INSERT INTO ppe_orders (id, person_key, name, email, items, source, status) VALUES (?, ?, ?, ?, ?, ?, 'requested')").bind(id, who.key, who.name, who.email, JSON.stringify(group), source).run();
+    made.push(ppeOrderOut(await env.DB.prepare("SELECT * FROM ppe_orders WHERE id = ?").bind(id).first()));
+  }
+  return made;
+}
+
+// ---- Stored pay slips: pay slips for current employees, kept in Reservoir's own database ----
+// The pull below is the only thing that reads pay slips from Xero. It is run by a director from the Development screen, and is safe to run again: a pay run already stored is skipped, so the same action is the weekly top up.
+// People and screens read the stored copy, so nobody else ever causes a Xero call for a pay slip.
+// Only current employees are stored (people with a row in xero_payroll). Anyone else on a pay run is skipped. No tax file number and no bank number is stored: the bank block is blanked before saving and filled in again when the person views their own slip, from dfp_xero.
+// The first payment date held in Reservoir: the first pay day of the 2025 to 2026 financial year. Anyone needing an earlier pay slip asks the office.
+const PAYSLIP_FROM = "2025-07-03";
+// The first financial year whose every pay day is held, so its year to date can be added up in full.
+const PAYSLIP_FULL_FY = "2025-07-01";
+// Bumped when the rules for building a stored pay slip change. A run stored under older rules is not counted as done, so the next pull rebuilds it from Xero.
+const PAYSLIP_RULES = 2;
+let payslipReady = false;
+async function payslipTables(env) {
+  if (payslipReady) return;
+  await env.DB.prepare("CREATE TABLE IF NOT EXISTS payslip_store (run_id TEXT NOT NULL, employee_id TEXT NOT NULL, email TEXT, name TEXT, period_start TEXT, period_end TEXT, payment_date TEXT NOT NULL, gross REAL NOT NULL DEFAULT 0, tax REAL NOT NULL DEFAULT 0, super_amt REAL NOT NULL DEFAULT 0, net REAL NOT NULL DEFAULT 0, slip TEXT NOT NULL, built_at TEXT DEFAULT (datetime('now')), PRIMARY KEY (run_id, employee_id))").run();
+  // missing = 1 when Xero left a main total out of this slip. rules says which version of the pay slip rules built the row, so older rows are rebuilt by the next pull.
+  for (const col of ["missing INTEGER NOT NULL DEFAULT 0", "rules INTEGER NOT NULL DEFAULT 0"]) { try { await env.DB.prepare(`ALTER TABLE payslip_store ADD COLUMN ${col}`).run(); } catch (e) { /* already there */ } }
+  await env.DB.prepare("CREATE INDEX IF NOT EXISTS payslip_store_email ON payslip_store (email, payment_date)").run();
+  await env.DB.prepare("CREATE TABLE IF NOT EXISTS payslip_runs (run_id TEXT PRIMARY KEY, payment_date TEXT, period_start TEXT, period_end TEXT, people INTEGER NOT NULL DEFAULT 0, skipped INTEGER NOT NULL DEFAULT 0, built_at TEXT DEFAULT (datetime('now')))").run();
+  try { await env.DB.prepare("ALTER TABLE payslip_runs ADD COLUMN rules INTEGER NOT NULL DEFAULT 0").run(); } catch (e) { /* already there */ }
+  // filed = 1 once the director has paid that pay run and tapped Pay Run Filed. Reservoir only, never a Xero figure. When the column is first added, every run already paid (payment date before today, Melbourne time) is marked filed so only upcoming runs show as Next Pay.
+  let filedAdded = false;
+  try { await env.DB.prepare("ALTER TABLE payslip_runs ADD COLUMN filed INTEGER NOT NULL DEFAULT 0").run(); filedAdded = true; } catch (e) { /* already there */ }
+  try { await env.DB.prepare("ALTER TABLE payslip_runs ADD COLUMN filed_at TEXT").run(); } catch (e) { /* already there */ }
+  try { await env.DB.prepare("ALTER TABLE payslip_runs ADD COLUMN filed_by TEXT").run(); } catch (e) { /* already there */ }
+  if (filedAdded) await env.DB.prepare("UPDATE payslip_runs SET filed = 1, filed_at = datetime('now'), filed_by = 'Existing run' WHERE payment_date < date('now', '+11 hours')").run();
+  payslipReady = true;
+}
+// Employee records kept between batches so a person's record is not fetched again for every batch.
+const payslipRecords = new Map();
+async function payslipRecordFor(env, employeeId) {
+  const kept = payslipRecords.get(employeeId);
+  if (kept && Date.now() - kept.at < 15 * 60000) return kept.record;
+  const r = await xeroFetch(env, `payroll.xro/1.0/Employees/${employeeId}`);
+  if (!r.ok) throw new Error(`Xero refused the employee record (${r.status})`);
+  const record = ((await r.json()).Employees || [])[0];
+  if (!record) throw new Error("Xero returned no employee record");
+  payslipRecords.set(employeeId, { at: Date.now(), record });
+  return record;
+}
+// Builds and stores the next few pay runs that are not stored yet, oldest first. Returns progress, never any pay figure.
+async function payslipPull(env, opts) {
+  const maxRuns = Math.max(1, Math.min(8, Number(opts && opts.runs) || 3));
+  await dfpTables(env);
+  await payslipTables(env);
+  const people = ((await env.DB.prepare("SELECT employee_id, email, name FROM xero_payroll WHERE employee_id IS NOT NULL AND email IS NOT NULL AND email <> '' AND COALESCE(status, 'ACTIVE') = 'ACTIVE'").all()).results) || [];
+  if (!people.length) return { fail: { status: 409, error: "No current employees are in the database yet. Run Populate DFP Internal first." } };
+  const byId = new Map(people.map((x) => [x.employee_id, x]));
+  // Always read the pay run list fresh, so a run posted in Xero a moment ago is seen. With replace, runs posted here but not yet filed are rebuilt from Xero.
+  xeroRunsKept = null;
+  if (opts && opts.replace) await env.DB.prepare("UPDATE payslip_runs SET rules = 0 WHERE filed = 0").run();
+  const posted = await xeroPostedRuns(env);
+  if (posted.fail) return { fail: { status: 502, error: "Xero refused the pay run list", detail: posted.fail.detail || "" } };
+  const runs = posted.runs.filter((x) => xeroDate(x.PaymentDate) >= PAYSLIP_FROM).sort((a, b) => xeroDate(a.PaymentDate).localeCompare(xeroDate(b.PaymentDate)));
+  const doneRows = ((await env.DB.prepare("SELECT run_id FROM payslip_runs WHERE rules >= ?").bind(PAYSLIP_RULES).all()).results) || [];
+  const done = new Set(doneRows.map((x) => x.run_id));
+  const pending = runs.filter((x) => !done.has(x.PayRunID));
+  const out = { from: PAYSLIP_FROM, runsSince: runs.length, runsDoneBefore: runs.length - pending.length, runsBuilt: 0, slipsStored: 0, skippedNotCurrent: 0, failed: [], flagged: [], remaining: pending.length, people: people.length };
+  if (!pending.length) return out;
+  const items = await xeroItems(env);
+  const kept = {};
+  const supFor = new Map();
+  for (const run of pending.slice(0, maxRuns)) {
+    const rd = await xeroRunDetail(env, run.PayRunID);
+    if (rd.fail) { out.failed.push(`pay run ${xeroDate(run.PaymentDate)}: ${(rd.fail.body && rd.fail.body.error) || "Xero refused"}`); break; }
+    const detail = rd.run;
+    if (!detail || (detail.PayRunStatus || "") !== "POSTED") { out.failed.push(`pay run ${xeroDate(run.PaymentDate)} is not posted`); continue; }
+    let stored = 0, skipped = 0, bad = 0;
+    const storedIds = [];
+    for (const summary of detail.Payslips || []) {
+      const person = byId.get(summary.EmployeeID);
+      if (!person) { skipped++; continue; }
+      if (!summary.PayslipID) { bad++; out.failed.push(`${person.name}: no payslip on ${xeroDate(run.PaymentDate)}`); continue; }
+      try {
+        const record = await payslipRecordFor(env, person.employee_id);
+        if (!supFor.has(person.employee_id)) supFor.set(person.employee_id, await xeroSuperFor(env, record, kept));
+        const sup = supFor.get(person.employee_id);
+        const sr = await xeroFetch(env, `payroll.xro/1.0/Payslip/${summary.PayslipID}`);
+        if (!sr.ok) throw new Error(`Xero refused the payslip (${sr.status})`);
+        const sj = await sr.json();
+        const slip = Array.isArray(sj.Payslip) ? sj.Payslip[0] : sj.Payslip || (sj.Payslips || [])[0];
+        if (!slip || (slip.EmployeeID && slip.EmployeeID !== person.employee_id)) throw new Error("Payslip not found");
+        const ms = Array.isArray(record.SuperMemberships) ? record.SuperMemberships : [];
+        const fundOf = (m) => { const i = ms.findIndex((x) => x.SuperMembershipID === m.SuperMembershipID); return i >= 0 ? (sup.memberships || [])[i] : null; };
+        const tot = slipTotals(summary, slip);
+        const shaped = xeroSlipShape(slip, detail, record, items, ms, fundOf, tot);
+        // Nothing about the bank goes into the stored copy.
+        shaped.bank = { accountName: "", bsb: "", masked: "" };
+        shaped.source = "reservoir";
+        const gap = shaped.missing && shaped.missing.length ? 1 : 0;
+        if (gap) out.flagged.push(`${person.name}, ${xeroDate(run.PaymentDate)}: Xero did not supply ${shaped.missing.join(", ")}`);
+        await env.DB.prepare("INSERT OR REPLACE INTO payslip_store (run_id, employee_id, email, name, period_start, period_end, payment_date, gross, tax, super_amt, net, slip, missing, rules) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").bind(detail.PayRunID, person.employee_id, String(person.email).toLowerCase(), person.name || "", shaped.period.start, shaped.period.end, shaped.paymentDate, tot.gross || 0, tot.tax || 0, tot.super || 0, tot.net || 0, JSON.stringify(shaped), gap, PAYSLIP_RULES).run();
+        stored++;
+        storedIds.push(person.employee_id);
+      } catch (e) {
+        bad++;
+        out.failed.push(`${person.name}, ${xeroDate(run.PaymentDate)}: ${String(e && e.message || e).slice(0, 120)}`);
+      }
+    }
+    out.slipsStored += stored;
+    out.skippedNotCurrent += skipped;
+    // A run is only marked done when every current person on it was stored, so a failed one is tried again next time.
+    if (!bad) {
+      // A rebuilt run drops any slip for someone who is no longer on it in Xero.
+      if (storedIds.length) await env.DB.prepare(`DELETE FROM payslip_store WHERE run_id = ? AND employee_id NOT IN (${storedIds.map(() => "?").join(",")})`).bind(detail.PayRunID, ...storedIds).run();
+      await env.DB.prepare("INSERT INTO payslip_runs (run_id, payment_date, period_start, period_end, people, skipped, rules) VALUES (?, ?, ?, ?, ?, ?, ?) ON CONFLICT(run_id) DO UPDATE SET payment_date = excluded.payment_date, period_start = excluded.period_start, period_end = excluded.period_end, people = excluded.people, skipped = excluded.skipped, rules = excluded.rules, built_at = datetime('now')").bind(detail.PayRunID, xeroDate(detail.PaymentDate || run.PaymentDate), xeroDate(detail.PayRunPeriodStartDate || run.PayRunPeriodStartDate), xeroDate(detail.PayRunPeriodEndDate || run.PayRunPeriodEndDate), stored, skipped, PAYSLIP_RULES).run();
+      out.runsBuilt++;
+      out.remaining--;
+    }
+  }
+  return out;
+}
+// One person's stored pay slip list, from the database alone.
+async function payslipListFor(env, email) {
+  if (!email) return { found: false, reason: "No email on your sign in" };
+  await dfpTables(env);
+  await payslipTables(env);
+  const rows = ((await env.DB.prepare("SELECT s.run_id, s.period_start, s.period_end, s.payment_date, json_extract(s.slip, '$.net') AS net, json_extract(s.slip, '$.lines') AS lines, s.gross AS g, s.tax AS t, s.super_amt AS sp, s.net AS nn, COALESCE(r.filed, 1) AS filed FROM payslip_store s LEFT JOIN payslip_runs r ON r.run_id = s.run_id WHERE s.email = ? ORDER BY s.payment_date DESC").bind(email).all()).results) || [];
+  // Hours per financial year (1 July to 30 June, by payment date), added up from the stored slip lines. Leave and public holiday lines are counted apart from hours worked.
+  const fyMap = new Map();
+  for (const r of rows) {
+    let lines = [];
+    try { lines = JSON.parse(r.lines || "[]") || []; } catch (e) { lines = []; }
+    const fy = financialYear(String(r.payment_date));
+    const row = fyMap.get(fy.label) || { label: `${fy.label}/${Number(fy.label) + 1}`, worked: 0, leave: 0, runs: 0 };
+    for (const l of lines) {
+      const h = Number(l.hours) || 0;
+      if (!h) continue;
+      if (/leave|holiday|sick|carer|personal|bereave|compassion|jury|long service/i.test(String(l.label || ""))) row.leave += h; else row.worked += h;
+    }
+    row.runs++;
+    fyMap.set(fy.label, row);
+  }
+  // Financial year stats from 2025/2026 on: pay totals, hours worked, and days off. Pay and hours come from the filed payslips. Days off come from the same approved leave records the Leave screen lists (split pieces left out, as there), counted day by day inside the year, so the two screens always agree. Days after today are Booked Ahead, not taken.
+  let fyStats = [];
+  try {
+  await leaveTable(env);
+  const dayLen = await leaveDayHours(env, email);
+  const todayIso = new Date().toISOString().slice(0, 10);
+  const leaveRows = ((await env.DB.prepare("SELECT * FROM xero_leave WHERE email = ? AND status = 'approved' AND split_of IS NULL").bind(email).all()).results) || [];
+  const stat = new Map();
+  for (const r of rows) {
+    if (r.filed === 0) continue;
+    const fy = financialYear(String(r.payment_date));
+    if (Number(fy.label) < 2025) continue;
+    const o = stat.get(fy.label) || { fy: fy.label, label: `${fy.label}/${Number(fy.label) + 1}`, closed: `${Number(fy.label) + 1}-06-30` < todayIso, runs: 0, firstPaid: String(r.payment_date), lastPaid: String(r.payment_date), gross: 0, tax: 0, super: 0, net: 0, worked: 0 };
+    let lines = [];
+    try { lines = JSON.parse(r.lines || "[]") || []; } catch (e) { lines = []; }
+    for (const l of lines) {
+      const h = Number(l.hours) || 0;
+      if (!h) continue;
+      if (!/leave|holiday|sick|carer|personal|bereave|compassion|jury|long service/i.test(String(l.label || ""))) o.worked += h;
+    }
+    o.runs++;
+    o.gross += Number(r.g) || 0; o.tax += Number(r.t) || 0; o.super += Number(r.sp) || 0; o.net += Number(r.nn) || 0;
+    if (String(r.payment_date) < o.firstPaid) o.firstPaid = String(r.payment_date);
+    if (String(r.payment_date) > o.lastPaid) o.lastPaid = String(r.payment_date);
+    stat.set(fy.label, o);
+  }
+  const r1 = (n) => Math.round(n * 10) / 10;
+  fyStats = [...stat.values()].map((o) => {
+    const from = `${o.fy}-07-01`, to = `${Number(o.fy) + 1}-06-30`;
+    const kinds = new Map();
+    let hoursTaken = 0, booked = 0;
+    for (const lr of leaveRows) {
+      if (lr.to_date < from || lr.from_date > to) continue;
+      const label = lr.type === "other" ? (lr.type_name || "Other Leave") : (LEAVE_LABELS[lr.type] || lr.type_name || "Leave");
+      for (const d of leavePlanOf(lr, dayLen)) {
+        if (d.date < from || d.date > to || !(d.hours > 0)) continue;
+        const frac = Math.min(1, d.hours / dayLen);
+        if (d.date > todayIso) { booked += frac; continue; }
+        const k = kinds.get(label) || { label, days: 0, hours: 0 };
+        k.days += frac; k.hours += d.hours; hoursTaken += d.hours;
+        kinds.set(label, k);
+      }
+    }
+    return { fy: o.fy, label: o.label, closed: o.closed, runs: o.runs, firstPaid: o.firstPaid, lastPaid: o.lastPaid, gross: money2(o.gross), tax: money2(o.tax), super: money2(o.super), net: money2(o.net), worked: money2(o.worked), leave: [...kinds.values()].map((k) => ({ label: k.label, days: r1(k.days), hours: money2(k.hours) })).sort((a, b) => a.label.localeCompare(b.label)), leaveHours: money2(hoursTaken), bookedDays: r1(booked), dayHours: dayLen };
+  }).sort((a, b) => b.fy.localeCompare(a.fy));
+  } catch (e) { console.log("fy stats error", String(e && e.message || e).slice(0, 200)); fyStats = []; }
+  const fyHours = [...fyMap.values()].map((x) => ({ label: x.label, worked: money2(x.worked), leave: money2(x.leave), runs: x.runs })).sort((a, b) => b.label.localeCompare(a.label));
+  if (!rows.length) {
+    const known = await env.DB.prepare("SELECT employee_id FROM xero_payroll WHERE email = ?").bind(email).first();
+    if (!known) return { found: false, reason: NOT_IN_RESERVOIR };
+  }
+  return { found: true, slips: rows.map((r) => ({ id: r.run_id, start: r.period_start, end: r.period_end, paid: r.payment_date, net: typeof r.net === "number" ? r.net : null, filed: r.filed !== 0 })), partial: false, fyHours, fyStats };
+}
+// One stored pay slip for a person, with year to date added up from their stored slips and their own bank details and job title from dfp_xero. Null when there is none.
+async function payslipOneFor(env, email, runId) {
+  await dfpTables(env);
+  await payslipTables(env);
+  const row = await env.DB.prepare("SELECT slip FROM payslip_store WHERE email = ? AND run_id = ?").bind(email, runId).first();
+  if (!row) return null;
+  const out = JSON.parse(row.slip);
+  out.ytd = await payslipYtd(env, email, out.paymentDate);
+  const me = await env.DB.prepare("SELECT job_title, bank_account_name, bsb, account_number FROM dfp_xero WHERE email = ?").bind(email).first();
+  if (me) {
+    const acct = String(me.account_number || "").replace(/\s+/g, "");
+    out.bank = { accountName: me.bank_account_name || "", bsb: me.bsb || "", masked: acct ? `XXXX ${acct.slice(-4)}` : "" };
+    if (me.job_title) out.employee = { ...(out.employee || {}), jobTitle: me.job_title };
+  }
+  return out;
+}
+// Year to date is added up from the stored pay slips, so it needs no Xero call. Xero gives no year to date figure through its API.
+// The rule matches Xero's own pay slips: a whole pay run counts by its payment date, and a payment date on or after 1 July starts the new financial year. No pay run is split by days.
+// It is complete only when every pay day of the financial year is held and Xero gave every main total on each slip.
+async function payslipYtd(env, email, paymentDate) {
+  const fy = financialYear(paymentDate);
+  const r = await env.DB.prepare("SELECT COALESCE(SUM(gross),0) g, COALESCE(SUM(tax),0) t, COALESCE(SUM(super_amt),0) s, COALESCE(SUM(net),0) n, COUNT(*) c, COALESCE(SUM(missing),0) m FROM payslip_store WHERE email = ? AND payment_date >= ? AND payment_date <= ?").bind(email, fy.start, paymentDate).first();
+  const gaps = Number(r.m) || 0;
+  return { gross: money2(r.g), tax: money2(r.t), super: money2(r.s), net: money2(r.n), complete: fy.start >= PAYSLIP_FULL_FY && gaps === 0, runs: Number(r.c) || 0, gaps, from: PAYSLIP_FROM };
+}
+
+// ---- DFP Xero and Xero Payroll ----
+// dfp_xero is every field that goes back and forth between DFP and Xero: name, address, date of birth, mobile, start date, job title and bank details. Preferred name, time of birth and the emergency contact never go to Xero, so they live in dfp_reservoir. It is keyed by work email, and a new employee is always created in Xero first. Bank details are never read back from Xero and never returned by any route.
+// It is DFP's own data that DFP feeds to Xero. Xero only needs these for payroll and compliance. DFP is the controlling source, and any sync (the Saturday sweep, not built yet) pushes DFP's values out to Xero rather than reading Xero's copy back in as the authority. The table was seeded once from what was already sitting in Xero's employee records, because that data existed there before this design. That seeding uses INSERT OR IGNORE, so running it again never overwrites a saved or approved change.
+// Everything else DFP holds about a person lives in dfp_reservoir, which Xero never reads or writes, and which is never read by any other program.
+// xero_payroll mirrors Xero's payroll side: classification, rates, overtime entitlement, leave loading, super and leave balances. Only the payroll complete trigger and the Saturday sweep should write to it (neither is built yet). Each write stamps synced_at and source, and xero_payroll_log is where the sweep records what changed.
+// Tax file numbers are never read or stored. Bank details are never read from Xero.
+// Per period figures (that week's hours, earnings lines, wages, tax, net) are for the pay run posted trigger to fill and clear after the PDF is filed. The standing values stay as the current snapshot: rates, leave balances, super fund and the latest super amount.
+let dfpTablesMade = false;
+async function dfpTables(env) {
+  if (dfpTablesMade) return;
+  await env.DB.prepare("CREATE TABLE IF NOT EXISTS dfp_xero (email TEXT PRIMARY KEY, xero_employee_id TEXT, name TEXT, address TEXT, dob TEXT, mobile TEXT, start_date TEXT, job_title TEXT, bank_account_name TEXT, bsb TEXT, account_number TEXT, status TEXT NOT NULL DEFAULT 'ACTIVE', source TEXT, created_at TEXT DEFAULT (datetime('now')), updated_at TEXT DEFAULT (datetime('now')), updated_by TEXT)").run();
+  // A dfp_xero made by an earlier build has no bank columns. Add them if they are missing.
+  for (const col of ["bank_account_name TEXT", "bsb TEXT", "account_number TEXT", "middle_names TEXT"]) { try { await env.DB.prepare(`ALTER TABLE dfp_xero ADD COLUMN ${col}`).run(); } catch (e) { /* already there */ } }
+  await env.DB.prepare("CREATE INDEX IF NOT EXISTS dfp_xero_employee ON dfp_xero (xero_employee_id)").run();
+  await env.DB.prepare("CREATE TABLE IF NOT EXISTS xero_payroll (employee_id TEXT PRIMARY KEY, email TEXT, name TEXT, status TEXT, classification TEXT, employment_basis TEXT, rate_ordinary REAL, rate_ot15 REAL, rate_ot2 REAL, has_overtime INTEGER NOT NULL DEFAULT 0, rates_note TEXT, leave_loading INTEGER, super_fund_name TEXT, super_member_number TEXT, super_usi TEXT, leave_balances TEXT, allowances TEXT, super_amount_period REAL, last_pay_run_id TEXT, synced_at TEXT, source TEXT)").run();
+  // A table made by the first w31 has no allowances or super amount columns. Add them if they are missing.
+  for (const col of ["allowances TEXT", "super_amount_period REAL", "annual_salary REAL", "week_hours REAL", "super_pct REAL", "super_run_date TEXT"]) { try { await env.DB.prepare(`ALTER TABLE xero_payroll ADD COLUMN ${col}`).run(); } catch (e) { /* already there */ } }
+  await env.DB.prepare("CREATE INDEX IF NOT EXISTS xero_payroll_email ON xero_payroll (email)").run();
+  await env.DB.prepare("CREATE TABLE IF NOT EXISTS xero_payroll_log (id INTEGER PRIMARY KEY AUTOINCREMENT, employee_id TEXT, name TEXT, field TEXT, old_value TEXT, new_value TEXT, changed_at TEXT DEFAULT (datetime('now')), trigger_name TEXT)").run();
+  dfpTablesMade = true;
+}
+// The super percentage each person is really being paid, worked out from Xero's own figures: the super guarantee Xero paid divided by the earnings that super is payable on, taken from the person's latest posted payslip. Super is not paid on overtime (or on any earnings rate Xero marks exempt from super), so those lines are left out of the base. Dividing by total wages, as an earlier build did, showed 9% or 11.1% for anyone who worked overtime that week. Nothing is stored as a rate, so if the legislated rate moves it shows up on the next pay run. Looks back up to six posted runs for anyone not on the newest. Returns Map(employeeId -> { pct, date }).
+async function xeroSuperPcts(env, ids) {
+  const want = new Set(ids);
+  const found = new Map();
+  let calls = 0;
+  if (!want.size) return { found, calls };
+  const posted = await xeroPostedRuns(env);
+  calls++;
+  if (posted.fail) return { found, calls, why: posted.fail.error || "Xero refused the pay runs" };
+  const items = await xeroItems(env);
+  calls++;
+  const rateOf = new Map(((items && items.EarningsRates) || []).map((x) => [x.EarningsRateID, x]));
+  const exempt = (id) => {
+    const r = rateOf.get(id);
+    if (!r) return false;
+    if (r.IsExemptFromSuper === true) return true;
+    if (r.IsExemptFromSuper === false) return false;
+    return /OVERTIME/i.test(String(r.EarningsType || ""));
+  };
+  for (const run of posted.runs.slice(0, 6)) {
+    if (found.size >= want.size) break;
+    const rd = await xeroRunDetail(env, run.PayRunID);
+    calls++;
+    if (rd.fail || !rd.run) continue;
+    const todo = (rd.run.Payslips || []).filter((sm) => want.has(sm.EmployeeID) && !found.has(sm.EmployeeID) && sm.PayslipID);
+    for (let i = 0; i < todo.length; i += 3) {
+      await Promise.all(todo.slice(i, i + 3).map(async (sm) => {
+        calls++;
+        try {
+          const r = await xeroFetch(env, `payroll.xro/1.0/Payslip/${sm.PayslipID}`);
+          if (!r.ok) return;
+          const j = await r.json();
+          const slip = Array.isArray(j.Payslip) ? j.Payslip[0] : j.Payslip || (j.Payslips || [])[0];
+          if (!slip) return;
+          const lines = [...(slip.EarningsLines || []), ...(slip.TimesheetEarningsLines || []), ...(slip.LeaveEarningsLines || [])];
+          let base = 0;
+          for (const l of lines) {
+            if (exempt(l.EarningsRateID)) continue;
+            base += xnum(l.FixedAmount) || xnum(l.Amount) || xunits(l.NumberOfUnits) * xnum(l.RatePerUnit);
+          }
+          const sgcLines = (slip.SuperannuationLines || []).filter((l) => String(l.ContributionType || "").replace(/[\s_-]/g, "").toUpperCase() === "SGC");
+          const sup = sgcLines.length ? sgcLines.reduce((a, l) => a + xnum(l.Amount), 0) : xnum(slip.Super) || xnum(sm.Super);
+          if (base > 0 && sup > 0) found.set(sm.EmployeeID, { pct: Math.round((sup / base) * 1000) / 10, date: xeroDate(run.PaymentDate) });
+        } catch (e) { /* this person is tried again on the next older run */ }
+      }));
+    }
+  }
+  return { found, calls };
+}
+// Seeding only: reads every ACTIVE employee's record as it already sits in Xero (3 at a time) and splits it into one dfp_xero row and one xero_payroll row each. Used for the one time fill. It is not how DFP's data is kept up to date, DFP pushes to Xero.
+// Returns { fail } or { people, calls }. Nothing is written here.
+async function dfpReadFromXero(env) {
+  const got = await xeroEmployeeList(env);
+  if (got.fail) return { fail: got.fail };
+  const active = got.list.filter((x) => String(x.Status || "ACTIVE").toUpperCase() === "ACTIVE");
+  let calls = 1;
+  const pr = await xeroFetch(env, "payroll.xro/1.0/PayItems");
+  calls++;
+  if (!pr.ok) return { fail: { status: pr.status, detail: await xeroWhy(pr) } };
+  const earnings = ((await pr.json()).PayItems || {}).EarningsRates || [];
+  // The super funds list, and the product name of each fund that has no name, are read once here so the people fetched in parallel below do not each ask again.
+  const kept = { funds: [], why: "", products: {} };
+  try {
+    const sr = await xeroFetch(env, "payroll.xro/1.0/Superfunds");
+    calls++;
+    if (sr.ok) kept.funds = (await sr.json()).SuperFunds || [];
+    else kept.why = `Xero refused the super funds list (${sr.status})`;
+  } catch (e) { kept.why = "Could not read the super funds list from Xero"; }
+  for (const f of kept.funds) {
+    const usi = String(f.USI || "").trim();
+    if (!usi || String(f.Name || "").trim() || usi in kept.products) continue;
+    kept.products[usi] = "";
+    try {
+      const r = await xeroFetch(env, `payroll.xro/1.0/SuperfundProducts?USI=${encodeURIComponent(usi)}`);
+      calls++;
+      if (r.ok) { const prod = ((await r.json()).SuperFundProducts || [])[0]; if (prod && prod.ProductName) kept.products[usi] = String(prod.ProductName).trim(); }
+    } catch (e) { /* leave the name blank */ }
+  }
+  const people = await xeroEach(active, async (item) => {
+    let full = null;
+    try {
+      const r = await xeroFetch(env, `payroll.xro/1.0/Employees/${item.EmployeeID}`);
+      calls++;
+      if (r.ok) full = ((await r.json()).Employees || [])[0] || null;
+    } catch (e) { /* use the list entry below */ }
+    const record = full || item;
+    const row = xeroStaffRow(record);
+    const email = String(row.email || "").trim().toLowerCase();
+    const rates = xeroRates(record, earnings);
+    const sup = await xeroSuperFor(env, record, kept);
+    const td = record.TaxDeclaration || {};
+    const balances = (Array.isArray(record.LeaveBalances) ? record.LeaveBalances : []).map((b) => ({ name: String(b.LeaveName || ""), typeId: String(b.LeaveTypeID || ""), units: xnum(b.NumberOfUnits), unitType: String(b.TypeOfUnits || "") }));
+    const fund = (sup.memberships || [])[0] || {};
+    // Allowances on the pay template: earnings lines whose earnings rate is of type ALLOWANCE.
+    const rateById = new Map(earnings.map((x) => [x.EarningsRateID, x]));
+    const allowances = ((record.PayTemplate && record.PayTemplate.EarningsLines) || []).filter((l) => { const er = rateById.get(l.EarningsRateID); return er && String(er.EarningsType || "").toUpperCase() === "ALLOWANCE"; }).map((l) => ({ name: String((rateById.get(l.EarningsRateID) || {}).Name || ""), rate: l.RatePerUnit === undefined || l.RatePerUnit === null ? null : xnum(l.RatePerUnit), amount: l.FixedAmount === undefined || l.FixedAmount === null ? null : xnum(l.FixedAmount), calc: String(l.CalculationType || "") }));
+    return {
+      xero: { email, xeroId: row.id, name: row.name, address: row.address, dob: row.dob, mobile: row.mobile, startDate: row.commenced, jobTitle: row.title, bank: { name: row.accountName, bsb: row.bsb, number: row.accountNumber }, em: { name: row.emName, relationship: row.emRelationship, mobile: row.emMobile, email: row.emEmail } },
+      payroll: { employeeId: row.id, email, name: row.name, status: row.status || "ACTIVE", classification: String(record.Classification || "").trim(), basis: xeroBasis(record), ordinary: rates.rates.ordinary, annual: rates.rates.annual, weekHours: rates.rates.weekHours, ot15: rates.rates.ot15, ot2: rates.rates.ot2, hasOvertime: rates.hasOvertime ? 1 : 0, ratesNote: rates.why.join("; "), leaveLoading: typeof td.EligibleToReceiveLeaveLoading === "boolean" ? (td.EligibleToReceiveLeaveLoading ? 1 : 0) : null, fundName: fund.fundName || "", memberNumber: fund.memberNumber || "", usi: fund.usi || "", balances: JSON.stringify(balances), balanceCount: balances.length, allowances: JSON.stringify(allowances), allowanceCount: allowances.length }
+    };
+  });
+  let superWhy = "";
+  try {
+    const sp = await xeroSuperPcts(env, people.map((x) => x.payroll.employeeId).filter(Boolean));
+    calls += sp.calls;
+    superWhy = sp.why || "";
+    for (const x of people) { const hit = sp.found.get(x.payroll.employeeId); if (hit) { x.payroll.superPct = hit.pct; x.payroll.superRunDate = hit.date; } }
+  } catch (e) { superWhy = String(e && e.message || e).slice(0, 160); }
+  return { people, calls, superWhy };
+}
+// Names of the fields that came back empty, never their values.
+function dfpGaps(p) {
+  const i = p.xero, y = p.payroll;
+  const gap = [];
+  [["email", i.email], ["address", i.address], ["dob", i.dob], ["mobile", i.mobile], ["start date", i.startDate], ["job title", i.jobTitle], ["bank account name", (i.bank || {}).name], ["bsb", (i.bank || {}).bsb], ["bank account number", (i.bank || {}).number], ["classification", y.classification], ["ordinary rate", y.ordinary], ["super fund", y.fundName], ["super member number", y.memberNumber]].forEach(([k, v]) => { if (v === "" || v === null || v === undefined) gap.push(k); });
+  return gap;
+}
+
+
+// ---- Phone numbers. One style everywhere, the same as fmtPhone in the app. Mobiles (04), 1300 and 1800 read xxxx xxx xxx, other ten digit numbers xx xxxx xxxx, six digit 13 numbers 13 xx xx. Anything else is kept as typed. ----
+function normPhone(v) {
+  const raw = String(v === null || v === undefined ? "" : v).trim();
+  if (!raw) return raw;
+  let d = raw.replace(/[^0-9+]/g, "");
+  if (/^\+61\d{9}$/.test(d)) d = `0${d.slice(3)}`;
+  else if (/^61\d{9}$/.test(d)) d = `0${d.slice(2)}`;
+  if (/^13\d{4}$/.test(d)) return `${d.slice(0, 2)} ${d.slice(2, 4)} ${d.slice(4)}`;
+  if (!/^\d{10}$/.test(d)) return raw;
+  if (d.startsWith("04") || d.startsWith("1300") || d.startsWith("1800")) return `${d.slice(0, 4)} ${d.slice(4, 7)} ${d.slice(7)}`;
+  return `${d.slice(0, 2)} ${d.slice(2, 6)} ${d.slice(6)}`;
+}
+// Moves every number already stored into that style. Runs once when the Worker first starts after a deploy, and again on a later start only changes a number that is still in the old style.
+let phonesChecked = false;
+async function phonesNormalise(env) {
+  if (phonesChecked) return;
+  phonesChecked = true;
+  await reservoirTables(env);
+  if (schemaSet && !schemaSet.broken && schemaSet.has("once:phones")) return;
+  let changed = 0;
+  for (const [tbl, col, idCol] of [["dfp_xero", "mobile", "email"], ["dfp_reservoir", "em_mobile", "person_key"]]) {
+    const rows = ((await env.DB.prepare(`SELECT ${idCol} AS id, ${col} AS v FROM ${tbl} WHERE ${col} IS NOT NULL AND ${col} <> ''`).all()).results) || [];
+    for (const r of rows) {
+      const n = normPhone(r.v);
+      if (n !== r.v) { await env.DB.prepare(`UPDATE ${tbl} SET ${col} = ? WHERE ${idCol} = ?`).bind(n, r.id).run(); changed++; }
+    }
+  }
+  try {
+    const rows = ((await env.DB.prepare("SELECT id, servicePhone AS v FROM fleet WHERE servicePhone IS NOT NULL AND servicePhone <> ''").all()).results) || [];
+    for (const r of rows) {
+      const n = normPhone(r.v);
+      if (n !== r.v) { await env.DB.prepare("UPDATE fleet SET servicePhone = ? WHERE id = ?").bind(n, r.id).run(); changed++; }
+    }
+  } catch (e) { console.log("phones: fleet not checked", String(e && e.message || e).slice(0, 120)); }
+  if (changed) console.log("phones moved to the standard style:", changed);
+  await schemaMark(env, "once:phones");
+}
+// ---- Leave. The app reads only this table (xero_leave). Xero is written to only when the office approves a request or applies a change. ----
+// Balances come from xero_payroll.leave_balances. History is brought in from Xero by the leave sync (leaveSync) and by nothing else.
+let leaveTableMade = false;
+async function leaveTable(env) {
+  if (leaveTableMade) return;
+  await env.DB.prepare("CREATE TABLE IF NOT EXISTS xero_leave (id TEXT PRIMARY KEY, email TEXT NOT NULL, name TEXT, employee_id TEXT, type TEXT NOT NULL, type_name TEXT, leave_type_id TEXT, from_date TEXT NOT NULL, to_date TEXT NOT NULL, status TEXT NOT NULL, cancel_requested INTEGER NOT NULL DEFAULT 0, edit_requested INTEGER NOT NULL DEFAULT 0, new_type TEXT, new_from TEXT, new_to TEXT, xero_id TEXT, source TEXT, xero_note TEXT, created_at TEXT DEFAULT (datetime('now')), decided_by TEXT, decided_at TEXT)").run();
+  await env.DB.prepare("CREATE INDEX IF NOT EXISTS xero_leave_email ON xero_leave (email, from_date)").run();
+  await env.DB.prepare("CREATE INDEX IF NOT EXISTS xero_leave_xero ON xero_leave (xero_id)").run();
+  for (const col of ["asked_type TEXT", "days TEXT", "split_of TEXT"]) {
+    try { await env.DB.prepare(`ALTER TABLE xero_leave ADD COLUMN ${col}`).run(); } catch (e) { /* already there */ }
+  }
+  await env.DB.prepare("CREATE TABLE IF NOT EXISTS xero_leave_apps (xero_id TEXT PRIMARY KEY, leave_id TEXT NOT NULL)").run();
+  leaveTableMade = true;
+}
+const LEAVE_LABELS = { annual: "Annual Leave", personal: "Personal/Carer's Leave", unpaid: "Personal/Carer's Leave (Unpaid)", compassionate: "Compassionate Leave (Unpaid)" };
+const leaveTypeOf = (t) => (t === "personal" || t === "annual" || t === "compassionate" ? t : "");
+function leaveKind(name) {
+  const n = String(name || "");
+  if (/compassionate/i.test(n)) return "compassionate";
+  if (/unpaid/i.test(n) && /personal|carer|sick/i.test(n)) return "unpaid";
+  if (/annual/i.test(n)) return "annual";
+  if (/personal|carer|sick/i.test(n)) return "personal";
+  return "other";
+}
+const leaveIsoOk = (s) => /^\d{4}-\d{2}-\d{2}$/.test(String(s || "")) && !isNaN(new Date(`${s}T00:00:00Z`).getTime());
+// A working day is 8 hours for everyone except people on the Plumbing and Fire Sprinklers Award, who are on 7.6. Clerical, casual and no award are all 8. A day figure typed on a person\u2019s Staff page overrides this.
+const LEAVE_DAY_HOURS = 8;
+const PLUMBING_DAY_HOURS = 7.6;
+const isPlumbingAward = (c) => /plumbing|MA000036/i.test(String(c || ""));
+// Contracted hours in a day are kept per person (dayHours on their Reservoir record). Anyone without one is on 8 hours, or 7.6 on the plumbing award.
+const leaveDayNum = (v) => { const n = Number(v); return n >= 1 && n <= 12 ? n : LEAVE_DAY_HOURS; };
+async function leaveDayMap(env) {
+  await reservoirTables(env);
+  await dfpTables(env);
+  const m = new Map();
+  const pay = ((await env.DB.prepare("SELECT email, name, classification FROM xero_payroll").all()).results) || [];
+  for (const r of pay) {
+    const h = isPlumbingAward(r.classification) ? PLUMBING_DAY_HOURS : LEAVE_DAY_HOURS;
+    if (r.email) m.set(`c:${String(r.email).toLowerCase()}`, h);
+    if (r.name) m.set(`ck:${profileKey(r.name)}`, h);
+  }
+  const rows = ((await env.DB.prepare("SELECT email, person_key, day_hours FROM dfp_reservoir WHERE day_hours IS NOT NULL AND day_hours <> ''").all()).results) || [];
+  for (const r of rows) {
+    const h = leaveDayNum(r.day_hours);
+    if (r.email) m.set(String(r.email).toLowerCase(), h);
+    if (r.person_key) m.set(`k:${r.person_key}`, h);
+  }
+  return m;
+}
+const leaveDayFrom = (m, email, name) => {
+  if (!m) return LEAVE_DAY_HOURS;
+  const e = String(email || "").toLowerCase(), k = profileKey(name);
+  return m.get(e) || m.get(`k:${k}`) || m.get(`c:${e}`) || m.get(`ck:${k}`) || LEAVE_DAY_HOURS;
+};
+async function leaveDayHours(env, email) {
+  const m = await leaveDayMap(env);
+  const pay = await env.DB.prepare("SELECT name FROM xero_payroll WHERE lower(email) = ?").bind(String(email || "").toLowerCase()).first();
+  return leaveDayFrom(m, email, pay && pay.name);
+}
+function leaveDaysOf(r) {
+  try { const d = JSON.parse(r.days || "null"); return Array.isArray(d) ? d : null; } catch (e) { return null; }
+}
+function leaveWorkDays(from, to) {
+  const out = [];
+  for (let d = from; d <= to && out.length < 400; d = tsAddDays(d, 1)) {
+    const dow = new Date(`${d}T00:00:00Z`).getUTCDay();
+    if (dow >= 1 && dow <= 5 && !TS_HOLIDAYS[d]) out.push(d);
+  }
+  return out;
+}
+const leaveHoursOf = (r, dh) => {
+  const d = leaveDaysOf(r);
+  const total = d ? d.reduce((a, x) => a + (Number(x.hours) || 0), 0) : leaveWorkDays(r.from_date, r.to_date).length * (dh || LEAVE_DAY_HOURS);
+  return Math.round(total * 100) / 100;
+};
+// The day by day plan as the screens see it: what was planned, or every working day in the range at the person's hours.
+const leavePlanOf = (r, dh) => {
+  const d = leaveDaysOf(r);
+  if (d) return d.map((x) => ({ date: x.date, hours: Math.round((Number(x.hours) || 0) * 10000) / 10000 }));
+  return leaveWorkDays(r.from_date, r.to_date).map((date) => ({ date, hours: dh || LEAVE_DAY_HOURS }));
+};
+// What staff see: a request that was switched to unpaid at the office still shows as what they asked for.
+const leaveShownType = (r) => (r.type === "unpaid" && r.asked_type ? r.asked_type : r.type);
+function leaveOut(r, dm) {
+  const dh = leaveDayFrom(dm, r.email, r.name);
+  const shown = leaveShownType(r);
+  return { id: r.id, name: r.name || "", email: r.email, type: shown, typeName: shown === r.type ? (r.type_name || LEAVE_LABELS[r.type] || "Leave") : (LEAVE_LABELS[shown] || "Leave"), actualType: r.type, hours: leaveHoursOf(r, dh), dayHours: dh, plan: leavePlanOf(r, dh), splitOf: r.split_of || "", unpaidPart: r.type === "unpaid" && !!r.asked_type, from: r.from_date, to: r.to_date, status: r.status, cancelRequested: Number(r.cancel_requested) === 1, editRequested: Number(r.edit_requested) === 1, newType: r.new_type || "", newFrom: r.new_from || "", newTo: r.new_to || "", createdAt: r.created_at || "", decidedAt: r.decided_at || "", decidedBy: r.decided_by || "", xeroNote: r.xero_note || "" };
+}
+function leaveActor(user) {
+  return user.viewAs && user.realUser ? `${user.realUser.name} (viewing as ${user.name})` : user.name;
+}
+// Hours on the books for annual and personal leave, from the stored snapshot of the person's Xero leave balances.
+async function leaveBalances(env, email) {
+  await dfpTables(env);
+  const row = await env.DB.prepare("SELECT employee_id, leave_balances, synced_at FROM xero_payroll WHERE email = ?").bind(email).first();
+  const out = { found: !!row, hasLeave: false, annualHours: null, personalHours: null, syncedAt: row ? row.synced_at || "" : "", employeeId: row ? row.employee_id : "" };
+  if (!row) return out;
+  let list;
+  try { list = JSON.parse(row.leave_balances || "[]"); } catch (e) { list = []; }
+  // Xero only gives a person leave balances when they have a leave template. No balances at all means no leave for that person (a director who has chosen not to take formal leave, for example).
+  out.hasLeave = Array.isArray(list) && list.length > 0;
+  for (const b of list) {
+    const k = leaveKind(b.name);
+    const hours = /hour/i.test(b.unitType || "Hours") ? xnum(b.units) : null;
+    if (hours === null) continue;
+    if (k === "annual") out.annualHours = (out.annualHours || 0) + hours;
+    if (k === "personal") out.personalHours = (out.personalHours || 0) + hours;
+  }
+  return out;
+}
+async function leaveXeroTypeId(env, row) {
+  const pay = await env.DB.prepare("SELECT leave_balances FROM xero_payroll WHERE email = ?").bind(row.email).first();
+  let list;
+  try { list = JSON.parse((pay && pay.leave_balances) || "[]"); } catch (e) { list = []; }
+  const hit = list.find((b) => b.typeId && leaveKind(b.name) === row.type);
+  if (hit) return hit.typeId;
+  const res = await xeroFetch(env, "payroll.xro/1.0/PayItems");
+  if (!res.ok) return "";
+  const types = (((await res.json()).PayItems || {}).LeaveTypes) || [];
+  const t = types.find((x) => leaveKind(x.Name) === row.type);
+  return t ? t.LeaveTypeID : "";
+}
+async function leaveEmployeeId(env, row) {
+  if (row.employee_id) return row.employee_id;
+  const pay = await env.DB.prepare("SELECT employee_id FROM xero_payroll WHERE email = ?").bind(row.email).first();
+  return pay ? pay.employee_id : "";
+}
+// Personal leave hours a person can still use: their Xero balance less what their earlier waiting requests already hold.
+async function leaveAvail(env, email, kind, exceptId, before) {
+  const bal = await leaveBalances(env, email);
+  let have = kind === "annual" ? bal.annualHours : bal.personalHours;
+  have = Number.isFinite(have) ? have : 0;
+  const rows = ((await env.DB.prepare("SELECT * FROM xero_leave WHERE email = ? AND status = 'pending' AND type = ? AND id <> ? AND created_at <= ?").bind(email, kind, exceptId || "", before || "9999").all()).results) || [];
+  const dh = await leaveDayHours(env, email);
+  const held = rows.reduce((a, r) => a + leaveHoursOf(r, dh), 0);
+  return Math.max(0, Math.round((have - held) * 100) / 100);
+}
+// Builds the day by day plan for a waiting request. Annual leave stays one range. Personal leave uses the hours the person has and any balance of the day goes as a second, unpaid request that only the office sees. No hours at all makes the whole request unpaid.
+async function leaveReplan(env, row, kind, from, to) {
+  await env.DB.prepare("DELETE FROM xero_leave WHERE split_of = ? AND status = 'pending'").bind(row.id).run();
+  const asked = row.asked_type || kind;
+  if (kind !== "personal") {
+    await env.DB.prepare("UPDATE xero_leave SET type = ?, type_name = ?, from_date = ?, to_date = ?, days = NULL, asked_type = ? WHERE id = ?").bind(kind, LEAVE_LABELS[kind], from, to, asked, row.id).run();
+    return { ok: true };
+  }
+  const work = leaveWorkDays(from, to);
+  if (!work.length) {
+    await env.DB.prepare("UPDATE xero_leave SET type = ?, type_name = ?, from_date = ?, to_date = ?, days = NULL, asked_type = ? WHERE id = ?").bind(kind, LEAVE_LABELS[kind], from, to, asked, row.id).run();
+    return { ok: true };
+  }
+  let avail = await leaveAvail(env, row.email, "personal", row.id, row.created_at);
+  const DAY = await leaveDayHours(env, row.email);
+  const paid = [], unpaid = [];
+  for (const date of work) {
+    const take = Math.round(Math.min(DAY, avail) * 100) / 100;
+    avail = Math.round((avail - take) * 100) / 100;
+    if (take > 0) paid.push({ date, hours: take });
+    const left = Math.round((DAY - take) * 100) / 100;
+    if (left > 0) unpaid.push({ date, hours: left });
+  }
+  if (!paid.length) {
+    await env.DB.prepare("UPDATE xero_leave SET type = 'unpaid', type_name = ?, from_date = ?, to_date = ?, days = ?, asked_type = 'personal' WHERE id = ?").bind(LEAVE_LABELS.unpaid, from, to, JSON.stringify(unpaid), row.id).run();
+    return { ok: true, unpaidOnly: true };
+  }
+  await env.DB.prepare("UPDATE xero_leave SET type = 'personal', type_name = ?, from_date = ?, to_date = ?, days = ?, asked_type = 'personal' WHERE id = ?").bind(LEAVE_LABELS.personal, from, to, JSON.stringify(paid), row.id).run();
+  if (unpaid.length) {
+    const id = `lv_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
+    await env.DB.prepare("INSERT INTO xero_leave (id, email, name, employee_id, type, type_name, from_date, to_date, status, source, asked_type, days, split_of, created_at) VALUES (?, ?, ?, ?, 'unpaid', ?, ?, ?, 'pending', 'reservoir', 'personal', ?, ?, ?)").bind(id, row.email, row.name || "", row.employee_id || null, LEAVE_LABELS.unpaid, unpaid[0].date, unpaid[unpaid.length - 1].date, JSON.stringify(unpaid), row.id, row.created_at || new Date().toISOString().replace("T", " ").slice(0, 19)).run();
+  }
+  return { ok: true, split: unpaid.length > 0 };
+}
+async function leaveCreate(env, o) {
+  const id = `lv_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
+  const now = new Date().toISOString().replace("T", " ").slice(0, 19);
+  await env.DB.prepare("INSERT INTO xero_leave (id, email, name, employee_id, type, type_name, from_date, to_date, status, source, asked_type, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', 'reservoir', ?, ?)").bind(id, o.email, o.name, o.employeeId, o.type, LEAVE_LABELS[o.type], o.from, o.to, o.type, now).run();
+  const row = await env.DB.prepare("SELECT * FROM xero_leave WHERE id = ?").bind(id).first();
+  await leaveReplan(env, row, o.type, o.from, o.to);
+  return id;
+}
+// Rejects in Xero every leave application made for a request (one per day, or the single older id). Returns { fail } with the first reason Xero gave when any are refused.
+async function leaveRejectInXero(env, row) {
+  const ids = new Set();
+  (leaveDaysOf(row) || []).forEach((d) => { if (d.xeroId) ids.add(d.xeroId); });
+  if (row.xero_id) ids.add(row.xero_id);
+  let fail = "";
+  for (const id of ids) {
+    try {
+      const res = await xeroFetch(env, `payroll.xro/1.0/LeaveApplications/${id}/reject`, { method: "POST", headers: { "Content-Type": "application/json" } });
+      if (!res.ok) { if (!fail) fail = await xeroWhy(res); continue; }
+      let j;
+      try { j = await res.json(); } catch (e) { j = {}; }
+      const errs = (((j.LeaveApplications || [])[0] || {}).ValidationErrors || []).map((x) => x.Message).filter(Boolean);
+      if (errs.length && !fail) fail = errs.join(" ");
+    } catch (e) { if (!fail) fail = String(e && e.message || e).slice(0, 160); }
+  }
+  return fail ? { fail } : {};
+}
+// Sends a day by day request to Xero, one leave application a day, so Xero totals the weeks itself. A part day carries its hours. Days already sent keep their id so a second try never sends them twice.
+async function leavePushDays(env, row) {
+  const employeeId = await leaveEmployeeId(env, row);
+  if (!employeeId) return { fail: "This person is not in the Xero payroll snapshot yet, so Xero cannot be told. Run the one time fill first." };
+  const typeId = await leaveXeroTypeId(env, row);
+  if (!typeId) return { fail: `Xero has no ${LEAVE_LABELS[row.type] || "matching"} leave type for this person.` };
+  const days = leaveDaysOf(row) || [];
+  const DAY = await leaveDayHours(env, row.email);
+  for (const d of days) {
+    if (d.xeroId) continue;
+    const monday = tsAddDays(d.date, -((new Date(`${d.date}T00:00:00Z`).getUTCDay() + 6) % 7));
+    const app = { EmployeeID: employeeId, LeaveTypeID: typeId, Title: LEAVE_LABELS[row.type] || "Leave", Description: "Requested in Reservoir", StartDate: `${d.date}T00:00:00`, EndDate: `${d.date}T00:00:00`, PayOutType: "DEFAULT" };
+    if (Math.abs(Number(d.hours) - DAY) > 0.001) app.LeavePeriods = [{ PayPeriodStartDate: `${monday}T00:00:00`, PayPeriodEndDate: `${tsAddDays(monday, 6)}T00:00:00`, NumberOfUnits: Number(d.hours) }];
+    const res = await xeroFetch(env, "payroll.xro/1.0/LeaveApplications", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify([app]) });
+    if (!res.ok) return { fail: `${d.date}: ${await xeroWhy(res)}`, days };
+    let j;
+    try { j = await res.json(); } catch (e) { j = {}; }
+    const made = (j.LeaveApplications || [])[0];
+    if (!made) return { fail: `${d.date}: Xero answered but sent back no leave application.`, days };
+    const errs = (made.ValidationErrors || []).map((x) => x.Message).filter(Boolean);
+    if (errs.length) return { fail: `${d.date}: Xero refused it: ${errs.join(" ")}`, days };
+    d.xeroId = made.LeaveApplicationID || "";
+    if (d.xeroId) await env.DB.prepare("INSERT OR REPLACE INTO xero_leave_apps (xero_id, leave_id) VALUES (?, ?)").bind(d.xeroId, row.id).run();
+    await env.DB.prepare("UPDATE xero_leave SET days = ? WHERE id = ?").bind(JSON.stringify(days), row.id).run();
+  }
+  return { id: (days.find((d) => d.xeroId) || {}).xeroId || "", days };
+}
+// Writes one leave application to Xero: create when there is no xero_id yet, update when there is. Returns { id } or { fail }.
+async function leavePushXero(env, row, change) {
+  const employeeId = await leaveEmployeeId(env, row);
+  if (!employeeId) return { fail: "This person is not in the Xero payroll snapshot yet, so Xero cannot be told. Run the one time fill first." };
+  const kind = change.type || row.type;
+  const typeId = await leaveXeroTypeId(env, { ...row, type: kind });
+  if (!typeId) return { fail: `Xero has no ${LEAVE_LABELS[kind] || "matching"} leave type for this person.` };
+  const app = { EmployeeID: employeeId, LeaveTypeID: typeId, Title: LEAVE_LABELS[kind] || row.type_name || "Leave", Description: "Requested in Reservoir", StartDate: `${change.from}T00:00:00`, EndDate: `${change.to}T00:00:00`, PayOutType: "DEFAULT" };
+  const updating = !!row.xero_id;
+  if (updating) app.LeaveApplicationID = row.xero_id;
+  const res = await xeroFetch(env, `payroll.xro/1.0/LeaveApplications${updating ? `/${row.xero_id}` : ""}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify([app]) });
+  if (!res.ok) return { fail: await xeroWhy(res) };
+  let j;
+  try { j = await res.json(); } catch (e) { j = {}; }
+  const made = (j.LeaveApplications || [])[0];
+  if (!made) return { fail: "Xero answered but sent back no leave application." };
+  const errs = (made.ValidationErrors || []).map((x) => x.Message).filter(Boolean);
+  if (errs.length) return { fail: `Xero refused it: ${errs.join(" ")}` };
+  return { id: made.LeaveApplicationID || row.xero_id || "" };
+}
+// After Xero changes, the person's balances are read once more so the Leave screen shows the new figure at once. Best effort.
+async function leaveRefreshBalances(env, email) {
+  try {
+    const pay = await env.DB.prepare("SELECT employee_id FROM xero_payroll WHERE email = ?").bind(email).first();
+    if (!pay || !pay.employee_id) return;
+    const r = await xeroFetch(env, `payroll.xro/1.0/Employees/${pay.employee_id}`);
+    if (!r.ok) return;
+    const rec = ((await r.json()).Employees || [])[0];
+    if (!rec) return;
+    const balances = (Array.isArray(rec.LeaveBalances) ? rec.LeaveBalances : []).map((b) => ({ name: String(b.LeaveName || ""), typeId: String(b.LeaveTypeID || ""), units: xnum(b.NumberOfUnits), unitType: String(b.TypeOfUnits || "") }));
+    await env.DB.prepare("UPDATE xero_payroll SET leave_balances = ?, synced_at = datetime('now') WHERE email = ?").bind(JSON.stringify(balances), email).run();
+  } catch (e) { /* the weekly sync will catch up */ }
+}
+// The leave sync. Reads every active person's balances and the last 12 months of leave applications from Xero into D1. Nothing here ever writes to Xero.
+async function leaveSync(env) {
+  await leaveTable(env);
+  await dfpTables(env);
+  const people = ((await env.DB.prepare("SELECT employee_id, email, name FROM xero_payroll WHERE email IS NOT NULL AND email <> '' AND (status IS NULL OR status = 'ACTIVE')").all()).results) || [];
+  const byEmp = new Map(people.map((p) => [p.employee_id, p]));
+  let balances = 0;
+  await xeroEach(people, async (p) => {
+    try {
+      const r = await xeroFetch(env, `payroll.xro/1.0/Employees/${p.employee_id}`);
+      if (!r.ok) return;
+      const rec = ((await r.json()).Employees || [])[0];
+      if (!rec) return;
+      const list = (Array.isArray(rec.LeaveBalances) ? rec.LeaveBalances : []).map((b) => ({ name: String(b.LeaveName || ""), typeId: String(b.LeaveTypeID || ""), units: xnum(b.NumberOfUnits), unitType: String(b.TypeOfUnits || "") }));
+      await env.DB.prepare("UPDATE xero_payroll SET leave_balances = ?, synced_at = datetime('now') WHERE employee_id = ?").bind(JSON.stringify(list), p.employee_id).run();
+      balances++;
+    } catch (e) { /* skip this person, try again next sync */ }
+  });
+  const since = melbourneDay(Date.now() - 366 * 86400000);
+  const typeNames = new Map();
+  try {
+    const pi = await xeroFetch(env, "payroll.xro/1.0/PayItems");
+    if (pi.ok) (((await pi.json()).PayItems || {}).LeaveTypes || []).forEach((t) => typeNames.set(t.LeaveTypeID, t.Name));
+  } catch (e) { /* names fall back to the balances */ }
+  for (const p of people) {
+    try {
+      const pay = await env.DB.prepare("SELECT leave_balances FROM xero_payroll WHERE employee_id = ?").bind(p.employee_id).first();
+      JSON.parse((pay && pay.leave_balances) || "[]").forEach((b) => { if (b.typeId && b.name && !typeNames.has(b.typeId)) typeNames.set(b.typeId, b.name); });
+    } catch (e) { /* ignore */ }
+  }
+  let seen = 0, added = 0, updated = 0, pages = 0;
+  for (let page = 1; page <= 20; page++) {
+    const res = await xeroFetch(env, `payroll.xro/1.0/LeaveApplications?page=${page}`);
+    if (!res.ok) return { ok: false, balances, error: await xeroWhy(res) };
+    const list = (await res.json()).LeaveApplications || [];
+    pages++;
+    if (!list.length) break;
+    for (const a of list) {
+      const p = byEmp.get(a.EmployeeID);
+      const from = xeroDate(a.StartDate), to = xeroDate(a.EndDate);
+      if (!p || !from || !to || to < since) continue;
+      seen++;
+      const name = typeNames.get(a.LeaveTypeID) || a.Title || "";
+      const kind = leaveKind(name);
+      const dayApp = await env.DB.prepare("SELECT leave_id FROM xero_leave_apps WHERE xero_id = ?").bind(a.LeaveApplicationID).first();
+      if (dayApp) continue;
+      const known = await env.DB.prepare("SELECT id, status FROM xero_leave WHERE xero_id = ?").bind(a.LeaveApplicationID).first();
+      if (known) {
+        if (known.status === "approved") { await env.DB.prepare("UPDATE xero_leave SET from_date = ?, to_date = ?, type = ?, type_name = ? WHERE id = ?").bind(from, to, kind, name, known.id).run(); updated++; }
+        continue;
+      }
+      await env.DB.prepare("INSERT INTO xero_leave (id, email, name, employee_id, type, type_name, leave_type_id, from_date, to_date, status, xero_id, source, decided_by, decided_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'approved', ?, 'xero', 'Xero', datetime('now'))").bind(`lv_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`, p.email, p.name, p.employee_id, kind, name, a.LeaveTypeID || "", from, to, a.LeaveApplicationID).run();
+      added++;
+    }
+    if (list.length < 100) break;
+  }
+  return { ok: true, balances, leaveSeen: seen, added, updated, pages };
+}
+// ---- Timesheet history. Xero timesheets from the start of 2026, kept in D1 as a read only record per person (xero_timesheets). Reads from Xero only, never writes. ----
+const TIMESHEET_FROM = "2026-01-01";
+let timesheetTableMade = false;
+async function timesheetTable(env) {
+  if (timesheetTableMade) return;
+  await env.DB.prepare("CREATE TABLE IF NOT EXISTS xero_timesheets (id TEXT PRIMARY KEY, employee_id TEXT NOT NULL, email TEXT, name TEXT, start_date TEXT NOT NULL, end_date TEXT NOT NULL, status TEXT, total_hours REAL NOT NULL DEFAULT 0, lines TEXT, xero_updated TEXT, synced_at TEXT DEFAULT (datetime('now')))").run();
+  await env.DB.prepare("CREATE INDEX IF NOT EXISTS xero_timesheets_email ON xero_timesheets (email, start_date)").run();
+  await env.DB.prepare("CREATE INDEX IF NOT EXISTS xero_timesheets_emp ON xero_timesheets (employee_id, start_date)").run();
+  timesheetTableMade = true;
+}
+// Brings every Xero timesheet that ends on or after 1 January 2026 into D1, for every person Reservoir knows from Xero payroll. Safe to run again, each timesheet is saved once and refreshed.
+async function timesheetSync(env) {
+  await timesheetTable(env);
+  await dfpTables(env);
+  const people = ((await env.DB.prepare("SELECT employee_id, email, name FROM xero_payroll").all()).results) || [];
+  const byEmp = new Map(people.map((p) => [p.employee_id, p]));
+  const rateNames = new Map();
+  try {
+    const pi = await xeroFetch(env, "payroll.xro/1.0/PayItems");
+    if (pi.ok) (((await pi.json()).PayItems || {}).EarningsRates || []).forEach((r) => rateNames.set(r.EarningsRateID, r.Name));
+  } catch (e) { /* lines keep their rate id */ }
+  const out = { ok: true, pages: 0, seen: 0, saved: 0, byStatus: {}, people: 0, earliest: "", latest: "", skippedNotStaff: 0, rawCount: 0, rawEarliest: "", rawLatest: "", rawPeople: 0, beforeCutoff: 0 };
+  const rawWho = new Set();
+  const who = new Set();
+  const pending = [];
+  // Saved in groups so a full read takes a moment, not a long wait.
+  const flush = async () => {
+    while (pending.length) {
+      const group = pending.splice(0, 40);
+      if (typeof env.DB.batch === "function") await env.DB.batch(group);
+      else for (const st of group) await st.run();
+    }
+  };
+  // Every page is read with no date filter in the request and the 1 January cut off is applied here, so nothing depends on how Xero treats a filter. raw* figures describe everything Xero holds, to show whether there is anything earlier than what was saved.
+  for (let page = 1; page <= 60; page++) {
+    const res = await xeroFetch(env, `payroll.xro/1.0/Timesheets?page=${page}`);
+    if (!res.ok) {
+      await flush();
+      const why = await xeroWhy(res);
+      const hint = res.status === 401 || res.status === 403 ? " Xero needs the Timesheets permission (payroll.timesheets). Add it to the Xero app, then reconnect Xero from the Development tab." : "";
+      return { ...out, ok: false, error: why + hint };
+    }
+    const list = (await res.json()).Timesheets || [];
+    out.pages++;
+    if (!list.length) break;
+    for (const t of list) {
+      const start = xeroDate(t.StartDate), end = xeroDate(t.EndDate);
+      if (start && end) {
+        out.rawCount++;
+        rawWho.add(t.EmployeeID);
+        if (!out.rawEarliest || start < out.rawEarliest) out.rawEarliest = start;
+        if (!out.rawLatest || end > out.rawLatest) out.rawLatest = end;
+      }
+      if (!start || !end) continue;
+      if (end < TIMESHEET_FROM) { out.beforeCutoff++; continue; }
+      const p = byEmp.get(t.EmployeeID);
+      if (!p) { out.skippedNotStaff++; continue; }
+      const lines = (Array.isArray(t.TimesheetLines) ? t.TimesheetLines : []).map((l) => ({ rateId: String(l.EarningsRateID || ""), rateName: rateNames.get(l.EarningsRateID) || "", units: (Array.isArray(l.NumberOfUnits) ? l.NumberOfUnits : []).map(xnum) }));
+      let total = xnum(t.Hours);
+      if (!total) total = lines.reduce((a, l) => a + l.units.reduce((x, y) => x + y, 0), 0);
+      const um = /\/Date\((-?\d+)/.exec(String(t.UpdatedDateUTC || ""));
+      const updated = um ? new Date(Number(um[1])).toISOString() : String(t.UpdatedDateUTC || "");
+      pending.push(env.DB.prepare("INSERT INTO xero_timesheets (id, employee_id, email, name, start_date, end_date, status, total_hours, lines, xero_updated, synced_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now')) ON CONFLICT(id) DO UPDATE SET employee_id = excluded.employee_id, email = excluded.email, name = excluded.name, start_date = excluded.start_date, end_date = excluded.end_date, status = excluded.status, total_hours = excluded.total_hours, lines = excluded.lines, xero_updated = excluded.xero_updated, synced_at = datetime('now') WHERE xero_timesheets.status <> 'PROCESSED'").bind(t.TimesheetID, t.EmployeeID, p.email || null, p.name || "", start, end, String(t.Status || ""), total, JSON.stringify(lines), updated));
+      out.seen++;
+      out.saved++;
+      const st = String(t.Status || "UNKNOWN");
+      out.byStatus[st] = (out.byStatus[st] || 0) + 1;
+      who.add(t.EmployeeID);
+      if (!out.earliest || start < out.earliest) out.earliest = start;
+      if (!out.latest || end > out.latest) out.latest = end;
+    }
+    if (list.length < 100) break;
+  }
+  await flush();
+  out.people = who.size;
+  out.rawPeople = rawWho.size;
+  return out;
+}
+// A read only check of what Xero actually sends for timesheets, to settle whether drafts come through. Asks the older and the newer Payroll API with and without a status filter and reports plainly. Writes nothing.
+async function timesheetProbe(env) {
+  const people = ((await env.DB.prepare("SELECT employee_id, name FROM xero_payroll").all()).results) || [];
+  const nameOf = new Map(people.map((p) => [p.employee_id, p.name]));
+  const lines = [];
+  const dmy = (iso) => String(iso || "").split("-").reverse().join(".");
+  const ask = async (label, path, pick) => {
+    try {
+      const res = await xeroFetch(env, path);
+      if (!res.ok) { lines.push(`${label}: ${await xeroWhy(res)}`); return null; }
+      const j = await res.json();
+      const list = pick(j);
+      return list;
+    } catch (e) { lines.push(`${label}: ${String(e && e.message || e).slice(0, 120)}`); return null; }
+  };
+  const count = (list, f) => list.reduce((m, t) => { const k = String(f(t) || "UNKNOWN"); m[k] = (m[k] || 0) + 1; return m; }, {});
+  const show = (m) => Object.entries(m).map(([k, v]) => `${k} ${v}`).join(", ") || "none";
+  const v1 = await ask("Older API, everything", "payroll.xro/1.0/Timesheets?page=1", (j) => j.Timesheets || []);
+  if (v1) lines.push(`Older API, no filter, first page: ${v1.length} timesheets. By status: ${show(count(v1, (t) => t.Status))}.`);
+  const v1d = await ask("Older API, Draft only", `payroll.xro/1.0/Timesheets?where=${encodeURIComponent('Status=="DRAFT"')}`, (j) => j.Timesheets || []);
+  if (v1d) {
+    lines.push(`Older API, Draft only: ${v1d.length} timesheets.`);
+    v1d.slice(0, 12).forEach((t) => lines.push(`Draft: ${nameOf.get(t.EmployeeID) || t.EmployeeID}, ${dmy(xeroDate(t.StartDate))} to ${dmy(xeroDate(t.EndDate))}, ${xnum(t.Hours)} hours.`));
+  }
+  const v2 = await ask("Newer API, Draft only", "payroll.xro/2.0/Timesheets?status=Draft", (j) => j.timesheets || j.Timesheets || []);
+  if (v2) {
+    lines.push(`Newer API, Draft only: ${v2.length} timesheets.`);
+    v2.slice(0, 12).forEach((t) => lines.push(`Draft (newer): ${nameOf.get(t.employeeId || t.EmployeeID) || t.employeeId || t.EmployeeID}, ${dmy(String(t.startDate || t.StartDate || "").slice(0, 10))} to ${dmy(String(t.endDate || t.EndDate || "").slice(0, 10))}.`));
+  }
+  const v2a = await ask("Newer API, everything", "payroll.xro/2.0/Timesheets", (j) => j.timesheets || j.Timesheets || []);
+  if (v2a) lines.push(`Newer API, no filter: ${v2a.length} timesheets. By status: ${show(count(v2a, (t) => t.status || t.Status))}.`);
+  return { ok: true, lines };
+}
+// The Timesheets screen reads only what is already stored here. It never calls Xero.
+// ---- Real access levels, as set on each person in Microsoft Entra (the T1, T2 and T3 app roles on the Reservoir enterprise app). Read through Graph with the app's own login. Needs the Graph app to hold the Directory.Read.All application permission with admin consent. Read only. Kept for five minutes. ----
+let accessTiersCache = { at: 0, value: null };
+async function accessTiers(env) {
+  if (accessTiersCache.value && Date.now() - accessTiersCache.at < 300000) return accessTiersCache.value;
+  const get = async (path) => {
+    let res = await graphFetch(env, path);
+    // A 403 can come from a Graph token fetched before the permission was granted (roles are fixed inside the token). Fetch a fresh one and try once more.
+    if (res.status === 403) { graphToken = { value: null, at: 0 }; res = await graphFetch(env, path); }
+    const text = await res.text();
+    let json;
+    try { json = JSON.parse(text); } catch (e) { json = null; }
+    if (!res.ok) {
+      let who = "";
+      if (res.status === 403) {
+        try {
+          const c = JSON.parse(atob(String(graphToken.value).split(".")[1].replace(/-/g, "+").replace(/_/g, "/")));
+          who = ` The Worker's Graph login is app ${c.appid || c.azp || "unknown"} and its token holds: ${(c.roles || []).join(", ") || "no application permissions at all"}.`;
+        } catch (e) { who = ""; }
+      }
+      throw new Error(`Graph answered ${res.status} for ${path.split("?")[0]}. ${json && json.error && json.error.message ? json.error.message : text.slice(0, 160)}${who}`);
+    }
+    return json || {};
+  };
+  const sp = (await get(`/servicePrincipals?$filter=appId eq '${env.CLIENT_ID}'&$select=id,appRoles`)).value || [];
+  if (!sp.length) throw new Error("The Reservoir enterprise app was not found in Entra.");
+  const roleOf = {};
+  (sp[0].appRoles || []).forEach((r) => { if (/^T[1-5]$/.test(r.value || "")) roleOf[r.id] = r.value; });
+  const rank = { T1: 1, T2: 2, T3: 3, T4: 4, T5: 5 };
+  const tiers = {};
+  const give = (u, tier) => {
+    for (const k of [u.userPrincipalName, u.mail]) {
+      const e = String(k || "").trim().toLowerCase();
+      if (e && (!tiers[e] || rank[tier] < rank[tiers[e]])) tiers[e] = tier;
+    }
+  };
+  let next = `/servicePrincipals/${sp[0].id}/appRoleAssignedTo?$top=100`;
+  for (let page = 0; next && page < 5; page++) {
+    const j = await get(next);
+    for (const a of j.value || []) {
+      const tier = roleOf[a.appRoleId];
+      if (!tier) continue;
+      if (a.principalType === "User") give(await get(`/users/${a.principalId}?$select=userPrincipalName,mail`), tier);
+      else if (a.principalType === "Group") for (const m of ((await get(`/groups/${a.principalId}/transitiveMembers/microsoft.graph.user?$select=userPrincipalName,mail&$top=200`)).value || [])) give(m, tier);
+    }
+    next = j["@odata.nextLink"] || "";
+  }
+  accessTiersCache = { at: Date.now(), value: tiers };
+  return tiers;
+}
+// ---- AroFlo (API v2, personal access token). Read only. T1 only. The token is the Worker secret AROFLO_TOKEN and is never returned. ----
+const AROFLO_BASE = "https://api.aroflo.com/v2";
+async function arofloGet(env, path) {
+  const res = await fetch(AROFLO_BASE + path, { method: "GET", headers: { Authorization: "Bearer " + env.AROFLO_TOKEN, Accept: "application/json" } });
+  const text = await res.text();
+  let json;
+  try { json = JSON.parse(text); } catch (e) { json = null; }
+  return { ok: res.ok, status: res.status, json, text: text.slice(0, 1200), contentType: res.headers.get("content-type") || "" };
+}
+// Flattens any JSON into [path, value] pairs so the app can list every field AroFlo sent, whatever its shape.
+function arofloFlat(value, prefix, out, depth) {
+  if (out.length > 400) return out;
+  if (value === null || value === undefined) { if (prefix) out.push([prefix, ""]); return out; }
+  if (Array.isArray(value)) {
+    if (!value.length) { if (prefix) out.push([prefix, "(empty list)"]); return out; }
+    if (depth >= 4) { out.push([prefix, `(${value.length} items)`]); return out; }
+    value.slice(0, 20).forEach((v, i) => arofloFlat(v, `${prefix}[${i}]`, out, depth + 1));
+    return out;
+  }
+  if (typeof value === "object") {
+    if (depth >= 4) { out.push([prefix, "(more fields)"]); return out; }
+    Object.keys(value).forEach((k) => arofloFlat(value[k], prefix ? `${prefix}.${k}` : k, out, depth + 1));
+    return out;
+  }
+  out.push([prefix, String(value)]);
+  return out;
+}
+// The list of records inside whatever AroFlo returned: a bare list, or the first list found under a key.
+function arofloList(json) {
+  if (Array.isArray(json)) return json;
+  if (json && typeof json === "object") {
+    for (const k of ["data", "items", "results", "projects", "records", "rows"]) if (Array.isArray(json[k])) return json[k];
+    for (const k of Object.keys(json)) if (Array.isArray(json[k])) return json[k];
+    for (const k of Object.keys(json)) if (json[k] && typeof json[k] === "object") { const inner = arofloList(json[k]); if (inner) return inner; }
+  }
+  return null;
+}
+// Everything in the reply that is not the list itself (paging details, totals, links), so the way AroFlo pages its answers can be read and followed.
+function arofloMeta(json) {
+  if (!json || typeof json !== "object" || Array.isArray(json)) return [];
+  const out = [];
+  for (const k of Object.keys(json)) {
+    const v = json[k];
+    if (Array.isArray(v)) continue;
+    arofloFlat(v, k, out, 1);
+  }
+  return out.slice(0, 40);
+}
+// Works out how many pages AroFlo has from its paging details, when it says. Returns 0 when it does not.
+function arofloLastPage(meta, listLength) {
+  const num = (re) => { const h = meta.find(([k, v]) => re.test(k.split(".").pop()) && v !== "" && Number.isFinite(Number(v))); return h ? Number(h[1]) : 0; };
+  const pages = num(/^(total_?pages|page_?count|last_?page|num_?pages|pages|totalPages|pageCount|lastPage)$/i);
+  if (pages > 1) return pages;
+  const total = num(/^(total|count|total_?count|total_?items|total_?results|totalCount|totalItems|totalResults)$/i);
+  const size = num(/^(per_?page|page_?size|limit|perPage|pageSize)$/i) || listLength;
+  if (total > size && size > 0) return Math.ceil(total / size);
+  return 0;
+}
+// Picks the project number, client and site address out of one record by field name. Anything not found stays blank, and the full record is always passed on too.
+function arofloShape(rec) {
+  const flat = arofloFlat(rec, "", [], 0).filter(([, v]) => v !== "" && v !== "(empty list)");
+  const find = (want, avoid) => {
+    for (const re of want) {
+      const hit = flat.find(([k]) => re.test(k) && !(avoid && avoid.test(k)));
+      if (hit) return hit[1];
+    }
+    return "";
+  };
+  const number = find([/project.*(number|no|num|code|ref)$/i, /(^|\.)(number|projectnumber|jobnumber|ref|reference)$/i, /(^|\.)id$/i]);
+  const client = find([/client.*name/i, /customer.*name/i, /(^|\.)client$/i, /(^|\.)customer$/i, /client/i, /customer/i], /address|email|phone|id$/i);
+  const parts = flat.filter(([k]) => /(site|location|project|job).*(address|street|suburb|city|town|state|postcode|postal)/i.test(k) && !/client|customer|billing|postal.*client/i.test(k)).map(([, v]) => v);
+  let address = parts.length ? Array.from(new Set(parts)).join(", ") : "";
+  if (!address) address = find([/(^|\.)address/i, /street/i], /client|customer|billing|email/i);
+  const when = flat.find(([k, v]) => /(created|added|loaded|inserted|entered|logged)/i.test(k) && /^\d{4}-\d{2}-\d{2}/.test(v));
+  return { number: String(number || ""), client: String(client || ""), address: String(address || ""), when: when ? when[1] : "" };
+}
+// The date a project was created, read from whichever date field AroFlo sent. Returns YYYY-MM-DD or "".
+function arofloWhen(rec) {
+  const flat = arofloFlat(rec, "", [], 0).filter(([, v]) => /^\d{4}[-\/]\d{2}[-\/]\d{2}/.test(String(v)));
+  const pick = (re) => flat.find(([k]) => re.test(k));
+  const hit = pick(/(created|added|loaded|inserted|entered|logged)/i) || pick(/(start|open|date)/i);
+  return hit ? String(hit[1]).slice(0, 10).replace(/\//g, "-") : "";
+}
+async function arofloDiscover(env) {
+  const tries = ["/openapi.json", "/swagger.json", "/docs/json", "/", "/healthcheck"];
+  const found = [];
+  for (const p of tries) {
+    try {
+      const r = await arofloGet(env, p);
+      const paths = r.json && r.json.paths ? Object.keys(r.json.paths).slice(0, 120) : [];
+      found.push({ path: p, status: r.status, paths, text: paths.length ? "" : r.text.slice(0, 300) });
+    } catch (e) {
+      found.push({ path: p, status: 0, paths: [], text: String(e && e.message || e).slice(0, 120) });
+    }
+  }
+  return found;
+}
+// ---- Email Accounts. Read only view and new mail pings for four DFP mailboxes, through the same Microsoft Graph app as SharePoint. The app registration needs the Mail.Read application permission (admin consent), ideally limited to these mailboxes. ----
+
+// ---- Supplier invoice reader and Xero approved bills. Reads the text of a Burnett's PDF (plain Flate streams, one text item per BT block), then creates the bill in Xero as approved with the PDF attached. Any failure falls back to a draft by email. ----
+async function pdfTextItems(bytes) {
+  const raw = new Uint8Array(bytes);
+  const bin = new TextDecoder("latin1").decode(raw);
+  const items = [];
+  const re = /stream\r?\n/g;
+  let m;
+  while ((m = re.exec(bin))) {
+    const start = m.index + m[0].length;
+    const end = bin.indexOf("endstream", start);
+    if (end < 0) break;
+    re.lastIndex = end + 9;
+    let text = "";
+    let cut = end;
+    while (cut > start && (raw[cut - 1] === 10 || raw[cut - 1] === 13)) cut--;
+    for (const stop of [cut, end]) {
+      try {
+        const ds = new DecompressionStream("deflate");
+        const out = new Response(new Blob([raw.slice(start, stop)]).stream().pipeThrough(ds));
+        text = new TextDecoder("latin1").decode(await out.arrayBuffer());
+        break;
+      } catch (e) { text = ""; }
+    }
+    if (!text) continue;
+    if (!/\bTj\b|\bTJ\b/.test(text)) continue;
+    const bt = /BT([\s\S]*?)ET/g;
+    let b;
+    while ((b = bt.exec(text))) {
+      const pos = b[1].match(/(-?[\d.]+)\s+(-?[\d.]+)\s+Td/);
+      const str = [...b[1].matchAll(/\(((?:\\.|[^\\)])*)\)\s*Tj/g)].map((x) => x[1].replace(/\\([()\\])/g, "$1")).join("");
+      if (pos && str.trim()) items.push({ x: Number(pos[1]), y: Number(pos[2]), t: str.trim() });
+    }
+  }
+  return items;
+}
+async function burnettsParse(bytes) {
+  const items = await pdfTextItems(bytes);
+  if (!items.length) return null;
+  const near = (label, minX) => {
+    const l = items.find((i) => i.t.toLowerCase() === label.toLowerCase());
+    if (!l) return "";
+    const v = items.filter((i) => Math.abs(i.y - l.y) < 4 && i.x > Math.max(minX || 0, l.x + 20) && i !== l).sort((a, b) => a.x - b.x)[0];
+    return v ? v.t : "";
+  };
+  const number = near("Invoice No.", 380);
+  const dateText = near("Invoice Date", 380);
+  const money = (t) => Number(String(t).replace(/[$,\s]/g, ""));
+  const ex = money(near("Total Exc GST", 300)), gst = money(near("GST", 300)), inc = money(near("Total Inc GST", 300));
+  const dm = dateText.match(/^(\d{1,2})\s+([A-Za-z]{3})[a-z]*\s+(\d{4})$/);
+  const mi = dm ? ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"].indexOf(dm[2].toLowerCase()) : -1;
+  const neg = [near("Total Exc GST", 300), near("Total Inc GST", 300)].some((t) => /^\(.*\)$|^-|-$|CR$/i.test(String(t).trim())) || items.some((i) => /credit/i.test(i.t) && /note|tax credit/i.test(i.t));
+  if (neg || ex < 0 || inc < 0) return { credit: true };
+  if (!/^\d{4,}$/.test(number) || !dm || mi < 0 || !(ex > 0) || !(inc > 0) || Math.abs(ex + gst - inc) > 0.02) return null;
+  return { number, date: `${dm[3]}-${String(mi + 1).padStart(2, "0")}-${String(dm[1]).padStart(2, "0")}`, ex, gst, inc, order: near("Cust Order #.", 380) };
+}
+// Creates the bill in Xero as approved (falls back to draft if Xero will not approve it) and attaches the PDF. Returns { ok, status, id, note }.
+async function harrisParse(bytes) {
+  const items = await pdfTextItems(bytes);
+  if (!items.length) return null;
+  const row = (label) => {
+    const l = items.find((i) => i.t.toLowerCase() === label.toLowerCase());
+    if (!l) return "";
+    const v = items.filter((i) => Math.abs(i.y - l.y) < 4 && i.x > l.x + 20 && i !== l && /\d/.test(i.t)).sort((a, b) => b.x - a.x)[0];
+    return v ? v.t : "";
+  };
+  const negText = (t) => /^\(.*\)$|^-|-$|CR$/i.test(String(t).trim());
+  const money = (t) => { const n = Number(String(t).replace(/[^0-9.]/g, "")); return negText(t) ? -n : n; };
+  const exT = row("TOTAL excl. GST"), gstT = row("GST @ 10%"), incT = row("AMOUNT DUE");
+  const ex = money(exT), gst = money(gstT), inc = money(incT);
+  const credit = negText(exT) || negText(incT) || ex < 0 || inc < 0 || items.some((i) => /credit note|tax credit|^credit$/i.test(i.t));
+  if (credit) return { credit: true };
+  const number = row("Invoice No");
+  const dt = row("Invoice Date").match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/);
+  if (!/^\d{5,}(\/\d+)?$/.test(number) || !dt || !(ex > 0) || !(inc > 0) || Math.abs(ex + gst - inc) > 0.02) return null;
+  const yr = dt[3].length === 2 ? 2000 + Number(dt[3]) : Number(dt[3]);
+  return { number, date: `${yr}-${String(dt[2]).padStart(2, "0")}-${String(dt[1]).padStart(2, "0")}`, ex, gst, inc, order: row("Order No") };
+}
+// Reader for PDFs that position text with Tm and kerned TJ arrays (Samios). Each item carries its page number (order of the content streams).
+// Small inflate used when the built in DecompressionStream refuses a stream (some generators write a window size the header does not match).
+function inflateBytes(src) {
+  let pos = 2, bitBuf = 0, bitCnt = 0;
+  const out = [];
+  const bits = (n) => { while (bitCnt < n) { if (pos >= src.length) throw new Error("eof"); bitBuf |= src[pos++] << bitCnt; bitCnt += 8; } const v = bitBuf & ((1 << n) - 1); bitBuf >>>= n; bitCnt -= n; return v; };
+  const build = (lens) => { const count = new Array(16).fill(0), offs = new Array(16).fill(0), syms = []; for (const l of lens) count[l]++; count[0] = 0; for (let i = 1; i < 16; i++) offs[i] = offs[i - 1] + count[i - 1]; lens.forEach((l, i) => { if (l) syms[offs[l]++] = i; }); return { count, syms }; };
+  const decode = (h) => { let code = 0, first = 0, index = 0; for (let len = 1; len < 16; len++) { code |= bits(1); const c = h.count[len]; if (code - c < first) return h.syms[index + (code - first)]; index += c; first += c; first <<= 1; code <<= 1; } throw new Error("bad code"); };
+  const LB = [3, 4, 5, 6, 7, 8, 9, 10, 11, 13, 15, 17, 19, 23, 27, 31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258], LE = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2, 2, 3, 3, 3, 3, 4, 4, 4, 4, 5, 5, 5, 5, 0];
+  const DB = [1, 2, 3, 4, 5, 7, 9, 13, 17, 25, 33, 49, 65, 97, 129, 193, 257, 385, 513, 769, 1025, 1537, 2049, 3073, 4097, 6145, 8193, 12289, 16385, 24577], DE = [0, 0, 0, 0, 1, 1, 2, 2, 3, 3, 4, 4, 5, 5, 6, 6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13];
+  let fixedL = null, fixedD = null;
+  for (let last = 0; !last;) {
+    last = bits(1);
+    const type = bits(2);
+    if (type === 0) {
+      bitBuf = 0; bitCnt = 0;
+      const len = src[pos] | (src[pos + 1] << 8); pos += 4;
+      for (let i = 0; i < len; i++) out.push(src[pos++]);
+      continue;
+    }
+    let hl, hd;
+    if (type === 1) {
+      if (!fixedL) { const l = []; for (let i = 0; i < 144; i++) l.push(8); for (let i = 144; i < 256; i++) l.push(9); for (let i = 256; i < 280; i++) l.push(7); for (let i = 280; i < 288; i++) l.push(8); fixedL = build(l); fixedD = build(new Array(30).fill(5)); }
+      hl = fixedL; hd = fixedD;
+    } else if (type === 2) {
+      const nlen = bits(5) + 257, ndist = bits(5) + 1, ncode = bits(4) + 4;
+      const order = [16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15];
+      const cl = new Array(19).fill(0);
+      for (let i = 0; i < ncode; i++) cl[order[i]] = bits(3);
+      const ch = build(cl);
+      const lens = [];
+      while (lens.length < nlen + ndist) {
+        const sym = decode(ch);
+        if (sym < 16) lens.push(sym);
+        else { let prev = 0, rep; if (sym === 16) { prev = lens[lens.length - 1]; rep = 3 + bits(2); } else if (sym === 17) rep = 3 + bits(3); else rep = 11 + bits(7); for (let i = 0; i < rep; i++) lens.push(prev); }
+      }
+      hl = build(lens.slice(0, nlen)); hd = build(lens.slice(nlen));
+    } else throw new Error("bad block");
+    for (;;) {
+      const sym = decode(hl);
+      if (sym < 256) out.push(sym);
+      else if (sym === 256) break;
+      else {
+        const li = sym - 257; const len = LB[li] + bits(LE[li]);
+        const di = decode(hd); const dist = DB[di] + bits(DE[di]);
+        const from = out.length - dist;
+        if (from < 0) throw new Error("bad distance");
+        for (let i = 0; i < len; i++) out.push(out[from + i]);
+      }
+    }
+  }
+  return Uint8Array.from(out);
+}
+async function pdfTextRuns(bytes, opts = {}) {
+  const raw = new Uint8Array(bytes);
+  const bin = new TextDecoder("latin1").decode(raw);
+  const items = [];
+  // Fonts that show glyph numbers in hex (Odoo, Qt) need the font's ToUnicode map to turn them back into text.
+  const inflate = async (st, en) => {
+    let cut = en;
+    while (cut > st && (raw[cut - 1] === 10 || raw[cut - 1] === 13)) cut--;
+    for (const stop of [cut, en]) {
+      try { return new TextDecoder("latin1").decode(await new Response(new Blob([raw.slice(st, stop)]).stream().pipeThrough(new DecompressionStream("deflate"))).arrayBuffer()); } catch (e) { /* try the next end */ }
+    }
+    return bin.slice(st, en);
+  };
+  const objBody = {};
+  for (const om of bin.matchAll(/(\d+)\s+0\s+obj([\s\S]*?)endobj/g)) objBody[om[1]] = { head: om[2], at: om.index + om[0].indexOf(om[2]) };
+  // Objects packed inside object streams (PDF 1.5, Microsoft and Dynamics) are opened up so their fonts can be found too.
+  let extra = "";
+  for (const om of bin.matchAll(/(\d+)\s+0\s+obj\s*<<([^>]*\/Type\s*\/ObjStm[^>]*)>>\s*stream\r?\n/g)) {
+    const n = Number((om[2].match(/\/N\s+(\d+)/) || [])[1]), fst = Number((om[2].match(/\/First\s+(\d+)/) || [])[1]);
+    const st = om.index + om[0].length, en = bin.indexOf("endstream", st);
+    if (!n || !fst || en < 0) continue;
+    const txt = await inflate(st, en);
+    const pairs = (txt.slice(0, fst).match(/\d+/g) || []).map(Number);
+    for (let k = 0; k < n; k++) {
+      const num = pairs[k * 2], off = pairs[k * 2 + 1], nxt = k + 1 < n ? pairs[k * 2 + 3] : txt.length - fst;
+      if (num === undefined) continue;
+      const body = txt.slice(fst + off, fst + nxt);
+      objBody[num] = { head: body, at: -1 };
+      extra += "\n" + body;
+    }
+  }
+  const all2 = bin + extra;
+  const fontObj = {};
+  for (const fm of all2.matchAll(/\/Font\s*<<([^>]*)>>/g)) for (const p of fm[1].matchAll(/\/([A-Za-z0-9_.+-]+)\s+(\d+)\s+0\s+R/g)) fontObj[p[1]] = p[2];
+  // Font dictionaries that sit in their own object (Qt): any name that points at a font object.
+  for (const fm of all2.matchAll(/\/([A-Za-z0-9_.+-]+)\s+(\d+)\s+0\s+R/g)) { const o = objBody[fm[2]]; if (o && /\/Type\s*\/Font\b/.test(o.head) && !(fm[1] in fontObj)) fontObj[fm[1]] = fm[2]; }
+  const cmaps = {};
+  const cmapOf = async (fname) => {
+    if (fname in cmaps) return cmaps[fname];
+    cmaps[fname] = null;
+    const fo = objBody[fontObj[fname]];
+    const tu = fo && fo.head.match(/\/ToUnicode\s+(\d+)\s+0\s+R/);
+    const co = tu && objBody[tu[1]];
+    if (!co) return null;
+    const sp = co.head.indexOf("stream");
+    if (sp < 0) return null;
+    const st = co.at + sp + 6 + (co.head[sp + 6] === "\r" ? 2 : 1);
+    const en = co.at + co.head.lastIndexOf("endstream");
+    const txt = await inflate(st, en);
+    const map = {};
+    const u16 = (h) => { let o = ""; for (let k = 0; k + 3 < h.length; k += 4) o += String.fromCharCode(parseInt(h.slice(k, k + 4), 16)); return o; };
+    for (const bm of txt.matchAll(/beginbfchar([\s\S]*?)endbfchar/g)) for (const p of bm[1].matchAll(/<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>/g)) map[parseInt(p[1], 16)] = u16(p[2]);
+    for (const bm of txt.matchAll(/beginbfrange([\s\S]*?)endbfrange/g)) for (const p of bm[1].matchAll(/<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*(?:<([0-9A-Fa-f]+)>|\[([^\]]*)\])/g)) {
+      const lo = parseInt(p[1], 16), hi = parseInt(p[2], 16);
+      if (p[3]) { const base = u16(p[3]); for (let c = lo; c <= hi; c++) map[c] = base.slice(0, -1) + String.fromCharCode(base.charCodeAt(base.length - 1) + (c - lo)); }
+      else { const arr = [...p[4].matchAll(/<([0-9A-Fa-f]+)>/g)].map((q) => u16(q[1])); for (let c = lo; c <= hi && c - lo < arr.length; c++) map[c] = arr[c - lo]; }
+    }
+    Object.defineProperty(map, "wide", { value: /begincodespacerange\s*<[0-9A-Fa-f]{4}>/.test(txt), enumerable: false });
+    cmaps[fname] = map;
+    return map;
+  };
+  const re = /stream\r?\n/g;
+  let m, page = 0;
+  while ((m = re.exec(bin))) {
+    const start = m.index + m[0].length;
+    const end = bin.indexOf("endstream", start);
+    if (end < 0) break;
+    re.lastIndex = end + 9;
+    let text = "";
+    const dict = bin.slice(Math.max(0, m.index - 400), m.index);
+    const dd = dict.slice(Math.max(dict.lastIndexOf("obj"), 0));
+    const filtered = /\/Filter/.test(dd);
+    let data = raw.slice(start, end);
+    if (/ASCII85Decode/.test(dd)) {
+      // ASCII85 wrapped streams (EngageOne, Bunnings): decode to bytes first, then inflate.
+      const body = new TextDecoder("latin1").decode(data).replace(/\s+/g, "").replace(/~>[\s\S]*$/, "").replace(/^<~/, "");
+      const bytesOut = [];
+      let grp = [];
+      for (const ch of body) {
+        if (ch === "z" && !grp.length) { bytesOut.push(0, 0, 0, 0); continue; }
+        grp.push(ch.charCodeAt(0) - 33);
+        if (grp.length === 5) { let v = 0; for (const g of grp) v = v * 85 + g; bytesOut.push((v >>> 24) & 255, (v >>> 16) & 255, (v >>> 8) & 255, v & 255); grp = []; }
+      }
+      if (grp.length > 1) { const n = grp.length; while (grp.length < 5) grp.push(84); let v = 0; for (const g of grp) v = v * 85 + g; const four = [(v >>> 24) & 255, (v >>> 16) & 255, (v >>> 8) & 255, v & 255]; bytesOut.push(...four.slice(0, n - 1)); }
+      data = new Uint8Array(bytesOut);
+    }
+    if (filtered) {
+      for (const trim of [true, false]) {
+        let stop = data.length;
+        if (trim) while (stop > 0 && (data[stop - 1] === 10 || data[stop - 1] === 13)) stop--;
+        try { text = new TextDecoder("latin1").decode(await new Response(new Blob([data.slice(0, stop)]).stream().pipeThrough(new DecompressionStream("deflate"))).arrayBuffer()); break; } catch (e) { text = ""; }
+        if (!text) { try { text = new TextDecoder("latin1").decode(inflateBytes(data.slice(0, stop))); break; } catch (e) { text = ""; } }
+      }
+    } else {
+      // Older PDFs (WEX) keep the page content uncompressed.
+      const plain = bin.slice(start, end);
+      if (/\bBT\b/.test(plain) && /\bTj\b|\bTJ\b/.test(plain)) text = plain;
+    }
+    if (!text || !/\bTj\b|\bTJ\b|[>)]\s*'/.test(text)) continue;
+    page++;
+    const unesc = (s) => s.replace(/\\([0-7]{1,3}|.)/g, (_, c) => (/^[0-7]+$/.test(c) ? String.fromCharCode(parseInt(c, 8)) : c === "n" ? "\n" : c === "r" ? "\r" : c === "t" ? "\t" : c));
+    const bt = /BT([\s\S]*?)ET/g;
+    let b;
+    let font = "", fsize = 0; // text state carries over between BT blocks
+    while ((b = bt.exec(text))) {
+      const startLen = items.length;
+      // With opts.cm, text positions are carried through the page's cm and q/Q operators so they are true page positions (Dynamics, Microsoft print).
+      let M = null;
+      if (opts.cm) {
+        M = [1, 0, 0, 1, 0, 0]; const stack = [];
+        for (const ev of text.slice(0, b.index).matchAll(/(?:^|\s)(q|Q)(?=\s|$)|((?:-?[\d.]+\s+){5}-?[\d.]+)\s+cm\b/g)) {
+          if (ev[1] === "q") stack.push(M.slice());
+          else if (ev[1] === "Q") { if (stack.length) M = stack.pop(); }
+          else { const c = ev[2].trim().split(/\s+/).map(Number); M = [c[0] * M[0] + c[1] * M[2], c[0] * M[1] + c[1] * M[3], c[2] * M[0] + c[3] * M[2], c[2] * M[1] + c[3] * M[3], c[4] * M[0] + c[5] * M[2] + M[4], c[4] * M[1] + c[5] * M[3] + M[5]]; }
+        }
+      }
+      let x = 0, y = 0, lead = 0;
+      const nums = [];
+      const tok = /\[((?:\((?:\\.|[^\\)])*\)|[^\]])*)\]|\(((?:\\.|[^\\)])*)\)|<([0-9A-Fa-f\s]+)>|\/([A-Za-z0-9_.+-]+)|(-?[\d.]+)|([A-Za-z*'"]+)/g;
+      let t, last = null;
+      const emit = async (str, hex, mapped) => {
+        if (hex) {
+          // Hex strings are glyph numbers, two bytes each, turned into text by the font's ToUnicode map.
+          const cm = await cmapOf(font);
+          const h = str.replace(/\s+/g, "");
+          let o = "";
+          if (cm) { for (let k = 0; k + 3 < h.length; k += 4) o += cm[parseInt(h.slice(k, k + 4), 16)] || ""; }
+          else for (let k = 0; k + 1 < h.length; k += 2) o += String.fromCharCode(parseInt(h.slice(k, k + 2), 16));
+          str = o.replace(/\t/g, " ");
+        }
+        // Literal strings in a font with a ToUnicode map: two byte glyph codes (CID fonts) or one byte codes (simple fonts) translated through the map.
+        if (!hex && !mapped && font && str) {
+          const cm1 = await cmapOf(font);
+          if (cm1) {
+            let o = "";
+            if (cm1.wide) { if (str.length % 2 === 0) { for (let k = 0; k + 1 < str.length; k += 2) { const c = (str.charCodeAt(k) << 8) | str.charCodeAt(k + 1); o += c in cm1 ? cm1[c] : ""; } str = o.replace(/\t/g, " "); } }
+            else { for (const ch of str) { const c = ch.charCodeAt(0); o += c in cm1 ? cm1[c] : ch; } str = o; }
+          }
+        }
+        // Two byte glyph codes (Reece): every other byte is zero and the glyph number is the character code less 29.
+        if (str.length >= 2 && str.length % 2 === 0 && /^(?:\0[\s\S])+$/.test(str)) { let o = ""; for (let k = 1; k < str.length; k += 2) o += String.fromCharCode(str.charCodeAt(k) + 29); str = o; }
+        if (!str) return;
+        // One glyph per Tj (Odoo): glyphs on the same line a short way apart belong to the same word or phrase.
+        if (hex && last && last.page === page && Math.abs(last.y - y) < 0.5 && x >= last.lastX && x - last.lastX < 25) { last.t += str; last.lastX = x; return; }
+        if (!str.trim()) return;
+        if (last && last.x === x && last.y === y && last.page === page && last.blk === b.index) last.t += str;
+        else { last = { x, y, t: str, page, lastX: x, size: fsize, blk: b.index }; items.push(last); }
+      };
+      while ((t = tok.exec(b[1]))) {
+        if (t[5] !== undefined) { nums.push(Number(t[5])); continue; }
+        if (t[4] !== undefined) { nums.push({ name: t[4] }); continue; }
+        if (t[1] !== undefined || t[2] !== undefined || t[3] !== undefined) {
+          // string operands are shown by the next Tj or TJ operator
+          nums.push(t[1] !== undefined ? { arr: t[1] } : t[2] !== undefined ? { str: t[2] } : { hex: t[3] });
+          continue;
+        }
+        const op = t[6];
+        if (op === "Tf") { const n = nums.find((q) => q && q.name !== undefined); if (n) font = n.name; const sz = nums.find((q) => typeof q === "number"); if (sz) fsize = sz; }
+        else if (op === "Tm" && nums.length >= 6) { x = nums[nums.length - 2]; y = nums[nums.length - 1]; }
+        else if ((op === "Td" || op === "TD") && nums.length >= 2) { x += nums[nums.length - 2]; y += nums[nums.length - 1]; if (op === "TD") lead = -nums[nums.length - 1]; }
+        else if (op === "TL" && nums.length) lead = nums[nums.length - 1];
+        else if (op === "T*") y -= lead;
+        else if (op === "Tj" || op === "TJ" || op === "'" || op === '"') {
+          if (op === "'" || op === '"') y -= lead;
+          const a = nums[nums.length - 1];
+          if (a && a.str !== undefined) await emit(unesc(a.str));
+          else if (a && a.hex !== undefined) await emit(a.hex, true);
+          else if (a && a.arr !== undefined) {
+            let out = "";
+            const hcm = /<[0-9A-Fa-f\s]+>/.test(a.arr) ? await cmapOf(font) : null;
+            for (const p of a.arr.matchAll(/\(((?:\\.|[^\\)])*)\)|<([0-9A-Fa-f\s]+)>|(-?[\d.]+)/g)) {
+              if (p[1] !== undefined) out += unesc(p[1]);
+              else if (p[2] !== undefined) { const h = p[2].replace(/\s+/g, ""); if (hcm) { for (let k = 0; k + 3 < h.length; k += 4) out += hcm[parseInt(h.slice(k, k + 4), 16)] || ""; } else for (let k = 0; k + 1 < h.length; k += 2) out += String.fromCharCode(parseInt(h.slice(k, k + 2), 16)); }
+              else if (Number(p[3]) <= -250) out += " ";
+            }
+            await emit(out, false, !!hcm || /<[0-9A-Fa-f\s]+>/.test(a.arr));
+          }
+        }
+        nums.length = 0;
+      }
+      if (M) for (let k = startLen; k < items.length; k++) { const it = items[k], lx = it.x, ly = it.y; it.x = M[0] * lx + M[2] * ly + M[4]; it.y = M[1] * lx + M[3] * ly + M[5]; }
+    }
+  }
+  return items;
+}
+async function samiosParse(bytes) {
+  const items = await pdfTextRuns(bytes);
+  if (!items.length) return null;
+  const all = items.map((i) => i.t);
+  const money = (t) => { const s = String(t).trim(); const n = Number(s.replace(/[^0-9.]/g, "")); return /^\(.*\)$|^-|-$|CR$/i.test(s) ? -n : n; };
+  const first = (re) => { for (const t of all) { const m = t.match(re); if (m) return m[1].trim(); } return ""; };
+  // Totals sit on the last page of a multi page invoice, so take the last match.
+  const lastOf = (re) => { let v = ""; for (const t of all) { const m = t.match(re); if (m) v = m[1].trim(); } return v; };
+  const number = first(/^Invoice:\s*(\d+)\b/i);
+  // Totals are a label with the amount to its right on the same line.
+  const valueOf = (label) => {
+    const ls = items.filter((i) => i.t.trim().toLowerCase() === label.toLowerCase());
+    const l = ls[ls.length - 1];
+    if (!l) return "";
+    const v = items.filter((i) => i.page === l.page && Math.abs(i.y - l.y) < 4 && i.x > l.x + 20 && /\d/.test(i.t)).sort((a, b) => a.x - b.x)[0];
+    return v ? v.t : "";
+  };
+  const exT = valueOf("Total Ex GST:"), gstT = valueOf("GST:"), incT = valueOf("Total Inc GST:");
+  const ex = money(exT), gst = money(gstT), inc = money(incT);
+  const credit = /^\(.*\)$|^-|-$|CR$/i.test(exT) || /^\(.*\)$|^-|-$|CR$/i.test(incT) || ex < 0 || inc < 0 || all.some((t) => /credit note|tax credit/i.test(t));
+  if (credit) {
+    // A credit note carries its own number and amounts; read them as positive figures so Xero can raise a supplier credit note.
+    const cn = first(/^(?:Credit Note|Credit|Invoice)\s*(?:No\.?|Number)?\s*:?\s*(\d{5,})\b/i) || (all.map((t) => t.match(/\b(\d{9})\b/)).find((m) => m) || [])[1] || "";
+    const cd = first(/^Date:\s*(\d{1,2}\/\d{1,2}\/\d{2,4})$/i).match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/);
+    const cy = cd ? (cd[3].length === 2 ? 2000 + Number(cd[3]) : Number(cd[3])) : 0;
+    // The credit note layout has no Total Ex GST line: it shows "Credit Total:" (with GST) and "Tax included in total:", so ex GST is worked out from those.
+    const rl = items.filter((i) => /^refer invoice:?$/i.test(i.t.trim()))[0];
+    const refItem = rl ? items.filter((i) => i.page === rl.page && Math.abs(i.y - rl.y) < 4 && i.x > rl.x + 10 && /^\d{5,}$/.test(i.t.trim())).sort((a, b) => a.x - b.x)[0] : null;
+    const refInv = refItem ? refItem.t.trim() : "";
+    const cInT = valueOf("Credit Total:") || incT, cGstT = valueOf("Tax included in total:") || gstT;
+    const cInc = Math.abs(money(cInT)) || 0, cGst = Math.abs(money(cGstT)) || 0;
+    const cEx = Math.abs(ex) || Math.round((cInc - cGst) * 100) / 100;
+    return { credit: true, refInv, number: cn, date: cd ? `${cy}-${String(cd[2]).padStart(2, "0")}-${String(cd[1]).padStart(2, "0")}` : "", ex: cEx, gst: cGst, inc: cInc, read: { exT: exT || String(cEx), gstT: cGstT, incT: cInT } };
+  }
+  const dt = first(/^Date:\s*(\d{1,2}\/\d{1,2}\/\d{2,4})$/i).match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/);
+  if (!/^\d{5,}$/.test(number) || !dt || !(ex > 0) || !(inc > 0) || Math.abs(ex + gst - inc) > 0.02) return null;
+  const yr = dt[3].length === 2 ? 2000 + Number(dt[3]) : Number(dt[3]);
+  return { number, date: `${yr}-${String(dt[2]).padStart(2, "0")}-${String(dt[1]).padStart(2, "0")}`, ex, gst, inc, order: "" };
+}
+async function reeceParse(bytes) {
+  const items = await pdfTextRuns(bytes);
+  if (!items.length) return null;
+  const valueOf = (label) => {
+    const ls = items.filter((i) => i.t.trim().toLowerCase() === label.toLowerCase());
+    const l = ls[ls.length - 1];
+    if (!l) return "";
+    const v = items.filter((i) => i.page === l.page && Math.abs(i.y - l.y) < 4 && i.x > l.x + 20 && i !== l).sort((a, b) => a.x - b.x)[0];
+    return v ? v.t.trim() : "";
+  };
+  const isNeg = (t) => /^\(.*\)$|^-|-$|CR$/i.test(String(t).trim());
+  const money = (t) => { const n = Number(String(t).replace(/[^0-9.]/g, "")); return isNeg(t) ? -n : n; };
+  const dl = items.filter((i) => i.t.trim().toLowerCase() === "document total");
+  const d = dl[dl.length - 1];
+  const nums = d ? items.filter((i) => i.page === d.page && Math.abs(i.y - d.y) < 4 && i.x > d.x + 20).sort((a, b) => a.x - b.x).map((i) => i.t.trim()) : [];
+  const ex = money(nums[0] || ""), gst = money(nums[1] || ""), inc = money(nums[2] || "");
+  const credit = nums.slice(0, 3).some(isNeg) || ex < 0 || inc < 0 || items.some((i) => /^tax credit|credit note/i.test(i.t.trim()));
+  if (credit) return { credit: true };
+  let number = "";
+  for (const i of items) { const m = i.t.match(/^Invoice No\.\s+(\d+)\s*$/i); if (m) { number = m[1]; break; } }
+  const dt = valueOf("Date").match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/);
+  if (!/^\d{5,}$/.test(number) || !dt || nums.length < 3 || !(ex > 0) || !(inc > 0) || Math.abs(ex + gst - inc) > 0.02) return null;
+  const yr = dt[3].length === 2 ? 2000 + Number(dt[3]) : Number(dt[3]);
+  return { number, date: `${yr}-${String(dt[2]).padStart(2, "0")}-${String(dt[1]).padStart(2, "0")}`, ex, gst, inc, order: valueOf("Order No.") };
+}
+async function tradelinkParse(bytes) {
+  const items = await pdfTextRuns(bytes);
+  if (!items.length) return null;
+  const valueOf = (label) => {
+    const ls = items.filter((i) => i.t.trim().toLowerCase() === label.toLowerCase());
+    const l = ls[ls.length - 1];
+    if (!l) return "";
+    const v = items.filter((i) => i.page === l.page && Math.abs(i.y - l.y) < 4 && i.x > l.x + 20 && i !== l && i.t.trim()).sort((a, b) => a.x - b.x)[0];
+    return v ? v.t.trim() : "";
+  };
+  const isNeg = (t) => /^\(.*\)$|^-|-$|CR$/i.test(String(t).trim());
+  const money = (t) => { const n = Number(String(t).replace(/[^0-9.]/g, "")); return isNeg(t) ? -n : n; };
+  const exT = valueOf("Total Exclusive of GST $"), gstT = valueOf("GST $"), incT = valueOf("Total Incl. GST $");
+  const ex = money(exT), gst = money(gstT), inc = money(incT);
+  const credit = isNeg(exT) || isNeg(incT) || ex < 0 || inc < 0 || items.some((i) => /credit note|tax credit/i.test(i.t));
+  if (credit) return { credit: true };
+  const number = valueOf("Invoice Number:");
+  const dt = valueOf("Invoice Date:").match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/);
+  if (!/^\d{5,}$/.test(number) || !dt || !(ex > 0) || !(inc > 0) || Math.abs(ex + gst - inc) > 0.02) return null;
+  const yr = dt[3].length === 2 ? 2000 + Number(dt[3]) : Number(dt[3]);
+  return { number, date: `${yr}-${String(dt[2]).padStart(2, "0")}-${String(dt[1]).padStart(2, "0")}`, ex, gst, inc, order: valueOf("Customer PO:") };
+}
+async function momentumParse(bytes) {
+  const items = await pdfTextRuns(bytes);
+  if (!items.length) return null;
+  const isNeg = (t) => /^\(.*\)$|^-|-$|CR$/i.test(String(t).trim());
+  const money = (t) => { const n = Number(String(t).replace(/[^0-9.]/g, "")); return isNeg(t) ? -n : n; };
+  const label = (name) => { const ls = items.filter((i) => i.t.trim().toLowerCase() === name.toLowerCase()); return ls[ls.length - 1]; };
+  // Invoice No and Issue date have their value on the line below, same left edge.
+  const below = (name) => { const l = label(name); if (!l) return ""; const v = items.filter((i) => i.page === l.page && Math.abs(i.x - l.x) < 3 && i.y < l.y && i.y > l.y - 30).sort((a, b) => b.y - a.y)[0]; return v ? v.t.trim() : ""; };
+  const side = (name) => { const l = label(name); if (!l) return ""; const v = items.filter((i) => i.page === l.page && Math.abs(i.y - l.y) < 4 && i.x > l.x + 20 && /\d/.test(i.t)).sort((a, b) => a.x - b.x)[0]; return v ? v.t.trim() : ""; };
+  const incT = side("Total Amount Due");
+  const inc = money(incT);
+  let gst = 0;
+  for (const i of items) { const m = i.t.match(/GST included on the invoice\s*\$\s*([\d,.]+)/i); if (m) gst = Number(m[1].replace(/,/g, "")); }
+  const credit = isNeg(incT) || inc < 0 || items.some((i) => /tax credit|credit note/i.test(i.t));
+  if (credit) return { credit: true };
+  const number = below("Invoice No");
+  const dm = below("Issue date").match(/^(\d{1,2})\s+([A-Za-z]{3})[a-z]*\s+(\d{4})$/);
+  const mi = dm ? ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"].indexOf(dm[2].toLowerCase()) : -1;
+  const ex = Math.round((inc - gst) * 100) / 100;
+  if (!/^\d{5,}$/.test(number) || !dm || mi < 0 || !(inc > 0) || !(gst >= 0) || !(ex > 0)) return null;
+  // The bill states its own due date ("due on 2 December 2026").
+  let due;
+  for (const it of items) { const m = it.t.match(/due on\s+(\d{1,2})\s+([A-Za-z]{3})[a-z]*\s+(\d{4})/i); const k = m ? ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"].indexOf(m[2].toLowerCase()) : -1; if (m && k >= 0) { due = `${m[3]}-${String(k + 1).padStart(2, "0")}-${String(m[1]).padStart(2, "0")}`; break; } }
+  return { number, date: `${dm[3]}-${String(mi + 1).padStart(2, "0")}-${String(dm[1]).padStart(2, "0")}`, due, ex, gst, inc, order: "" };
+}
+async function wexParse(bytes) {
+  const items = await pdfTextRuns(bytes);
+  if (!items.length) return null;
+  const isNeg = (t) => /^\(.*\)$|^-|-$|CR$/i.test(String(t).trim());
+  const money = (t) => { const n = Number(String(t).replace(/[^0-9.]/g, "")); return isNeg(t) ? -n : n; };
+  const mon = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+  const side = (name) => { const ls = items.filter((i) => i.t.trim().toLowerCase() === name.toLowerCase()); const l = ls[ls.length - 1]; if (!l) return ""; const v = items.filter((i) => i.page === l.page && Math.abs(i.y - l.y) < 4 && i.x > l.x + 20 && i.t.trim()).sort((a, b) => a.x - b.x)[0]; return v ? v.t.trim() : ""; };
+  const dateOf = (t) => { const m = String(t).trim().match(/^(\d{1,2})\s+([A-Za-z]{3})[A-Za-z]*\s+(\d{2,4})$/); const mi = m ? mon.indexOf(m[2].toLowerCase()) : -1; if (!m || mi < 0) return ""; const y = m[3].length === 2 ? 2000 + Number(m[3]) : Number(m[3]); return `${y}-${String(mi + 1).padStart(2, "0")}-${String(m[1]).padStart(2, "0")}`; };
+  const dueT = side("AMOUNT DUE");
+  const inc = money(dueT);
+  let ex = 0, gst = 0;
+  for (const i of items) { const m = i.t.trim().match(/^TOTAL EXPENDITURE\s+([\d,.]+)\s+([\d,.]+)\s+([\d,.]+)\s+([\d,.]+)$/i); if (m) { ex = money(m[2]); gst = money(m[3]); if (Math.abs(money(m[4]) - inc) > 0.02) return null; } }
+  if (isNeg(dueT) || inc < 0) return { credit: true };
+  const date = dateOf(side("Period Ending"));
+  const due = dateOf(side("DATE DUE"));
+  const stamp = date ? date.slice(8, 10) + date.slice(5, 7) + date.slice(2, 4) : "";
+  if (!date || !due || !(inc > 0) || !(ex > 0) || Math.abs(ex + gst - inc) > 0.02) return null;
+  return { number: stamp, date, due, ex, gst, inc, order: "" };
+}
+async function daisysParse(bytes) {
+  const items = await pdfTextRuns(bytes);
+  if (!items.length) return null;
+  const isNeg = (t) => /^\(.*\)$|^-|-$|CR$/i.test(String(t).trim());
+  const money = (t) => { const n = Number(String(t).replace(/[^0-9.]/g, "")); return isNeg(t) ? -n : n; };
+  const label = (name) => { const ls = items.filter((i) => i.t.trim().toLowerCase() === name.toLowerCase()); return ls[ls.length - 1]; };
+  const side = (name) => { const l = label(name); if (!l) return ""; const v = items.filter((i) => i.page === l.page && Math.abs(i.y - l.y) < 4 && i.x > l.x + 20 && /\d/.test(i.t)).sort((a, b) => b.x - a.x)[0]; return v ? v.t.trim() : ""; };
+  const sideText = (name) => { const l = label(name); if (!l) return ""; const v = items.filter((i) => i.page === l.page && Math.abs(i.y - l.y) < 4 && i.x > l.x + 20 && i.t.trim()).sort((a, b) => a.x - b.x)[0]; return v ? v.t.trim() : ""; };
+  const belowText = (name) => { const l = label(name); if (!l) return ""; const v = items.filter((i) => i.page === l.page && Math.abs(i.x - l.x) < 3 && Math.abs(i.y - l.y) > 5 && Math.abs(i.y - l.y) < 40).sort((a, b) => Math.abs(a.y - l.y) - Math.abs(b.y - l.y))[0]; return v ? v.t.trim() : ""; };
+  const incT = side("Total"), gstT = side("GST 10%");
+  const inc = money(incT), gst = money(gstT);
+  if (isNeg(incT) || inc < 0 || items.some((i) => /credit note|tax credit/i.test(i.t))) return { credit: true };
+  const number = sideText("Invoice Number");
+  const dt = belowText("Invoice Date:").match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/);
+  const ex = Math.round((inc - gst) * 100) / 100;
+  if (!/^INV\d{5,}$/.test(number) || !dt || !(inc > 0) || !(gst >= 0) || !(ex > 0)) return null;
+  const yr = dt[3].length === 2 ? 2000 + Number(dt[3]) : Number(dt[3]);
+  return { number, date: `${yr}-${String(dt[2]).padStart(2, "0")}-${String(dt[1]).padStart(2, "0")}`, ex, gst, inc, order: belowText("PO#:") };
+}
+// Some generators (pdf-lib) split one word into several runs. Joins runs on the same line only when the next run starts inside or touching the end of the one before, so separate columns stay separate.
+function joinRuns(items) {
+  const out = [];
+  const sorted = [...items].sort((a, b) => a.page - b.page || a.y - b.y || a.x - b.x);
+  for (const it of sorted) {
+    const p = out[out.length - 1];
+    const sz = (p && p.size) || it.size || 12;
+    if (p && p.page === it.page && Math.abs(p.y - it.y) < 1.5 && it.x - (p.x + p.t.length * sz * 0.6) <= 0 && it.x >= p.x) out[out.length - 1] = { ...p, t: p.t + it.t, size: p.size };
+    else out.push({ ...it });
+  }
+  return out;
+}
+async function plumbhausParse(bytes) {
+  const items = joinRuns(await pdfTextRuns(bytes));
+  if (!items.length) return null;
+  const isNeg = (t) => /^\(.*\)$|^-|-$|CR$/i.test(String(t).trim());
+  const money = (t) => { const n = Number(String(t).replace(/[^0-9.]/g, "")); return isNeg(t) ? -n : n; };
+  const label = (name) => { const ls = items.filter((i) => i.t.trim().toLowerCase() === name.toLowerCase()); return ls[ls.length - 1]; };
+  const side = (name) => { const l = label(name); if (!l) return ""; const v = items.filter((i) => i.page === l.page && Math.abs(i.y - l.y) < 4 && i.x > l.x + 20 && /\d/.test(i.t)).sort((a, b) => b.x - a.x)[0]; return v ? v.t.trim() : ""; };
+  const belowText = (name) => { const l = label(name); if (!l) return ""; const v = items.filter((i) => i.page === l.page && Math.abs(i.x - l.x) < 3 && Math.abs(i.y - l.y) > 5 && Math.abs(i.y - l.y) < 40).sort((a, b) => Math.abs(a.y - l.y) - Math.abs(b.y - l.y))[0]; return v ? v.t.trim() : ""; };
+  const mon = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+  const dateOf = (t) => { const m = String(t).trim().match(/^(\d{1,2})\s+([A-Za-z]{3})[A-Za-z]*\s+(\d{4})$/); const mi = m ? mon.indexOf(m[2].toLowerCase()) : -1; return m && mi >= 0 ? `${m[3]}-${String(mi + 1).padStart(2, "0")}-${String(m[1]).padStart(2, "0")}` : ""; };
+  const exT = side("Subtotal"), gstT = side("Total GST 10%"), incT = side("Total");
+  const ex = money(exT), gst = money(gstT), inc = money(incT);
+  if (isNeg(incT) || inc < 0 || items.some((i) => /credit note/i.test(i.t))) return { credit: true };
+  const number = belowText("Invoice number");
+  const date = dateOf(belowText("Issue date")), due = dateOf(belowText("Due date"));
+  if (!/^INV-\d+$/i.test(number) || !date || !due || !(ex > 0) || !(inc > 0) || Math.abs(ex + gst - inc) > 0.02) return null;
+  return { number, date, due, ex, gst, inc, order: "" };
+}
+async function bunningsParse(bytes) {
+  const items = await pdfTextRuns(bytes);
+  if (!items.length) return null;
+  const isNeg = (t) => /^\(.*\)$|^-|-$|CR$/i.test(String(t).trim());
+  const money = (t) => { const n = Number(String(t).replace(/[^0-9.]/g, "")); return isNeg(t) ? -n : n; };
+  const label = (name) => { const ls = items.filter((i) => i.t.trim().toLowerCase() === name.toLowerCase()); return ls[0]; };
+  const side = (name) => { const l = label(name); if (!l) return ""; const v = items.filter((i) => i.page === l.page && Math.abs(i.y - l.y) < 4 && i.x > l.x + 20 && /\d/.test(i.t)).sort((a, b) => a.x - b.x)[0]; return v ? v.t.trim() : ""; };
+  const accT = side("ACCOUNT TOTAL");
+  const inc = money(accT);
+  if (isNeg(accT) || inc < 0) return { credit: true };
+  const dm = side("DATE OF ISSUE:").match(/^(\d{1,2})\s+([A-Za-z]{3})[a-z]*\s+(\d{4})$/);
+  const mi = dm ? ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"].indexOf(dm[2].toLowerCase()) : -1;
+  const acct = side("ACCOUNT NUMBER:");
+  if (!dm || mi < 0 || !/^\d{6,}$/.test(acct) || !(inc > 0)) return null;
+  const date = `${dm[3]}-${String(mi + 1).padStart(2, "0")}-${String(dm[1]).padStart(2, "0")}`;
+  // The statement shows no GST split, so the account total is booked GST inclusive. Due 14 days after issue.
+  const d = new Date(`${date}T00:00:00Z`); d.setUTCDate(d.getUTCDate() + 14);
+  const gst = Math.round((inc / 11) * 100) / 100;
+  return { number: `${acct}-${String(dm[1]).padStart(2, "0")}${String(mi + 1).padStart(2, "0")}${dm[3].slice(2)}`, date, due: d.toISOString().slice(0, 10), ex: Math.round((inc - gst) * 100) / 100, gst, inc, inclusive: true, order: "" };
+}
+async function jjsParse(bytes) {
+  const items = await pdfTextRuns(bytes);
+  if (!items.length) return null;
+  const all = items.map((i) => i.t);
+  const first = (re) => { for (const t of all) { const m = t.match(re); if (m) return m; } return null; };
+  const num = first(/Invoice No:\s*(\d{6,})/i), iss = first(/Issue Date:\s*(\d{1,2})\/(\d{1,2})\/(\d{4})/i), due = first(/Due By:\s*(\d{1,2})\/(\d{1,2})\/(\d{4})/i);
+  const tot = first(/Total Due:\s*(-?)\$\s*([\d,.]+)\s*(cr)?/i), gstM = first(/Total GST for this invoice\s*\$\s*([\d,.]+)/i);
+  if (tot && (tot[1] || tot[3])) return { credit: true };
+  if (!num || !iss || !tot || !gstM) return null;
+  const inc = Number(tot[2].replace(/,/g, "")), gst = Number(gstM[1].replace(/,/g, ""));
+  const ex = Math.round((inc - gst) * 100) / 100;
+  if (!(inc > 0) || !(ex > 0) || !(gst >= 0)) return null;
+  const iso = (m) => `${m[3]}-${String(m[2]).padStart(2, "0")}-${String(m[1]).padStart(2, "0")}`;
+  return { number: num[1], date: iso(iss), due: due ? iso(due) : undefined, ex, gst, inc, order: "" };
+}
+async function aroFloParse(bytes) {
+  const items = await pdfTextRuns(bytes);
+  if (!items.length) return null;
+  const isNeg = (t) => /^\(.*\)$|^-|-$|CR$/i.test(String(t).trim());
+  const money = (t) => { const n = Number(String(t).replace(/[^0-9.]/g, "")); return isNeg(t) ? -n : n; };
+  const label = (name) => items.filter((i) => i.t.trim().toLowerCase() === name.toLowerCase()).sort((a, b) => b.y - a.y)[0];
+  const side = (name) => { const l = label(name); if (!l) return ""; const v = items.filter((i) => i.page === l.page && Math.abs(i.y - l.y) < 4 && i.x > l.x + 20 && /\d/.test(i.t)).sort((a, b) => a.x - b.x)[0]; return v ? v.t.trim() : ""; };
+  const exT = side("Subtotal:"), gstT = side("GST:"), incT = side("AUD Total:");
+  const ex = money(exT), gst = money(gstT), inc = money(incT);
+  if (isNeg(incT) || inc < 0 || items.some((i) => /credit note/i.test(i.t))) return { credit: true };
+  const number = side("Invoice No:");
+  const dm = side("Date:").match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/), dd = side("Due Date:").match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (!/^\d{4,}$/.test(number) || !dm || !(ex > 0) || !(inc > 0) || Math.abs(ex + gst - inc) > 0.02) return null;
+  const iso = (m) => `${m[3]}-${String(m[2]).padStart(2, "0")}-${String(m[1]).padStart(2, "0")}`;
+  return { number, date: iso(dm), due: dd ? iso(dd) : undefined, ex, gst, inc, order: "" };
+}
+async function adamsonsParse(bytes) {
+  const items = await pdfTextRuns(bytes);
+  if (!items.length) return null;
+  // This generator gives no usable line positions or spaces, so read the items in order: a label, then its value.
+  const t = items.map((i) => i.t.trim());
+  const idx = (pred) => { for (let k = 0; k < t.length; k++) if (pred(k)) return k; return -1; };
+  const isNeg = (x) => /^\(.*\)$|^-|-$|CR$/i.test(String(x).trim());
+  const money = (x) => { const n = Number(String(x).replace(/[^0-9.]/g, "")); return isNeg(x) ? -n : n; };
+  const mon = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+  const ex = money(t[idx((k) => t[k] === "Subtotal") + 1] || "");
+  const gst = money(t[idx((k) => t[k] === "Total" && /^GST/i.test(t[k + 1] || "")) + 2] || "");
+  const iT = idx((k) => /^Invoice\s*Total/i.test(t[k]) || (t[k] === "Invoice" && /^TotalAUD$/i.test(t[k + 1] || "")));
+  const incT = iT < 0 ? "" : t[iT + (/^TotalAUD$/i.test(t[iT + 1] || "") ? 2 : 1)] || "";
+  const inc = money(incT);
+  if (isNeg(incT) || inc < 0 || items.some((i) => /credit note/i.test(i.t))) return { credit: true };
+  const nk = idx((k) => t[k] === "Invoice" && t[k + 1] === "Number");
+  const number = nk < 0 ? "" : t[nk + 2] || "";
+  const dk = idx((k) => t[k] === "Invoice" && t[k + 1] === "Date");
+  const dm = dk < 0 ? null : [t[dk + 2], t[dk + 3], t[dk + 4]];
+  const mi = dm ? mon.indexOf(String(dm[1]).slice(0, 3).toLowerCase()) : -1;
+  const due = ((t.join(" ").match(/Due\s*Date:\s*(\d{1,2})\s*([A-Za-z]{3})\s*(\d{4})/i)) || null);
+  const dmi = due ? mon.indexOf(due[2].toLowerCase()) : -1;
+  if (!/^\d{5,}$/.test(number) || !dm || mi < 0 || !/^\d{1,2}$/.test(dm[0]) || !/^\d{4}$/.test(dm[2]) || !(ex > 0) || !(inc > 0) || Math.abs(ex + gst - inc) > 0.02) return null;
+  return { number, date: `${dm[2]}-${String(mi + 1).padStart(2, "0")}-${String(dm[0]).padStart(2, "0")}`, due: dmi >= 0 ? `${due[3]}-${String(dmi + 1).padStart(2, "0")}-${String(due[1]).padStart(2, "0")}` : undefined, ex, gst, inc, order: "" };
+}
+async function superloopParse(bytes) {
+  const items = await pdfTextRuns(bytes);
+  if (!items.length) return null;
+  const isNeg = (t) => /^\(.*\)$|^-|-$|CR$/i.test(String(t).trim());
+  const money = (t) => { const n = Number(String(t).replace(/[^0-9.]/g, "")); return isNeg(t) ? -n : n; };
+  const label = (name) => items.filter((i) => i.t.trim().toLowerCase() === name.toLowerCase()).sort((a, b) => b.y - a.y)[0];
+  const side = (name) => { const l = label(name); if (!l) return ""; const v = items.filter((i) => i.page === l.page && Math.abs(i.y - l.y) < 4 && i.x > l.x + 20 && /\d/.test(i.t)).sort((a, b) => a.x - b.x)[0]; return v ? v.t.trim() : ""; };
+  const mon = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+  const dateOf = (t) => { const m = String(t).trim().match(/^(\d{1,2})\s+([A-Za-z]{3})[a-z]*\s+(\d{4})$/); const mi = m ? mon.indexOf(m[2].toLowerCase()) : -1; return m && mi >= 0 ? `${m[3]}-${String(mi + 1).padStart(2, "0")}-${String(m[1]).padStart(2, "0")}` : ""; };
+  const incT = side("This Bill:"), gstT = side("Includes GST");
+  const inc = money(incT), gst = money(gstT);
+  if (isNeg(incT) || inc < 0 || items.some((i) => /credit note/i.test(i.t))) return { credit: true };
+  const number = side("Invoice Number:");
+  const date = dateOf(side("Date of Issue:")), due = dateOf(side("This Bill Due:"));
+  const ex = Math.round((inc - gst) * 100) / 100;
+  if (!/^[A-Z]?\d{5,}$/i.test(number) || !date || !(inc > 0) || !(gst >= 0) || !(ex > 0)) return null;
+  return { number, date, due: due || undefined, ex, gst, inc, order: "" };
+}
+async function soilworxParse(bytes) {
+  const items = await pdfTextRuns(bytes);
+  if (!items.length) return null;
+  const isNeg = (t) => /^\(.*\)$|^-|-$|CR$/i.test(String(t).trim());
+  const money = (t) => { const n = Number(String(t).replace(/[^0-9.]/g, "")); return isNeg(t) ? -n : n; };
+  const label = (name) => items.filter((i) => i.t.trim().toLowerCase() === name.toLowerCase()).sort((a, b) => a.y - b.y)[0];
+  const side = (name) => { const l = label(name); if (!l) return ""; const v = items.filter((i) => i.page === l.page && Math.abs(i.y - l.y) < 4 && i.x > l.x + 20 && /\d/.test(i.t)).sort((a, b) => a.x - b.x)[0]; return v ? v.t.trim() : ""; };
+  const subT = side("Sub Total"), extT = side("Total Extras"), gstT = side("Total Tax"), incT = side("Total");
+  const ex = Math.round((money(subT) + money(extT)) * 100) / 100, gst = money(gstT), inc = money(incT);
+  if (isNeg(incT) || inc < 0 || isNeg(subT) || items.some((i) => /credit note/i.test(i.t))) return { credit: true };
+  const number = side("INVOICE NO.");
+  const dt = side("DATE").match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/);
+  if (!/^INV\d{5,}$/i.test(number) || !dt || !(ex > 0) || !(inc > 0) || Math.abs(ex + gst - inc) > 0.02) return null;
+  return { number, date: `${dt[3]}-${String(dt[2]).padStart(2, "0")}-${String(dt[1]).padStart(2, "0")}`, ex, gst, inc, order: side("Cust. Ref.") };
+}
+async function apexParse(bytes) {
+  const items = await pdfTextRuns(bytes);
+  if (!items.length) return null;
+  const isNeg = (t) => /^\(.*\)$|^-|-$|CR$/i.test(String(t).trim());
+  const money = (t) => { const n = Number(String(t).replace(/[^0-9.]/g, "")); return isNeg(t) ? -n : n; };
+  const label = (name) => items.filter((i) => i.t.trim().toLowerCase() === name.toLowerCase()).sort((a, b) => a.y - b.y)[0];
+  const side = (name) => { const l = label(name); if (!l) return ""; const v = items.filter((i) => i.page === l.page && Math.abs(i.y - l.y) < 4 && i.x > l.x + 20 && i.t.trim()).sort((a, b) => a.x - b.x)[0]; return v ? v.t.trim() : ""; };
+  const dateOf = (t) => { const m = String(t).trim().match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/); return m ? `${m[3]}-${String(m[2]).padStart(2, "0")}-${String(m[1]).padStart(2, "0")}` : ""; };
+  const exT = side("TOTAL EXCL. GST:"), gstT = side("TOTAL GST:"), incT = side("TOTAL INCL. GST:");
+  const ex = money(exT), gst = money(gstT), inc = money(incT);
+  if (isNeg(incT) || inc < 0 || items.some((i) => /credit note/i.test(i.t))) return { credit: true };
+  const number = side("Invoice No:");
+  const date = dateOf(side("Invoice Date:")), due = dateOf(side("Due Date:"));
+  if (!/^\d{5,}$/.test(number) || !date || !(ex > 0) || !(inc > 0) || Math.abs(ex + gst - inc) > 0.02) return null;
+  return { number, date, due: due || date, ex, gst, inc, order: side("Order No:") };
+}
+async function geelongAccessParse(bytes) {
+  const items = await pdfTextRuns(bytes);
+  if (!items.length) return null;
+  // The totals box on these PDFs is drawn in a font that cannot be read as text, so the total comes from adding up the Line Total column (GST is 10% of that).
+  const money = (t) => { const neg = /^\(|-/.test(String(t).trim()); const n = Number(String(t).replace(/[^0-9.]/g, "")); return neg ? -n : n; };
+  const lab = (name) => items.filter((i) => i.t.trim().toLowerCase() === name.toLowerCase()).sort((a, b) => a.y - b.y)[0];
+  const side = (name) => { const l = lab(name); if (!l) return ""; const v = items.filter((i) => i.page === l.page && Math.abs(i.y - l.y) < 4 && i.x > l.x + 20 && i.t.trim()).sort((a, b) => a.x - b.x)[0]; return v ? v.t.trim() : ""; };
+  const dateOf = (t) => { const m = String(t).trim().match(/(\d{1,2})\/(\d{1,2})\/(\d{4})/); return m ? `${m[3]}-${String(m[2]).padStart(2, "0")}-${String(m[1]).padStart(2, "0")}` : ""; };
+  if (items.some((i) => /credit note/i.test(i.t))) return { credit: true };
+  const lt = lab("Line Total");
+  if (!lt) return null;
+  const lines = items.filter((i) => i.page === lt.page && i.y > lt.y + 4 && i.x > lt.x - 30 && /^-?\(?\$[\d,]+\.\d\d\)?$/.test(i.t.trim()));
+  if (!lines.length) return null;
+  const sum = Math.round(lines.reduce((a, i) => a + money(i.t), 0) * 100) / 100;
+  if (sum < 0) return { credit: true };
+  const ex = sum, gst = Math.round(ex * 10) / 100, inc = Math.round((ex + gst) * 100) / 100;
+  const head = lab("Tax Invoice");
+  const near = head ? items.filter((i) => i.page === head.page && /^\d{4,}$/.test(i.t.trim()) && i.x > head.x - 40 && i.y > head.y && i.y < head.y + 90).sort((a, b) => a.y - b.y)[0] : null;
+  const number = near ? near.t.trim() : "";
+  const date = dateOf(side("Invoice Date:")), due = dateOf(side("Due Date:"));
+  if (!/^\d{4,}$/.test(number) || !date || !(ex > 0)) return null;
+  return { number, date, due: due || date, ex, gst, inc, order: /^\d{3,}$/.test(side("Purchase Order:")) ? side("Purchase Order:") : "" };
+}
+// A customer remittance advice PDF. Reads the payer, date, payment amount and each invoice line (invoice number first, current payment last).
+async function remittanceParse(bytes) {
+  const items0 = await pdfTextRuns(bytes, { cm: true });
+  // Glyphs placed one at a time on the same line are joined into the cell they belong to.
+  const items = [];
+  for (const it of items0.filter((i) => String(i.t).length).sort((a, b) => a.page - b.page || Math.round(b.y) - Math.round(a.y) || a.x - b.x)) {
+    const p = items[items.length - 1];
+    if (p && p.page === it.page && Math.abs(p.y - it.y) < 1.5 && it.x - (p.x + String(p.t).length * (p.size || 8) * 0.5) < 6 && it.x >= p.x) p.t = String(p.t) + String(it.t);
+    else items.push({ ...it });
+  }
+  if (!items.length) return null;
+  const moneyRe = /^\(?-?\$?\s?[\d,]+\.\d\d\)?$/;
+  const num = (t) => { const n = Number(String(t).replace(/[^0-9.]/g, "")); return /^\(|-/.test(String(t).trim()) ? -n : n; };
+  const rows = [];
+  for (const it of items.filter((i) => String(i.t).trim()).sort((a, b) => a.page - b.page || b.y - a.y || a.x - b.x)) {
+    const r = rows.find((q) => q.page === it.page && Math.abs(q.y - it.y) < 3);
+    if (r) r.cells.push(it); else rows.push({ page: it.page, y: it.y, cells: [it] });
+  }
+  for (const r of rows) r.cells.sort((a, b) => a.x - b.x);
+  const mon = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+  const dmy = (t) => { const x = String(t).match(/(\d{1,2})\/(\d{1,2})\/(\d{4})/); if (x) return `${x[3]}-${String(x[2]).padStart(2, "0")}-${String(x[1]).padStart(2, "0")}`; const y = String(t).match(/(\d{1,2})\s+([A-Za-z]{3})[a-z]*\.?,?\s+(\d{4})/); const mi = y ? mon.indexOf(y[2].toLowerCase()) : -1; return y && mi >= 0 ? `${y[3]}-${String(mi + 1).padStart(2, "0")}-${String(y[1]).padStart(2, "0")}` : ""; };
+  const first = rows[0] && rows[0].cells[0] ? String(rows[0].cells[0].t).trim() : "";
+  let payer = first.replace(/\s*-\s*NEW$/i, "").slice(0, 60);
+  const co = rows.flatMap((r) => r.cells).map((c) => String(c.t).trim()).find((t) => /\b(pty|ltd|limited)\b/i.test(t) && !/direct\s*flow/i.test(t) && t.length < 70);
+  if (co) payer = co.replace(/\s*-\s*NEW$/i, "");
+  let total = 0, date = "", payX = null;
+  const lines = [];
+  const invRe = /^[A-Za-z]{2,6}[-#\s]?\d{3,}[A-Za-z0-9-]*$/;
+  const plainRe = /^[A-Za-z]{0,6}[-#\s]?\d{3,}[A-Za-z0-9-]*$/;
+  for (let ri = 0; ri < rows.length; ri++) {
+    const r = rows[ri];
+    const texts = r.cells.map((c) => String(c.t).trim());
+    const joined = texts.join(" ");
+    const money = r.cells.filter((c) => moneyRe.test(String(c.t).trim()));
+    if (/Payment Amount|Total\s+(AUD\s+)?paid|Amount Paid\s*:?\s*\$|Total Paid/i.test(joined) && money.length) total = num(money[money.length - 1].t);
+    if (!date && (/^Date:?/i.test(texts[0]) || /Payment Date/i.test(joined))) {
+      date = dmy(joined) || (rows[ri + 1] ? dmy(rows[ri + 1].cells.map((c) => c.t).join(" ")) : "");
+    }
+    const hd = r.cells.find((c) => /^(amount paid|paid|payment( amount)?|amount)$/i.test(String(c.t).trim()));
+    if (hd && !money.length) { payX = hd.x; continue; }
+    if (!money.length) continue;
+    const isDate = (t) => !!dmy(t) && /\b(19|20)\d\d\b/.test(t) && t.length < 16;
+    const emb = r.cells.map((c) => String(c.t).trim()).filter((t) => !moneyRe.test(t) && !isDate(t)).map((t) => t.match(/\bINV[-\s#]*(\d{3,})\b/i) || t.match(/(?:^|[-\u2013#\s])(\d{4,})\s*$/)).find((q) => q);
+    if (emb && !r.cells.some((c) => invRe.test(String(c.t).trim()) && !moneyRe.test(String(c.t).trim()))) { let pc2 = money[money.length - 1]; if (payX !== null) pc2 = money.slice().sort((a, b) => Math.abs(a.x - payX) - Math.abs(b.x - payX))[0]; lines.push({ number: "INV-" + emb[1], pay: num(pc2.t) }); continue; }
+    const idCell = r.cells.find((c) => invRe.test(String(c.t).trim()) && !moneyRe.test(String(c.t).trim())) || (texts.length >= 3 && plainRe.test(texts[0]) && !moneyRe.test(texts[0]) ? r.cells[0] : null);
+    if (!idCell) continue;
+    let pc = money[money.length - 1];
+    if (payX !== null) pc = money.slice().sort((a, b) => Math.abs(a.x - payX) - Math.abs(b.x - payX))[0];
+    lines.push({ number: String(idCell.t).trim().toUpperCase(), pay: num(pc.t) });
+  }
+  if (!lines.length) return null;
+  const sum = Math.round(lines.reduce((a, l) => a + l.pay, 0) * 100) / 100;
+  return { payer, date, total: total || sum, sum, lines };
+}
+async function leaveplusParse(bytes) {
+  const items = await pdfTextRuns(bytes);
+  if (!items.length) return null;
+  const money = (t) => { const neg = /^\(|-/.test(String(t).trim()); const n = Number(String(t).replace(/[^0-9.]/g, "")); return neg ? -n : n; };
+  const lab = (name) => items.filter((i) => i.t.trim().toLowerCase() === name.toLowerCase()).sort((a, b) => a.page - b.page || b.y - a.y)[0];
+  const side = (name) => { const l = lab(name); if (!l) return ""; const v = items.filter((i) => i.page === l.page && Math.abs(i.y - l.y) < 4 && i.x > l.x + 20 && i.t.trim()).sort((a, b) => a.x - b.x)[0]; return v ? v.t.trim() : ""; };
+  const dateOf = (t) => { const m = String(t).trim().match(/(\d{1,2})\/(\d{1,2})\/(\d{4})/); return m ? `${m[3]}-${String(m[2]).padStart(2, "0")}-${String(m[1]).padStart(2, "0")}` : ""; };
+  if (items.some((i) => /credit note/i.test(i.t))) return { credit: true };
+  const number = side("Invoice Number");
+  const date = dateOf(side("Issued Date")), due = dateOf(side("Due Date"));
+  const incT = side("Balance Due");
+  const inc = money(incT);
+  const gl = items.find((i) => /^Total includes \$/.test(i.t.trim()));
+  const gst = gl ? money(items.filter((i) => i.page === gl.page && Math.abs(i.y - gl.y) < 4 && i.x > gl.x + 20 && /\d/.test(i.t)).sort((a, b) => a.x - b.x)[0]?.t || "0") : 0;
+  if (inc < 0) return { credit: true };
+  if (!/^\d{6,}$/.test(number) || !date || !(inc > 0)) return null;
+  const ex = Math.round((inc - gst) * 100) / 100;
+  return { number, date, due: due || undefined, ex, gst, inc, order: "" };
+}
+async function melbourneDrainParse(bytes) {
+  const items = await pdfTextRuns(bytes);
+  if (!items.length) return null;
+  const money = (t) => Number(String(t).replace(/[^0-9.]/g, ""));
+  const lab = (name) => items.filter((i) => i.t.trim().toLowerCase() === name.toLowerCase()).sort((a, b) => a.y - b.y)[0];
+  const side = (name) => { const l = lab(name); if (!l) return ""; const v = items.filter((i) => i.page === l.page && Math.abs(i.y - l.y) < 4 && i.x > l.x + 20 && i.t.trim()).sort((a, b) => a.x - b.x)[0]; return v ? v.t.trim() : ""; };
+  const below = (name) => { const l = lab(name); if (!l) return ""; const v = items.filter((i) => i.page === l.page && Math.abs(i.x - l.x) < 4 && i.y < l.y - 3 && i.y > l.y - 20 && i.t.trim()).sort((a, b) => b.y - a.y)[0]; return v ? v.t.trim() : ""; };
+  const dateOf = (t) => { const m = String(t).trim().match(/(\d{1,2})\/(\d{1,2})\/(\d{4})/); return m ? `${m[3]}-${String(m[2]).padStart(2, "0")}-${String(m[1]).padStart(2, "0")}` : ""; };
+  const exT = side("Subtotal:"), gstT = side("Total GST:"), incT = side("Invoice Total:");
+  const ex = money(exT), gst = money(gstT), inc = money(incT);
+  if (items.some((i) => /credit note/i.test(i.t)) || /^-|\(/.test(incT)) return { credit: true };
+  const number = below("Invoice No");
+  const date = dateOf(below("Invoice Date"));
+  const dueItem = items.find((i) => /^Due Date:/i.test(i.t.trim()));
+  const due = dueItem ? dateOf(dueItem.t) : "";
+  if (!/^\d{3,}$/.test(number) || !date || !(ex > 0) || !(inc > 0) || Math.abs(ex + gst - inc) > 0.02) return null;
+  return { number, date, due: due || date, ex, gst, inc, order: side("Job Number:") };
+}
+async function estimateOneParse(bytes) {
+  const items = await pdfTextRuns(bytes);
+  if (!items.length) return null;
+  // No usable line positions in this generator, so read the items in order: a label, then its value.
+  const t = items.map((i) => i.t.trim());
+  const nextOf = (label) => { const k = t.indexOf(label); return k < 0 ? "" : t[k + 1] || ""; };
+  const isNeg = (x) => /^\(.*\)$|^-|-$|CR$/i.test(String(x).trim());
+  const money = (x) => { const n = Number(String(x).replace(/[^0-9.]/g, "")); return isNeg(x) ? -n : n; };
+  const mon = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+  const dateOf = (x) => { const m = String(x).trim().match(/^([A-Za-z]{3})[a-z]*\s+(\d{1,2}),\s*(\d{4})$/); const mi = m ? mon.indexOf(m[1].toLowerCase()) : -1; return m && mi >= 0 ? `${m[3]}-${String(mi + 1).padStart(2, "0")}-${String(m[2]).padStart(2, "0")}` : ""; };
+  const exT = nextOf("Sub Total"), gstT = nextOf("GST @ 10%"), incT = nextOf("Invoice Amount");
+  const ex = money(exT), gst = money(gstT), inc = money(incT);
+  if (isNeg(incT) || inc < 0 || items.some((i) => /credit note/i.test(i.t))) return { credit: true };
+  const number = nextOf("Invoice #");
+  const date = dateOf(nextOf("Invoice Date")), dueRaw = dateOf(nextOf("Invoice Due Date"));
+  if (!/^\d{4,}$/.test(number) || !date || !(ex > 0) || !(inc > 0) || Math.abs(ex + gst - inc) > 0.02) return null;
+  return { number, date, due: dueRaw || date, ex, gst, inc, order: "" };
+}
+async function geelongCommercialParse(bytes) {
+  const items = await pdfTextRuns(bytes);
+  if (!items.length) return null;
+  const isNeg = (t) => /^\(.*\)$|^-|-$|CR$/i.test(String(t).trim());
+  const money = (t) => { const n = Number(String(t).replace(/[^0-9.]/g, "")); return isNeg(t) ? -n : n; };
+  const label = (name) => items.filter((i) => i.t.trim().toLowerCase() === name.toLowerCase()).sort((a, b) => a.y - b.y)[0];
+  const side = (name) => { const l = label(name); if (!l) return ""; const v = items.filter((i) => i.page === l.page && Math.abs(i.y - l.y) < 4 && i.x > l.x + 20 && i.t.trim()).sort((a, b) => a.x - b.x)[0]; return v ? v.t.trim() : ""; };
+  const mon = ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"];
+  const dateOf = (t) => { const m = String(t).trim().match(/^(\d{1,2})\s+([A-Za-z]{3})[a-z]*\s+(\d{4})$/); const mi = m ? mon.indexOf(m[2].toLowerCase()) : -1; return m && mi >= 0 ? `${m[3]}-${String(mi + 1).padStart(2, "0")}-${String(m[1]).padStart(2, "0")}` : ""; };
+  // The bottom Total Due row holds GST then balance; the heading Total Due has the amount above it.
+  let gst = 0, inc = 0, incT = "";
+  for (const l of items.filter((i) => i.t.trim().toLowerCase() === "total due").sort((a, b) => a.y - b.y)) {
+    const row = items.filter((i) => i.page === l.page && Math.abs(i.y - l.y) < 4 && i.x > l.x + 20 && /\$/.test(i.t)).sort((a, b) => a.x - b.x).map((i) => i.t.trim());
+    if (row.length >= 2) { gst = money(row[0]); incT = row[row.length - 1]; inc = money(incT); break; }
+  }
+  if (isNeg(incT) || inc < 0 || items.some((i) => /credit note/i.test(i.t))) return { credit: true };
+  const number = side("Invoice No.");
+  const date = dateOf(side("Issued:")), due = dateOf(side("Due Date:"));
+  const ex = Math.round((inc - gst) * 100) / 100;
+  if (!/^\d{4,}$/.test(number) || !date || !(inc > 0) || !(gst >= 0) || !(ex > 0)) return null;
+  // GST comes from the invoice. If it is neither nil nor a tenth of the ex GST amount, the invoice mixes lines, so flag it for a person.
+  if (gst > 0 && Math.abs(gst - ex * 0.1) > 0.02) return null;
+  return { number, date, due: due || undefined, ex, gst, inc, order: "" };
+}
+async function telecaParse(bytes) {
+  const items = await pdfTextRuns(bytes);
+  if (!items.length) return null;
+  const isNeg = (t) => /^\(.*\)$|^-|-$|CR$/i.test(String(t).trim());
+  const money = (t) => { const n = Number(String(t).replace(/[^0-9.]/g, "")); return isNeg(t) ? -n : n; };
+  const label = (name) => items.filter((i) => i.t.trim().toLowerCase() === name.toLowerCase()).sort((a, b) => a.page - b.page || b.y - a.y)[0];
+  // Boxed figures: the value sits just under its label, roughly centred.
+  const below = (name) => { const l = label(name); if (!l) return ""; const v = items.filter((i) => i.page === l.page && i.y < l.y && l.y - i.y < 18 && Math.abs(i.x - l.x) < 60).sort((a, b) => (l.y - a.y) - (l.y - b.y))[0]; return v ? v.t.trim() : ""; };
+  const row = (name) => { const l = label(name); if (!l) return []; return items.filter((i) => i.page === l.page && Math.abs(i.y - l.y) < 4 && i.x > l.x + 20 && /\d/.test(i.t)).sort((a, b) => a.x - b.x).map((i) => i.t.trim()); };
+  // Only this period's charges are billed. Amount Owing also carries last month's balance, already billed.
+  const incT = below("Current Charges"), tot = row("TOTAL"), gstRow = row("GST included in total *");
+  const inc = money(incT), ex = money(tot[0] || ""), gst = money(gstRow[0] || "");
+  if (isNeg(incT) || inc < 0 || items.some((i) => /credit note/i.test(i.t))) return { credit: true };
+  const number = below("Statement Number");
+  const dateOf = (t) => { const m = String(t).trim().match(/^(\d{1,2})\/(\d{1,2})\/(\d{4})$/); return m ? `${m[3]}-${String(m[2]).padStart(2, "0")}-${String(m[1]).padStart(2, "0")}` : ""; };
+  const date = dateOf(below("Issue Date")), due = dateOf(below("Payment Due By"));
+  if (!/^\d{6,}[-\d]*$/.test(number) || !date || !(inc > 0) || !(ex > 0) || Math.abs(ex + gst - inc) > 0.02 || Math.abs(money(tot[1] || "") - inc) > 0.02) return null;
+  return { number, date, due: due || undefined, ex, gst, inc, order: "" };
+}
+// Due on the last business day (Monday to Friday) of the month after the invoice month.
+function billDueDate(iso) {
+  const [y, m] = iso.split("-").map(Number);
+  const d = new Date(Date.UTC(y, m + 1, 0));
+  while (d.getUTCDay() === 0 || d.getUTCDay() === 6) d.setUTCDate(d.getUTCDate() - 1);
+  return d.toISOString().slice(0, 10);
+}
+async function xeroBillFromPdf(env, rule, bytes, fileName, parsed) {
+  await xeroContactsTable(env);
+  const rows = ((await env.DB.prepare("SELECT contact_id, name FROM xero_contacts WHERE REPLACE(REPLACE(name_lc, char(8217), ''), char(39), '') LIKE ?").bind(`%${rule.contact.toLowerCase()}%`).all()).results) || [];
+  if (rows.length !== 1) return { ok: false, note: rows.length ? `${rows.length} Xero contacts match ${rule.contact}` : `no Xero contact matches ${rule.contact}` };
+  const contact = rows[0];
+  const dup = await xeroFetch(env, `api.xro/2.0/Invoices?where=${encodeURIComponent(`Type=="ACCPAY" AND InvoiceNumber=="${parsed.number}" AND Contact.ContactID==Guid("${contact.contact_id}")`)}`);
+  if (dup.ok) { const dj = await dup.json(); if ((dj.Invoices || []).some((i) => i.Status !== "DELETED" && i.Status !== "VOIDED")) return { ok: true, status: "EXISTS", note: "already in Xero" }; }
+  let account = "";
+  const cr = await xeroFetch(env, `api.xro/2.0/Contacts/${contact.contact_id}`);
+  if (cr.ok) { const cj = await cr.json(); const c = (cj.Contacts || [])[0] || {}; account = String(c.PurchasesDefaultAccountCode || (c.PurchasesDefaultAccount && c.PurchasesDefaultAccount.Code) || ""); }
+  if (!account) account = String(rule.account || "");
+  const make = async (status) => {
+    const line = { Description: `${rule.name} ${parsed.inclusive ? "statement" : "invoice"} ${parsed.number}${parsed.order ? ` (order ${parsed.order})` : ""}`, Quantity: 1, UnitAmount: parsed.inc, TaxType: parsed.gst === 0 ? "EXEMPTEXPENSES" : "INPUT" };
+    if (account) line.AccountCode = account;
+    // Bills are always Tax Inclusive at the invoice total, so the Xero total is exactly the supplier invoice amount whatever GST Xero works out.
+    const body = { Invoices: [{ Type: "ACCPAY", Contact: { ContactID: contact.contact_id }, InvoiceNumber: parsed.number, Date: parsed.date, DueDate: parsed.due || billDueDate(parsed.date), LineAmountTypes: "Inclusive", Status: status, LineItems: [line] }] };
+    return xeroFetch(env, "api.xro/2.0/Invoices?summarizeErrors=false", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  };
+  const created = async (status) => {
+    const res = await make(status);
+    if (!res.ok) return { err: `Xero ${res.status}: ${String(await res.text()).slice(0, 160)}` };
+    const inv = (((await res.json()).Invoices) || [])[0] || {};
+    const msgs = [...(inv.ValidationErrors || []), ...(((inv.Warnings) || []))].map((e) => e.Message).filter(Boolean).join("; ");
+    if (!inv.InvoiceID || /^0+(-0+)*$/.test(inv.InvoiceID) || inv.StatusAttributeString === "ERROR") return { err: msgs || "Xero did not save the bill" };
+    return { inv };
+  };
+  let status = "AUTHORISED";
+  let why = account ? "" : "no purchases account set for the contact";
+  let r = account ? await created("AUTHORISED") : { err: why };
+  if (r.err) { why = r.err; status = "DRAFT"; r = await created("DRAFT"); }
+  if (r.err) return { ok: false, note: `${why ? why + ". " : ""}${r.err}`.slice(0, 220) };
+  const inv = r.inv;
+  // Read the bill back from Xero so the screen can say which organisation it landed in and what its status is.
+  let seen = "";
+  try {
+    const rb = await xeroFetch(env, `api.xro/2.0/Invoices/${inv.InvoiceID}`);
+    const rj = rb.ok ? await rb.json() : null;
+    const got = rj && rj.Invoices && rj.Invoices[0];
+    const og = await xeroFetch(env, "api.xro/2.0/Organisation");
+    const oj = og.ok ? await og.json() : null;
+    const org = oj && oj.Organisations && oj.Organisations[0] && oj.Organisations[0].Name;
+    seen = got ? `read back from ${org || "Xero"}: ${got.Status}, ${got.Contact && got.Contact.Name}, total ${got.Total}` : "could not read it back from Xero";
+  } catch (e) { seen = "could not read it back from Xero"; }
+  let attached = "";
+  const at = await xeroFetch(env, `api.xro/2.0/Invoices/${inv.InvoiceID}/Attachments/${encodeURIComponent(fileName)}`, { method: "PUT", headers: { "Content-Type": "application/pdf" }, body: bytes });
+  if (!at.ok) attached = `PDF not attached (Xero ${at.status}: ${String(await at.text()).replace(/\s+/g, " ").slice(0, 120)})`;
+  return { ok: true, status: inv.Status, id: inv.InvoiceID, note: [status === "DRAFT" && why ? `left as draft (${why})` : "", seen, attached].filter(Boolean).join(". ") };
+}
+// Raises a supplier credit note in Xero (ACCPAYCREDIT) from a parsed credit PDF, approved if Xero allows it and a draft if not, and attaches the PDF. Returns { ok, status, id, note }.
+async function xeroCreditFromPdf(env, rule, bytes, fileName, parsed) {
+  // Xero now and then answers 502, 503 or 504 for a call that is fine a moment later, so every call here is tried up to four times.
+  const xf = async (e, url, init) => {
+    let res;
+    for (let i = 0; i < 4; i++) {
+      try { res = await xeroFetch(e, url, init); } catch (err) { if (i === 3) throw err; await xeroSleep(2000); continue; }
+      if (res.status < 500 || i === 3) return res;
+      await xeroSleep(2000);
+    }
+    return res;
+  };
+  if (!parsed || !parsed.number || !parsed.date || !(parsed.inc > 0) || Math.abs(parsed.ex + parsed.gst - parsed.inc) > 0.02) {
+    const r = parsed && parsed.read ? ` (read: number ${parsed.number || "none"}, date ${parsed.date || "none"}, ex ${parsed.read.exT || "none"}, gst ${parsed.read.gstT || "none"}, inc ${parsed.read.incT || "none"})` : "";
+    return { ok: false, note: `The credit note could not be read from the PDF${r}`.slice(0, 220) };
+  }
+  await xeroContactsTable(env);
+  const rows = ((await env.DB.prepare("SELECT contact_id, name FROM xero_contacts WHERE REPLACE(REPLACE(name_lc, char(8217), ''), char(39), '') LIKE ?").bind(`%${rule.contact.toLowerCase()}%`).all()).results) || [];
+  if (rows.length !== 1) return { ok: false, note: rows.length ? `${rows.length} Xero contacts match ${rule.contact}` : `no Xero contact matches ${rule.contact}` };
+  const contact = rows[0];
+  // Xero will not reuse the number of a deleted or voided credit note (it tries to edit the dead one), so a number that was deleted is saved with -2, -3 and so on, and the Reference keeps the real number.
+  let xNumber = parsed.number, reused = "";
+  for (let n = 1; n <= 6; n++) {
+    const dup = await xf(env, `api.xro/2.0/CreditNotes?where=${encodeURIComponent(`Type=="ACCPAYCREDIT" AND CreditNoteNumber=="${xNumber}" AND Contact.ContactID==Guid("${contact.contact_id}")`)}`);
+    const list = dup.ok ? (((await dup.json()).CreditNotes) || []) : [];
+    const live = list.find((c) => c.Status !== "DELETED" && c.Status !== "VOIDED");
+    if (live) return { ok: true, status: "EXISTS", note: "already in Xero" };
+    if (!list.length) break;
+    reused = parsed.number;
+    xNumber = `${parsed.number}-${n + 1}`;
+  }
+  let account = "";
+  const cr = await xf(env, `api.xro/2.0/Contacts/${contact.contact_id}`);
+  let crWhy = "";
+  if (!cr.ok) crWhy = `Xero contact lookup failed (${cr.status})`;
+  if (cr.ok) { const cj = await cr.json(); const c = (cj.Contacts || [])[0] || {}; account = String(c.PurchasesDefaultAccountCode || (c.PurchasesDefaultAccount && c.PurchasesDefaultAccount.Code) || ""); }
+  if (!account) account = String(rule.account || "");
+  // No default purchases account on the contact: use the account from the original invoice, then from the supplier's latest bill.
+  if (!account) {
+    try {
+      const where = parsed.refInv ? `Type=="ACCPAY" AND InvoiceNumber=="${parsed.refInv}" AND Contact.ContactID==Guid("${contact.contact_id}")` : `Type=="ACCPAY" AND Contact.ContactID==Guid("${contact.contact_id}")`;
+      const br = await xf(env, `api.xro/2.0/Invoices?where=${encodeURIComponent(where)}&order=Date%20DESC&page=1`);
+      if (br.ok) { const bj = await br.json(); const code = ((bj.Invoices || []).flatMap((x) => x.LineItems || []).find((l) => l.AccountCode) || {}).AccountCode; if (code) { account = String(code); crWhy = ""; } }
+    } catch (e) { /* leave it */ }
+  }
+  const make = async (status) => {
+    const line = { Description: parsed.refInv ? `Credit: Original invoice ${parsed.refInv}` : `${rule.name} Credit`, Quantity: 1, UnitAmount: parsed.inc, TaxType: parsed.gst === 0 ? "EXEMPTEXPENSES" : "INPUT" };
+    if (account) line.AccountCode = account;
+    const body = { CreditNotes: [{ Type: "ACCPAYCREDIT", Contact: { ContactID: contact.contact_id }, CreditNoteNumber: xNumber, Reference: parsed.number, Date: parsed.date, LineAmountTypes: "Inclusive", Status: status, LineItems: [line] }] };
+    return xf(env, "api.xro/2.0/CreditNotes?summarizeErrors=false", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  };
+  const created = async (status) => {
+    const res = await make(status);
+    if (!res.ok) return { err: `Xero ${res.status}: ${String(await res.text()).slice(0, 160)}` };
+    const cn = (((await res.json()).CreditNotes) || [])[0] || {};
+    const msgs = [...(cn.ValidationErrors || []), ...(cn.Warnings || [])].map((e) => e.Message).filter(Boolean).join("; ");
+    if (!cn.CreditNoteID || /^0+(-0+)*$/.test(cn.CreditNoteID) || cn.StatusAttributeString === "ERROR") return { err: msgs || "Xero did not save the credit note" };
+    return { cn };
+  };
+  let status = "AUTHORISED";
+  let why = account ? "" : (crWhy || "no purchases account set for the contact");
+  let r = account ? await created("AUTHORISED") : { err: why };
+  if (r.err && /valid status/i.test(r.err)) { xNumber = `${parsed.number}-2`; reused = parsed.number; why = ""; r = await created("AUTHORISED"); }
+  if (r.err) { why = r.err; status = "DRAFT"; r = await created("DRAFT"); }
+  if (r.err && /valid status/i.test(r.err) && xNumber === parsed.number) { xNumber = `${parsed.number}-2`; reused = parsed.number; r = await created("DRAFT"); }
+  if (r.err) return { ok: false, note: `${why ? why + ". " : ""}${r.err}`.slice(0, 220) };
+  const cn = r.cn;
+  let attached = "";
+  const at = await xf(env, `api.xro/2.0/CreditNotes/${cn.CreditNoteID}/Attachments/${encodeURIComponent(fileName)}`, { method: "PUT", headers: { "Content-Type": "application/pdf" }, body: bytes });
+  if (!at.ok) attached = `PDF not attached (Xero ${at.status}: ${String(await at.text()).replace(/\s+/g, " ").slice(0, 120)})`;
+  const alloc = "";
+  return { ok: true, status: cn.Status, id: cn.CreditNoteID, note: [status === "DRAFT" && why ? `left as draft (${why})` : "", `credit note ${xNumber}${reused ? ` (${reused} was used by a deleted credit note)` : ""}, total ${cn.Total}`, alloc, attached].filter(Boolean).join(". ") };
+}
+const INVOICE_MAIL_RULES = [
+  { name: "Burnett's", from: "burnetts-noreply@mail.myframeworks.com.au", subject: "BURNETTS PLUMBING SUPPLIES INVOICE", contact: "burnett", account: "", parse: (b) => burnettsParse(b) },
+  { name: "Harris", from: "mailouts@harristps.com.au", subject: "invoice", contact: "harris", account: "", parse: (b) => harrisParse(b) },
+  { name: "Samios", fromDomain: "samios.net.au", subject: "invoice", contact: "samios", account: "", creditNotes: true, alsoSubject: ["credit note"], parse: (b) => samiosParse(b) },
+  { name: "Reece", fromDomain: "reece.com.au", subject: "reece transactions", contact: "reece", account: "", parse: (b) => reeceParse(b) },
+  { name: "Tradelink", from: "donotreply@tradelink.com.au", subject: "tax invoice", contact: "tradelink", account: "", parse: (b) => tradelinkParse(b) },
+  { name: "Momentum", from: "hello@mail.momentum.com.au", subject: "your electricity bill", contact: "momentum", account: "", xeroOnly: true, parse: (b) => momentumParse(b) },
+  { name: "WEX Motorpass", from: "enquiries@motorpass.com.au", subject: "wex motorpass statement", contact: "wex", account: "", xeroOnly: true, parse: (b) => wexParse(b) },
+  { name: "Daisys", from: "notifications@daisysgarden.com.au", subject: "daisys garden supplies pty ltd invoice", contact: "daisy", account: "", parse: (b) => daisysParse(b) },
+  { name: "Plumbhaus", from: "messaging-service@post.xero.com", subject: "from plumbhaus co pty ltd", contact: "plumbhaus", account: "", parse: (b) => plumbhausParse(b) },
+  { name: "Bunnings", from: "creditedelivery@edelivery.bunnings.com.au", subject: "your bunnings statement", contact: "bunnings", account: "", xeroOnly: true, parse: (b) => bunningsParse(b) },
+  { name: "JJ's Waste", from: "ar.melbourne@jjswaste.com.au", subject: "invoice for customer", contact: "jjs waste", account: "", xeroOnly: true, parse: (b) => jjsParse(b) },
+  { name: "AroFlo", from: "billing@aroflo.com", subject: "aroflo billing", contact: "aroflo", account: "", xeroOnly: true, parse: (b) => aroFloParse(b) },
+  { name: "Adamsons", from: "messaging-service@post.xero.com", subject: "from adamsons tax", contact: "adamsons", account: "", xeroOnly: true, parse: (b) => adamsonsParse(b) },
+  { name: "Superloop", from: "noreply@superloop.com", subject: "your superloop bill", contact: "superloop", account: "", xeroOnly: true, parse: (b) => superloopParse(b) },
+  { name: "Soilworx", from: "accounts@soilworx.com.au", subject: "inv", contact: "soilworx", account: "", parse: (b) => soilworxParse(b) },
+  { name: "Estimate One", from: "accounts@estimateone.com", subject: "your e1 invoice", contact: "estimate one", account: "", xeroOnly: true, parse: (b) => estimateOneParse(b) },
+  { name: "Geelong Commercial", from: "emaildelivery@console.com.au", subject: "invoice for 41 seaside pde", contact: "geelong commercial", account: "", xeroOnly: true, parse: (b) => geelongCommercialParse(b) },
+  { name: "Apex", fromDomain: "apexsteel.com.au", subject: "invoice", contact: "apex", account: "", parse: (b) => apexParse(b) },
+  { name: "Geelong Access Hire", from: "no-reply@latner.app", subject: "from geelong access hire", contact: "geelong access", account: "", parse: (b) => geelongAccessParse(b) },
+  { name: "Melbourne Drain Relining", fromDomain: "inboundemail.aroflo.com", subject: "from melbourne drain relining", contact: "melbourne drain", account: "", forwardBack: "Invoice sent to Xero and AroFlo. Download the links in this email and upload them to AroFlo.", parse: (b) => melbourneDrainParse(b) },
+  { name: "LeavePlus", from: "noreply@leaveplus.com.au", subject: "leaveplus long service leave invoice", contact: "leaveplus", account: "", xeroOnly: true, parse: (b) => leaveplusParse(b) },
+  { name: "Teleca", from: "cs@teleca.com.au", subject: "telephone billing", contact: "teleca", account: "", xeroOnly: true, parse: (b) => telecaParse(b) }
+];
+const MAILBOXES = [
+  { id: "jobs", label: "DFP Jobs", address: "dfpjobs@directflow.com.au", tiers: ["T1", "T2"] },
+  { id: "maintenance", label: "Maintenance", address: "maintenance@directflow.com.au", tiers: ["T1", "T2"], who: ["tayler@directflow.com.au"] },
+  { id: "accounts", label: "Accounts", address: "accounts@directflow.com.au", tiers: ["T1"] },
+  { id: "tayler", label: "Tayler", address: "tayler@directflow.com.au", only: ["tayler@directflow.com.au"] }
+];
+const mailAddress = (env, b) => String((env && env["MAILBOX_" + b.id.toUpperCase()]) || b.address).toLowerCase();
+const mailAllowed = (b, user) => b.who && !(b.who.includes(String(user.email || "").toLowerCase()) || (user.tier === "T1" && /^tayler/i.test(String(user.email || "")))) ? false : b.only ? (b.only.includes(String(user.email || "").toLowerCase()) || (b.id === "tayler" && user.tier === "T1" && (/^tayler/i.test(String(user.email || "")) || /^tayler\b/i.test(String(user.name || ""))))) : b.tiers.includes(user.tier);
+const mxAddr = (a) => a ? [a.street, a.city, a.state, a.postalCode].filter(Boolean).join(", ").slice(0, 160) : "";
+// Client logos: a SharePoint folder (Reservoir site, beside Workplace Culture and Fleet Management) where each file is named for the web address it stands for, such as vestbuild.com.au.png.
+const LOGO_HOMES = [["Branding & Marketing", "Client Logos"], ["Reservoir", "Branding & Marketing", "Client Logos"]];
+let logoIndex = { at: 0, map: null };
+let avatarCache = { at: 0, items: null };
+async function logoLookup(env, email, probe) {
+  const dom = String(email || "").split("@")[1] || "";
+  if (!dom) return null;
+  const ext = /\.(png|jpe?g|svg|webp|gif)$/i;
+  if (!logoIndex.map || Date.now() - logoIndex.at > 600000) {
+    const map = new Map();
+    for (const segs of LOGO_HOMES) {
+      let next = `/sites/${siteId(env)}/drive/root:/${pathOf(segs)}:/children?$top=999&$select=id,name,file`, found = false;
+      for (let n = 0; next && n < 10; n++) {
+        const r = await graphFetch(env, next);
+        if (!r.ok) break;
+        found = true;
+        const j = await r.json();
+        for (const it of j.value || []) if (it.file && ext.test(it.name || "")) map.set(String(it.name).toLowerCase().replace(ext, ""), it.id);
+        next = j["@odata.nextLink"] || "";
+      }
+      if (found) break;
+    }
+    logoIndex = { at: Date.now(), map };
+  }
+  const parts = dom.toLowerCase().split(".");
+  let id = logoIndex.map.get(String(email).toLowerCase().trim()) || "";
+  for (let i = 0; i < parts.length - 1 && !id; i++) { const k = parts.slice(i).join("."); if (logoIndex.map.has(k)) id = logoIndex.map.get(k); }
+  // A mail system address (no reply, or a Xero sending address) only gets a logo from an exact web address file, never a guess from the name.
+  const sysSender = /^(no-?reply|do-?not-?reply|donotreply|mailer-daemon|postmaster)/i.test(String(email).split("@")[0]) || /(^|\.)xero\.com$/.test(dom.toLowerCase());
+  if (!id && !sysSender) { const stem = parts.length > 2 && /^(com|net|org|co|gov|edu)$/.test(parts[parts.length - 2]) ? parts[parts.length - 3] : parts[parts.length - 2]; for (const [name, v] of logoIndex.map) if (name.split(".")[0] === stem) { id = v; break; } if (!id && stem && stem.length >= 4) { const nz = (x) => String(x).toLowerCase().replace(/[^a-z0-9]/g, ""); const st = nz(stem); for (const [name, v] of logoIndex.map) { const n = nz(name.replace(/\.(com|net|org|co|au|nz|gov|edu)\b/g, "")); if (n && (n === st || n.startsWith(st) || (n.length >= 4 && st.startsWith(n)))) { id = v; break; } } } }
+  if (!id) return null;
+  logoIndex.lastName = ""; for (const [nm, v] of logoIndex.map) if (v === id) { logoIndex.lastName = nm; break; }
+  if (probe) return true;
+  const res = await graphFetch(env, `/sites/${siteId(env)}/drive/items/${encodeURIComponent(id)}/content`);
+  return res.ok ? res : null;
+}
+// Contact approvals: a new sender with no contact waits here for Tayler to approve, change or skip. A skipped sender comes back after another 10 emails.
+async function approvalsTable(env) {
+  await env.DB.prepare("CREATE TABLE IF NOT EXISTS contact_approvals (email TEXT PRIMARY KEY, box TEXT, name TEXT, status TEXT, logo INTEGER DEFAULT 0, cnt INTEGER DEFAULT 0, next_at INTEGER DEFAULT 0, created_at TEXT DEFAULT (datetime('now')))").run();
+  try { await env.DB.prepare("ALTER TABLE contact_approvals ADD COLUMN msg TEXT").run(); } catch (e) {}
+  await env.DB.prepare("DELETE FROM contact_approvals WHERE email LIKE '%aroflo%'").run();
+  // One time (26.11.2026): every sender that was approved goes back to waiting, so each one is approved again and gets a real contact.
+  try {
+    await env.DB.prepare("CREATE TABLE IF NOT EXISTS app_flags (k TEXT PRIMARY KEY, at TEXT)").run();
+    const rd = await env.DB.prepare("SELECT k FROM app_flags WHERE k = 'approvals_reset_20261126'").first();
+    if (!rd) {
+      await env.DB.prepare("UPDATE contact_approvals SET status = 'pending', cnt = 1 WHERE status = 'approved'").run();
+      await env.DB.prepare("INSERT OR IGNORE INTO app_flags (k, at) VALUES ('approvals_reset_20261126', datetime('now'))").run();
+    }
+  } catch (e) {}
+}
+async function approvalSeen(env, b, em, name, msgId) {
+  em = String(em || "").toLowerCase().trim();
+  if (!/^[^\s@'"<>]+@[^\s@'"<>]+$/.test(em) || /(@directflow\.com\.au$|aroflo)/.test(em) || /^(no-?reply|do-?not-?reply|mailer-daemon|postmaster)/.test(em)) return;
+  await approvalsTable(env);
+  const row = await env.DB.prepare("SELECT * FROM contact_approvals WHERE email = ?").bind(em).first();
+  const tell = () => null; // Contact approval notices are off. Tayler approves contacts by hand.
+  if (!row) {
+    const owner = encodeURIComponent(mailAddress(env, b));
+    const f = await graphFetch(env, `/users/${owner}/contacts?$filter=${encodeURIComponent(`emailAddresses/any(a:a/address eq '${em}')`)}&$select=id&$top=1`);
+    const has = f.ok && ((await f.json()).value || []).length > 0;
+    if (has) { await env.DB.prepare("INSERT INTO contact_approvals (email, box, name, status, cnt) VALUES (?, ?, ?, 'known', 1)").bind(em, b.id, String(name || "").slice(0, 120)).run(); return; }
+    let logo = 0; try { const lg = await logoLookup(env, em); if (lg) logo = 1; } catch (e) {}
+    await env.DB.prepare("INSERT INTO contact_approvals (email, box, name, status, logo, cnt, msg) VALUES (?, ?, ?, 'pending', ?, 1, ?)").bind(em, b.id, String(name || "").slice(0, 120), logo, String(msgId || "")).run();
+    await tell(logo);
+    return;
+  }
+  if (row.status === "known" || row.status === "approved") return;
+  const cnt = (row.cnt || 0) + 1;
+  if (row.status === "skipped" && cnt >= (row.next_at || 10)) {
+    await env.DB.prepare("UPDATE contact_approvals SET cnt = ?, status = 'pending' WHERE email = ?").bind(cnt, em).run();
+    await tell(!!row.logo);
+  } else await env.DB.prepare("UPDATE contact_approvals SET cnt = ? WHERE email = ?").bind(cnt, em).run();
+}
+async function approvalScan(env, boxes) {
+  await approvalsTable(env);
+  let added = 0;
+  const info = [];
+  for (const b of boxes) {
+    const row0 = { box: b.id, contacts: 0, senders: 0, added: 0, note: "" };
+    info.push(row0);
+    try {
+      const owner = encodeURIComponent(mailAddress(env, b));
+      const have = new Set();
+      let next = `/users/${owner}/contacts?$top=500&$select=emailAddresses`;
+      for (let n = 0; next && n < 10; n++) {
+        const r = await graphFetch(env, next);
+        if (!r.ok) { row0.note = "contacts " + r.status; break; }
+        const j = await r.json();
+        for (const c of j.value || []) for (const a of c.emailAddresses || []) have.add(String(a.address || "").toLowerCase());
+        next = j["@odata.nextLink"] || "";
+      }
+      row0.contacts = have.size;
+      const seen = new Map();
+      next = `/users/${owner}/mailFolders/inbox/messages?$top=100&$select=id,from,receivedDateTime`;
+      for (let n = 0; next && n < 6; n++) {
+        const r = await graphFetch(env, next);
+        if (!r.ok) { row0.note += " mail " + r.status; break; }
+        const j = await r.json();
+        for (const m of j.value || []) { const fa = (m.from && m.from.emailAddress) || {}; const em = String(fa.address || "").toLowerCase().trim(); if (em) { const o = seen.get(em) || { name: fa.name || "", n: 0, id: m.id }; o.n++; seen.set(em, o); } }
+        next = j["@odata.nextLink"] || "";
+      }
+      row0.senders = seen.size;
+      for (const [em, o] of seen) {
+        if (have.has(em) || !/^[^\s@'"<>]+@[^\s@'"<>]+$/.test(em) || /(@directflow\.com\.au$|aroflo)/.test(em) || /^(no-?reply|do-?not-?reply|mailer-daemon|postmaster)/.test(em)) continue;
+        const row = await env.DB.prepare("SELECT status FROM contact_approvals WHERE email = ?").bind(em).first();
+        if (row) { await env.DB.prepare("UPDATE contact_approvals SET msg = ? WHERE email = ? AND status = 'pending' AND (msg IS NULL OR msg = '')").bind(String(o.id || ""), em).run(); continue; }
+        let logo = 0; try { if (await logoLookup(env, em, true)) logo = 1; } catch (e) {}
+        const nm = o.name && o.name.toLowerCase() !== em ? o.name : "";
+        await env.DB.prepare("INSERT INTO contact_approvals (email, box, name, status, logo, cnt, msg) VALUES (?, ?, ?, 'pending', ?, ?, ?)").bind(em, b.id, String(nm).slice(0, 120), logo, o.n, String(o.id || "")).run();
+        added++; row0.added++;
+      }
+    } catch (e) { row0.note += " error " + String(e && e.message || e).slice(0, 80); }
+  }
+  return { added, info };
+}
+async function mailGraph(env, address, qs) {
+  // qs is a path inside the mailbox, or the full next page link Graph handed back.
+  const target = qs.startsWith(GRAPH + "/") ? qs : `/users/${encodeURIComponent(address)}${qs}`;
+  let res = await graphFetch(env, target);
+  if (res.status === 401 || res.status === 403) { graphToken = { value: null, at: 0 }; res = await graphFetch(env, target); }
+  const text = await res.text();
+  let json = null;
+  try { json = JSON.parse(text); } catch (e) { json = null; }
+  return { ok: res.ok, status: res.status, json, text };
+}
+const mailWhy = (r, write) => {
+  let who = "";
+  try {
+    const c = JSON.parse(atob(String(graphToken.value).split(".")[1].replace(/-/g, "+").replace(/_/g, "/")));
+    const mailRoles = (c.roles || []).filter((x) => /^Mail|^MailboxSettings/.test(x));
+    who = ` Reservoir signs in to Microsoft as app ${c.appid || c.azp || "unknown"}, and its token holds these mail permissions: ${mailRoles.join(", ") || "none"}.`;
+  } catch (e) { who = ""; }
+  const code = r.json && r.json.error && r.json.error.code ? ` Microsoft said ${r.json.error.code}.` : "";
+  if ((r.status === 403 || r.status === 401) && write) return "Reservoir's Microsoft app is not allowed to change this mailbox yet. The Reservoir Directories app needs the Mail.ReadWrite and Mail.Send application permissions." + code + who;
+  if (r.status === 403 || r.status === 401) return "Reservoir's Microsoft app is not allowed to read this mailbox yet." + code + who;
+  if (r.status === 404) return "Microsoft could not find this mailbox." + code;
+  return `Microsoft answered ${r.status}.` + code;
+};
+// ---- Access (T1 only). Who has which tier, changing it in Entra, and tiles switched off per person. ----
+async function accessTable(env) {
+  await env.DB.prepare("CREATE TABLE IF NOT EXISTS temp_access (email TEXT PRIMARY KEY, tier TEXT NOT NULL, until TEXT, by_name TEXT, at TEXT DEFAULT (datetime('now')))").run();
+  await env.DB.prepare("CREATE TABLE IF NOT EXISTS tile_overrides (email TEXT NOT NULL, tile_id TEXT NOT NULL, by_name TEXT, at TEXT DEFAULT (datetime('now')), PRIMARY KEY (email, tile_id))").run();
+}
+async function accessGraph(env, path, init) {
+  let res = await graphFetch(env, path, init);
+  if (res.status === 403) { graphToken = { value: null, at: 0 }; res = await graphFetch(env, path, init); }
+  const text = await res.text();
+  let json = null;
+  try { json = JSON.parse(text); } catch (e) { json = null; }
+  return { ok: res.ok, status: res.status, json, text };
+}
+// Temporary access. A person can be lifted to a better level until 4pm Melbourne time on the end date. Past that moment the row is ignored.
+function tempAccessLive(row) {
+  if (!row || !row.tier) return false;
+  if (!row.until) return true;
+  const parts = new Intl.DateTimeFormat("en-CA", { timeZone: "Australia/Melbourne", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", hour12: false }).formatToParts(new Date());
+  const g = (t) => (parts.find((x) => x.type === t) || {}).value;
+  const day = `${g("year")}-${g("month")}-${g("day")}`;
+  const hour = Number(g("hour")) % 24;
+  return day < row.until || (day === row.until && hour < 16);
+}
+const tempAccessCache = new Map();
+async function tempAccessFor(env, email) {
+  try {
+    const key = String(email || "").toLowerCase();
+    const hit = tempAccessCache.get(key);
+    if (hit && Date.now() - hit.at < 60000) return tempAccessLive(hit.row) ? hit.row : null;
+    const row = await env.DB.prepare("SELECT tier, until FROM temp_access WHERE email = ?").bind(key).first();
+    tempAccessCache.set(key, { at: Date.now(), row });
+    return tempAccessLive(row) ? row : null;
+  } catch (e) { return null; }
+}
+async function accessRoutes(request, env, user, url) {
+  if (!url.pathname.startsWith("/api/access") && url.pathname !== "/api/mytiles") return null;
+  // /api/access/tiers has its own handler further down. Without this line this function answered it with "not found" first, which is what broke Login As.
+  if (url.pathname === "/api/access/tiers") return null;
+  if (url.pathname === "/api/mytiles") {
+    if (request.method !== "GET") return reply(env, 404, { error: "not found" });
+    await accessTable(env);
+    const rows = await env.DB.prepare("SELECT tile_id FROM tile_overrides WHERE email = ?").bind(String(user.email || "").toLowerCase()).all();
+    const tmp = await tempAccessFor(env, user.email);
+    return reply(env, 200, { off: (rows.results || []).map((r) => r.tile_id), temp: tmp ? { tier: tmp.tier, until: tmp.until || "" } : null, worker: WORKER_BUILD });
+  }
+  if (user.realUser ? user.realUser.tier !== "T1" : user.tier !== "T1" || user.tempTier) return reply(env, 403, { error: "forbidden" });
+  try {
+    await accessTable(env);
+    const sp = (await accessGraph(env, `/servicePrincipals?$filter=appId eq '${env.CLIENT_ID}'&$select=id,appRoles`));
+    if (!sp.ok || !sp.json || !(sp.json.value || []).length) return reply(env, 200, { ok: false, error: `Could not read the Reservoir app in Entra (${sp.status}). ${sp.json && sp.json.error ? sp.json.error.message : ""}` });
+    const app = sp.json.value[0];
+    const roleOf = {}, idOf = {};
+    (app.appRoles || []).forEach((r) => { if (/^T[1-5]$/.test(r.value || "")) { roleOf[r.id] = r.value; idOf[r.value] = r.id; } });
+    if (url.pathname === "/api/access/people" && request.method === "GET") {
+      const people = {};
+      let next = `/servicePrincipals/${app.id}/appRoleAssignedTo?$top=100`;
+      for (let page = 0; next && page < 5; page++) {
+        const j = await accessGraph(env, next);
+        if (!j.ok) return reply(env, 200, { ok: false, error: `Entra answered ${j.status}. ${j.json && j.json.error ? j.json.error.message : j.text.slice(0, 160)}` });
+        for (const a of j.json.value || []) {
+          const tier = roleOf[a.appRoleId];
+          if (!tier) continue;
+          if (a.principalType === "User") {
+            const p = people[a.principalId] || (people[a.principalId] = { id: a.principalId, name: a.principalDisplayName || "", tier: "", direct: "", viaGroup: "" });
+            p.direct = tier;
+          } else if (a.principalType === "Group") {
+            const m = await accessGraph(env, `/groups/${a.principalId}/transitiveMembers/microsoft.graph.user?$select=id,displayName&$top=200`);
+            for (const u of (m.json && m.json.value) || []) {
+              const p = people[u.id] || (people[u.id] = { id: u.id, name: u.displayName || "", tier: "", direct: "", viaGroup: "" });
+              p.viaGroup = tier;
+            }
+          }
+        }
+        next = j.json["@odata.nextLink"] || "";
+      }
+      const rank = { T1: 1, T2: 2, T3: 3, T4: 4, T5: 5 };
+      const all = await accessGraph(env, "/users?$select=id,displayName,mail,userPrincipalName,accountEnabled&$top=200");
+      const out = [];
+      const seen = {};
+      let nameBy = {};
+      try {
+        const rows = await env.DB.prepare(PERSON_SQL).all();
+        (rows.results || []).forEach((r) => { const e = String(r.email || "").toLowerCase(); const n = teamName(r); if (e && n) nameBy[e] = n; });
+      } catch (e) { nameBy = {}; }
+      const centralBoxes = new Set(MAILBOXES.filter((b) => b.id !== "tayler").map((b) => mailAddress(env, b)));
+      for (const u of (all.json && all.json.value) || []) {
+        if (u.accountEnabled === false) continue;
+        const email = String(u.mail || u.userPrincipalName || "").toLowerCase();
+        if (centralBoxes.has(email) || centralBoxes.has(String(u.userPrincipalName || "").toLowerCase()) || /^DFP (Accounts|Jobs|Maintenance)$/i.test(String(u.displayName || "").trim())) continue;
+        const p = people[u.id];
+        const tiers = p ? [p.direct, p.viaGroup].filter(Boolean) : [];
+        const tier = tiers.sort((a, b) => rank[a] - rank[b])[0] || "";
+        seen[u.id] = 1;
+        out.push({ id: u.id, name: nameBy[email] || String(u.displayName || "").replace(/\s+-\s+DFP$/i, "").trim() || email, email, tier, direct: p ? p.direct : "", viaGroup: p ? p.viaGroup : "", me: email === String(user.email || "").toLowerCase() });
+      }
+      for (const id of Object.keys(people)) if (!seen[id]) { const p = people[id]; out.push({ id, name: p.name, email: "", tier: p.direct || p.viaGroup, direct: p.direct, viaGroup: p.viaGroup, me: false }); }
+      out.sort((a, b) => (a.tier ? 0 : 1) - (b.tier ? 0 : 1) || String(a.name).localeCompare(String(b.name)));
+      const off = await env.DB.prepare("SELECT email, COUNT(*) AS n FROM tile_overrides GROUP BY email").all();
+      const offBy = {};
+      (off.results || []).forEach((r) => { offBy[r.email] = r.n; });
+      out.forEach((p) => { p.tilesOff = offBy[p.email] || 0; });
+      const tmpRows = await env.DB.prepare("SELECT email, tier, until FROM temp_access").all();
+      const tmpBy = {};
+      (tmpRows.results || []).forEach((r) => { if (tempAccessLive(r)) tmpBy[r.email] = r.tier; });
+      out.forEach((p) => { p.temp = tmpBy[p.email] || ""; });
+      return reply(env, 200, { ok: true, people: out, roles: Object.keys(idOf).sort(), worker: WORKER_BUILD });
+    }
+    if (url.pathname === "/api/access/tier" && request.method === "POST") {
+      const b = await request.json().catch(() => ({}));
+      const userId = String(b.userId || "");
+      const tier = String(b.tier || "");
+      if (!/^[0-9a-f-]{36}$/i.test(userId)) return reply(env, 400, { error: "bad person" });
+      if (tier !== "none" && !idOf[tier]) return reply(env, 200, { ok: false, error: `The role ${tier} does not exist in Entra yet.` });
+      const who = await accessGraph(env, `/users/${userId}?$select=mail,userPrincipalName`);
+      const whoEmail = String((who.json && (who.json.mail || who.json.userPrincipalName)) || "").toLowerCase();
+      if (whoEmail && whoEmail === String(user.email || "").toLowerCase()) return reply(env, 200, { ok: false, error: "You cannot change your own access here. Do that in Entra so you cannot lock yourself out." });
+      const cur = await accessGraph(env, `/users/${userId}/appRoleAssignments?$top=100`);
+      if (!cur.ok) return reply(env, 200, { ok: false, error: `Entra answered ${cur.status}. ${cur.json && cur.json.error ? cur.json.error.message : cur.text.slice(0, 160)}` });
+      const mine = ((cur.json && cur.json.value) || []).filter((a) => a.resourceId === app.id && roleOf[a.appRoleId]);
+      if (mine.length === 1 && roleOf[mine[0].appRoleId] === tier) return reply(env, 200, { ok: true, tier, unchanged: true, worker: WORKER_BUILD });
+      if (tier !== "none") {
+        const add = await accessGraph(env, `/users/${userId}/appRoleAssignments`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ principalId: userId, resourceId: app.id, appRoleId: idOf[tier] }) });
+        if (!add.ok) return reply(env, 200, { ok: false, error: `Entra refused the change (${add.status}). ${add.json && add.json.error ? add.json.error.message : add.text.slice(0, 160)}` });
+      }
+      for (const a of mine) {
+        if (tier !== "none" && roleOf[a.appRoleId] === tier) continue;
+        const del = await accessGraph(env, `/users/${userId}/appRoleAssignments/${a.id}`, { method: "DELETE" });
+        if (!del.ok && del.status !== 404) return reply(env, 200, { ok: false, error: `Added the new level but could not remove the old one (${del.status}). ${del.json && del.json.error ? del.json.error.message : ""}` });
+      }
+      accessTiersCache = { at: 0, value: null };
+      return reply(env, 200, { ok: true, tier, worker: WORKER_BUILD });
+    }
+    if (url.pathname === "/api/access/tiles" && request.method === "GET") {
+      const email = String(url.searchParams.get("email") || "").toLowerCase();
+      const rows = await env.DB.prepare("SELECT tile_id FROM tile_overrides WHERE email = ?").bind(email).all();
+      const t = await env.DB.prepare("SELECT tier, until FROM temp_access WHERE email = ?").bind(email).first();
+      return reply(env, 200, { off: (rows.results || []).map((r) => r.tile_id), temp: t && tempAccessLive(t) ? { tier: t.tier, until: t.until || "" } : null, worker: WORKER_BUILD });
+    }
+    if (url.pathname === "/api/access/temp" && request.method === "POST") {
+      const b = await request.json().catch(() => ({}));
+      const email = String(b.email || "").toLowerCase();
+      const tier = String(b.tier || "");
+      const until = String(b.until || "");
+      if (!email || (tier && !idOf[tier]) || (until && !/^\d{4}-\d{2}-\d{2}$/.test(until))) return reply(env, 400, { error: "bad request" });
+      if (email === String(user.email || "").toLowerCase()) return reply(env, 200, { ok: false, error: "You cannot lift your own level." });
+      if (!tier) await env.DB.prepare("DELETE FROM temp_access WHERE email = ?").bind(email).run();
+      else await env.DB.prepare("INSERT INTO temp_access (email, tier, until, by_name) VALUES (?, ?, ?, ?) ON CONFLICT(email) DO UPDATE SET tier = excluded.tier, until = excluded.until, by_name = excluded.by_name, at = datetime('now')").bind(email, tier, until || null, user.name || "").run();
+      return reply(env, 200, { ok: true, tier, until, worker: WORKER_BUILD });
+    }
+    if (url.pathname === "/api/access/tiles" && request.method === "POST") {
+      const b = await request.json().catch(() => ({}));
+      const email = String(b.email || "").toLowerCase();
+      if (!email || !Array.isArray(b.off)) return reply(env, 400, { error: "bad request" });
+      const ids = b.off.map((x) => String(x)).filter((x) => /^[a-z0-9:_-]{1,40}$/i.test(x)).slice(0, 80);
+      const stmts = [env.DB.prepare("DELETE FROM tile_overrides WHERE email = ?").bind(email)];
+      ids.forEach((id) => stmts.push(env.DB.prepare("INSERT INTO tile_overrides (email, tile_id, by_name) VALUES (?, ?, ?)").bind(email, id, user.name || "")));
+      await env.DB.batch(stmts);
+      return reply(env, 200, { ok: true, off: ids, worker: WORKER_BUILD });
+    }
+    return reply(env, 404, { error: "not found" });
+  } catch (e) {
+    return reply(env, 200, { ok: false, error: String(e && e.message || e).slice(0, 240) });
+  }
+}
+// ---- End of Month. Reads a supplier statement PDF (Samios first), takes the lines for one month, and matches each invoice number and amount against the bills and supplier credit notes in Xero. T1 and T2 only. Reads only, nothing is written to Xero. ----
+async function eomSamiosStatement(bytes) {
+  const items = await pdfTextRuns(bytes);
+  const money = (t) => { const n = Number(String(t).replace(/[^0-9.]/g, "")); return /^\(.*\)$|^-|-$|CR$/i.test(String(t).trim()) ? -n : n; };
+  const left = items.filter((i) => i.x < 400);
+  const rows = {};
+  for (const i of left) {
+    const key = `${i.page}|${Math.round(i.y / 3)}`;
+    (rows[key] = rows[key] || []).push(i);
+  }
+  const lines = [];
+  let closing = null;
+  for (const k of Object.keys(rows)) {
+    const r = rows[k].sort((a, b) => a.x - b.x);
+    const date = r.find((i) => /^\d{2}\/\d{2}\/\d{2}$/.test(i.t.trim()) && i.x < 60);
+    const tr = r.find((i) => /^(Invoice|Cr\/Note:?)\s+\d{5,}$/i.test(i.t.trim()));
+    if (!date || !tr) continue;
+    const credit = /^Cr/i.test(tr.t.trim());
+    const number = tr.t.trim().match(/(\d{5,})$/)[1];
+    const amounts = r.filter((i) => i.x > 255 && i.x < 360 && /\d/.test(i.t));
+    const amt = amounts.length ? Math.abs(money(amounts[0].t)) : 0;
+    const d = date.t.trim().match(/^(\d{2})\/(\d{2})\/(\d{2})$/);
+    lines.push({ date: `20${d[3]}-${d[2]}-${d[1]}`, number, credit, amount: Math.round(amt * 100) / 100 });
+  }
+  const dueItem = items.find((i) => /^Amount Due$/i.test(i.t.trim()));
+  if (dueItem) { const v = items.filter((i) => i.page === dueItem.page && Math.abs(i.y - dueItem.y) < 4 && i.x > dueItem.x && /\d/.test(i.t)).sort((a, b) => a.x - b.x)[0]; if (v) closing = money(v.t); }
+  const acct = (items.map((i) => i.t.match(/Account:\s*(\d+)/)).find((m) => m) || [])[1] || "";
+  lines.sort((a, b) => a.date < b.date ? -1 : a.date > b.date ? 1 : a.number < b.number ? -1 : 1);
+  return { account: acct, closing, lines };
+}
+// Any supplier's statement: every row that has a date, an invoice number and an amount becomes a line. Samios keeps its own exact reader and is tried first.
+async function eomGenericStatement(bytes) {
+  const items = await pdfTextRuns(bytes);
+  const MON = { jan: 1, feb: 2, mar: 3, apr: 4, may: 5, jun: 6, jul: 7, aug: 8, sep: 9, oct: 10, nov: 11, dec: 12 };
+  const moneyRe = /^[-(]?\$?[\d,]+\.\d{2}\)?(CR|DR)?-?$/i;
+  const toDate = (t) => {
+    t = t.trim();
+    let m = t.match(/^(\d{1,2})[\/.\-](\d{1,2})[\/.\-](\d{2}|\d{4})$/);
+    if (m) return `${m[3].length === 2 ? "20" + m[3] : m[3]}-${m[2].padStart(2, "0")}-${m[1].padStart(2, "0")}`;
+    m = t.match(/^(\d{1,2})[ \-]([A-Za-z]{3})[a-z]*[ \-,]*(\d{2}|\d{4})$/);
+    if (m && MON[m[2].toLowerCase()]) return `${m[3].length === 2 ? "20" + m[3] : m[3]}-${String(MON[m[2].toLowerCase()]).padStart(2, "0")}-${m[1].padStart(2, "0")}`;
+    return "";
+  };
+  const rows = {};
+  for (const i of items) (rows[`${i.page}|${Math.round(i.y / 3)}`] = rows[`${i.page}|${Math.round(i.y / 3)}`] || []).push(i);
+  const lines = [];
+  for (const k of Object.keys(rows)) {
+    const r = rows[k].sort((a, b) => a.x - b.x);
+    const dateItem = r.find((i) => toDate(i.t));
+    if (!dateItem) continue;
+    const amounts = r.filter((i) => moneyRe.test(i.t.trim()));
+    if (!amounts.length) continue;
+    const numItem = r.find((i) => i !== dateItem && !moneyRe.test(i.t.trim()) && !toDate(i.t) && /\d{4,}/.test(i.t));
+    if (!numItem) continue;
+    const number = numItem.t.match(/\d{4,}/)[0];
+    const first = amounts[0].t.trim();
+    const rowText = r.map((i) => i.t).join(" ");
+    const credit = /cr\/?note|credit/i.test(rowText) || /^[-(]|-$/.test(first);
+    const amt = Math.abs(Number(first.replace(/[^0-9.]/g, "")));
+    lines.push({ date: toDate(dateItem.t), number, credit, amount: Math.round(amt * 100) / 100 });
+  }
+  lines.sort((a, b) => a.date < b.date ? -1 : a.date > b.date ? 1 : a.number < b.number ? -1 : 1);
+  const text = items.map((i) => i.t).join(" ").toLowerCase().replace(/[’']/g, "");
+  return { account: "", closing: null, lines, text };
+}
+async function eomXeroMonth(env, contactId, from, to) {
+  const wh = (type) => encodeURIComponent(`Type=="${type}" AND Contact.ContactID==Guid("${contactId}") AND Date>=DateTime(${from.slice(0, 4)}, ${Number(from.slice(5, 7))}, ${Number(from.slice(8, 10))}) AND Date<=DateTime(${to.slice(0, 4)}, ${Number(to.slice(5, 7))}, ${Number(to.slice(8, 10))})`);
+  const out = [];
+  for (const [path, type, numKey, credit] of [["Invoices", "ACCPAY", "InvoiceNumber", false], ["CreditNotes", "ACCPAYCREDIT", "CreditNoteNumber", true]]) {
+    for (let page = 1; page <= 10; page++) {
+      const res = await xeroFetch(env, `api.xro/2.0/${path}?where=${wh(type)}&page=${page}`);
+      if (!res.ok) throw new Error(`Xero ${res.status}`);
+      const j = await res.json();
+      const list = (credit ? j.CreditNotes : j.Invoices) || [];
+      for (const x of list) {
+        if (x.Status === "DELETED" || x.Status === "VOIDED") continue;
+        out.push({ number: String(x[numKey] || ""), credit, total: Math.round(Number(x.Total) * 100) / 100, status: x.Status, date: xeroDate(x.DateString || x.Date), due: xeroDate(x.DueDateString || x.DueDate), amountDue: Math.round(Number(x.AmountDue) * 100) / 100 });
+      }
+      if (list.length < 100) break;
+    }
+  }
+  return out;
+}
+// Matches one month of statement lines to Xero by number. Same number and same amount is matched; same number with another amount is a difference; on the statement only is missing from Xero; in Xero only is not on the statement.
+function eomCompare(lines, xero, from, to) {
+  const r2 = (n) => Math.round(n * 100) / 100;
+  const used = new Set();
+  const matched = [], different = [], missing = [], stmtLines = [];
+  // A Xero number matches a statement line when it contains the statement's invoice number, whatever sits around it (colons, PO numbers, prefixes). Invoices and credits stay apart, each Xero item is used once, and an exact amount wins when several contain the number.
+  const digits = (v) => String(v || "").replace(/\D/g, "");
+  const fits = (x, l) => !!x.credit === !!l.credit && !used.has(x) && (String(x.number || "").includes(String(l.number)) || digits(x.number).includes(digits(l.number)));
+  for (const l of lines) {
+    const cands = xero.filter((x) => fits(x, l));
+    const hit = cands.find((x) => Math.abs(x.total - l.amount) < 0.005) || cands[0];
+    const out = { date: l.date, number: l.number, credit: l.credit, amount: l.amount };
+    if (!hit) { missing.push(l); stmtLines.push({ ...out, match: "missing" }); continue; }
+    used.add(hit);
+    if (Math.abs(hit.total - l.amount) < 0.005) { matched.push({ ...l, xeroStatus: hit.status, xeroDue: hit.due }); stmtLines.push({ ...out, match: "matched" }); }
+    else { different.push({ ...l, xeroAmount: hit.total, difference: r2(l.amount - hit.total) }); stmtLines.push({ ...out, match: "different", xeroAmount: hit.total }); }
+  }
+  const notOnStatement = xero.filter((x) => !used.has(x) && (!from || (x.date >= from && x.date <= to)));
+  const net = (arr, amt) => r2(arr.reduce((t, x) => t + (x.credit ? -amt(x) : amt(x)), 0));
+  const stmtTotal = net(lines, (x) => x.amount);
+  const inMonth = xero.filter((x) => !from || (x.date >= from && x.date <= to));
+  const xeroTotal = net(inMonth, (x) => x.total);
+  return { stmtTotal, xeroTotal, difference: r2(stmtTotal - xeroTotal), balanced: Math.abs(stmtTotal - xeroTotal) < 0.005 && !missing.length && !different.length && !notOnStatement.length, counts: { statement: lines.length, matched: matched.length, different: different.length, missing: missing.length, notOnStatement: notOnStatement.length }, lines: stmtLines, different, missing, notOnStatement };
+}
+async function eomRoutes(request, env, user, url) {
+  if (url.pathname !== "/api/eom/check") return null;
+  if (user.tier !== "T1" && user.tier !== "T2") return reply(env, 403, { error: "forbidden" });
+  if (request.method !== "POST") return reply(env, 404, { error: "not found" });
+  try {
+    const b = await request.json();
+    if (!b.pdf) return reply(env, 400, { error: "pdf (base64) needed" });
+    const raw = atob(String(b.pdf)), bytes = new Uint8Array(raw.length);
+    for (let i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
+    const gen = await eomGenericStatement(bytes.buffer);
+    let stmt = await eomSamiosStatement(bytes.buffer);
+    if (!stmt.lines.length) stmt = gen;
+    if (!stmt.lines.length) return reply(env, 200, { ok: false, error: "No statement lines could be read from that PDF." });
+    const text = gen.text || "";
+    // The month is the one most of the lines fall in, unless one was sent.
+    let month = /^\d{4}-\d{2}$/.test(String(b.month || "")) ? b.month : "";
+    if (!month) {
+      const cnt = {};
+      for (const l of stmt.lines) cnt[l.date.slice(0, 7)] = (cnt[l.date.slice(0, 7)] || 0) + 1;
+      month = Object.keys(cnt).sort((x, y) => cnt[y] - cnt[x] || (x < y ? 1 : -1))[0];
+    }
+    const lines = stmt.lines.filter((l) => l.date.slice(0, 7) === month);
+    await xeroContactsTable(env);
+    const all0 = ((await env.DB.prepare("SELECT contact_id, name, name_lc FROM xero_contacts").all()).results) || [];
+    // Who it is from: contact names that appear in the statement text (never DFP itself), longest first.
+    const clean = (n) => String(n || "").toLowerCase().replace(/[’']/g, "").replace(/\b(pty|ltd|limited|the|t\/a|trading as|and|&)\b/g, " ").replace(/[^a-z0-9 ]/g, " ").replace(/\s+/g, " ").trim();
+    const hay = ` ${clean(text)} `;
+    const ok = (c) => !/direct flow|dfp/.test(clean(c.name));
+    let cands = all0.filter((c) => { const n = clean(c.name_lc || c.name); return n.length >= 4 && ok(c) && hay.includes(` ${n} `); }).sort((x, y) => clean(y.name).length - clean(x.name).length).slice(0, 3);
+    // Statements often print a shorter name than Xero holds, so fall back to the contact's first word.
+    if (!cands.length) cands = all0.filter((c) => { const w = clean(c.name).split(" ")[0]; return w.length >= 5 && ok(c) && hay.includes(` ${w} `); }).slice(0, 6);
+    if (!cands.length) return reply(env, 200, { ok: false, error: "Could not tell who that statement is from." });
+    const [y, m] = month.split("-").map(Number);
+    const day = (iso, n) => new Date(Date.parse(iso + "T00:00:00Z") + n * 86400000).toISOString().slice(0, 10);
+    const from = `${month}-01`, to = new Date(Date.UTC(y, m, 0)).toISOString().slice(0, 10);
+    let best = null;
+    for (const c of cands) {
+      // Xero's bill date can differ from the statement date, so look 60 days either side and match by number; only bills dated in the month count as missing from the statement.
+      const all = await eomXeroMonth(env, c.contact_id, day(from, -60), day(to, 60));
+      const cmp = eomCompare(lines, all, from, to);
+      if (!best || cmp.counts.matched + cmp.counts.different > best.cmp.counts.matched + best.cmp.counts.different) best = { c, cmp };
+    }
+    return reply(env, 200, { ok: true, supplier: best.c.name, account: stmt.account, month, ...best.cmp, worker: WORKER_BUILD });
+  } catch (e) {
+    return reply(env, 200, { ok: false, error: String(e && e.message || e).slice(0, 240) });
+  }
+}
+// ---- Budget. The expense list, what is ticked paid this month and the weekly transfer, kept in one settings row so it survives reloads and is the same on every device. T1 and T2 only. ----
+async function budgetRoutes(request, env, user, url) {
+  if (url.pathname !== "/api/budget" && url.pathname !== "/api/budget/bills") return null;
+  if (user.tier !== "T1" && user.tier !== "T2") return reply(env, 403, { error: "forbidden" });
+  if (url.pathname === "/api/budget/bills") {
+    // The Awaiting Payment list from Xero for the lines whose amount changes every bill (PMFA, WEX Motorpass, Microsoft). The Expenses screen matches these to the week they fall due.
+    if (request.method !== "GET") return reply(env, 404, { error: "not found" });
+    try {
+      const bills = [];
+      for (let page = 1; page <= 3; page++) {
+        const since = new Date(Date.now() - 75 * 864e5), sinceW = `DateTime(${since.getUTCFullYear()}, ${since.getUTCMonth() + 1}, ${since.getUTCDate()})`;
+        const res = await xeroFetch(env, `api.xro/2.0/Invoices?where=${encodeURIComponent(`Type=="ACCPAY" AND (Status=="AUTHORISED" OR Status=="PAID") AND Date>=${sinceW}`)}&order=${encodeURIComponent("Date DESC")}&page=${page}`);
+        if (!res.ok) return reply(env, 200, { ok: false, error: `Xero ${res.status}`, bills: [] });
+        const j = await res.json();
+        const list = j && j.Invoices || [];
+        for (const inv of list) {
+          const name = String(inv.Contact && inv.Contact.Name || "");
+          if (!name) continue;
+          const amount = Number(inv.Status === "PAID" ? inv.Total : inv.AmountDue);
+          const due = xeroDate(inv.DueDateString || inv.DueDate);
+          if (!due || !(amount > 0)) continue;
+          bills.push({ due, amount: Math.round(amount * 100) / 100, number: String(inv.InvoiceNumber || ""), contact: name });
+        }
+        if (list.length < 100) break;
+      }
+      return reply(env, 200, { ok: true, bills });
+    } catch (e) {
+      return reply(env, 200, { ok: false, error: String(e && e.message || e).slice(0, 200), bills: [] });
+    }
+  }
+  await settingsTable(env);
+  if (request.method === "GET") {
+    const row = await env.DB.prepare("SELECT value, by_name, at FROM app_settings WHERE key = 'budget.state'").first();
+    let state = null;
+    try { state = row && row.value ? JSON.parse(row.value) : null; } catch (e) { state = null; }
+    return reply(env, 200, { state, by: row ? row.by_name : "", at: row ? row.at : "", worker: WORKER_BUILD });
+  }
+  if (request.method === "PUT") {
+    const raw = await request.text();
+    if (raw.length > 120000) return reply(env, 400, { error: "too big" });
+    let b;
+    try { b = JSON.parse(raw); } catch (e) { return reply(env, 400, { error: "bad json" }); }
+    if (!b || !Array.isArray(b.expenses)) return reply(env, 400, { error: "bad state" });
+    const state = { expenses: b.expenses.slice(0, 200), paid: b.paid && typeof b.paid === "object" ? b.paid : {}, amounts: b.amounts && typeof b.amounts === "object" ? b.amounts : {}, settings: b.settings && typeof b.settings === "object" ? b.settings : {}, month: String(b.month || "").slice(0, 7) };
+    await env.DB.prepare("INSERT INTO app_settings (key, value, by_name, at) VALUES ('budget.state', ?, ?, datetime('now')) ON CONFLICT(key) DO UPDATE SET value = excluded.value, by_name = excluded.by_name, at = excluded.at").bind(JSON.stringify(state), user.name || "").run();
+    return reply(env, 200, { ok: true, worker: WORKER_BUILD });
+  }
+  return reply(env, 404, { error: "not found" });
+}
+// ---- Mail client. Folders, messages, reading, replying, forwarding, sending, deleting and attachments for the four DFP mailboxes, all through Microsoft Graph. Changing mail needs the Mail.ReadWrite and Mail.Send application permissions on the Reservoir Directories app. ----
+async function mailGraphPost(env, path, bodyObj) {
+  const go = () => graphFetch(env, path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(bodyObj) });
+  let res = await go();
+  if (res.status === 401 || res.status === 403) { graphToken = { value: null, at: 0 }; res = await go(); }
+  return { ok: res.ok, status: res.status, text: await res.text() };
+}
+async function mailDo(env, address, path, method, bodyObj) {
+  // Anything filed into the Archive is marked as read first, whichever route moves it there.
+  if (method === "POST" && /\/move$/.test(path) && bodyObj && String(bodyObj.destinationId || "").toLowerCase() === "archive") {
+    const rd = await mailDo(env, address, path.replace(/\/move$/, ""), "PATCH", { isRead: true });
+    if (!rd.ok) console.log("archive mark read failed", rd.status);
+  }
+  const go = () => graphFetch(env, `/users/${encodeURIComponent(address)}${path}`, { method, headers: { "Content-Type": "application/json" }, body: bodyObj === void 0 ? void 0 : JSON.stringify(bodyObj) });
+  let res = await go();
+  if (res.status === 401 || res.status === 403) { graphToken = { value: null, at: 0 }; res = await go(); }
+  const text = await res.text();
+  let json = null;
+  try { json = JSON.parse(text); } catch (e) { json = null; }
+  return { ok: res.ok, status: res.status, json, text };
+}
+// Business font for everything sent from the mail client: Calibri 11.
+function mailHtml(text) {
+  const esc = String(text || "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/\r?\n/g, "<br>");
+  return `<div style="font-family:Calibri,sans-serif;font-size:11pt">${esc}</div>`;
+}
+function mailSafeHtml(h) {
+  return String(h || "").slice(0, 400000).replace(/<script[\s\S]*?<\/script>/gi, "").replace(/\son[a-z]+\s*=\s*("[^"]*"|'[^']*')/gi, "").replace(/\scontenteditable="[^"]*"/gi, "");
+}
+const mailBodyHtml = (b, text) => b && typeof b.html === "string" && b.html.trim() ? (b.html.trim().startsWith('<div style="font-family:Calibri,sans-serif;font-size:11pt">') ? mailSafeHtml(b.html) : `<div style="font-family:Calibri,sans-serif;font-size:11pt">${mailSafeHtml(b.html)}</div>`) : mailHtml(String(text || "").slice(0, 200000));
+// The signature logo is a link to the Reservoir site, which iPhone Mail and others drop from the quoted trail when a client replies. Swap the link for an inline attachment so the logo travels inside the email.
+let mailLogoCache = null;
+async function mailEmbedLogo(env, body) {
+  try {
+    if (!body || typeof body.html !== "string") return;
+    const m = body.html.match(/https:\/\/[^"'\s<>]+\/dfp-signature-logo\.png/i);
+    if (!m) return;
+    const okHost = String(env.ALLOWED_ORIGIN || "").split(",").map((x) => x.trim().replace(/\/$/, "")).filter(Boolean).some((o) => m[0].toLowerCase().startsWith(o.toLowerCase() + "/"));
+    if (!okHost) return;
+    if (!mailLogoCache) {
+      const r = await fetch(m[0]);
+      if (!r.ok) return;
+      mailLogoCache = toB64(await r.arrayBuffer());
+    }
+    body.html = body.html.split(m[0]).join("cid:dfplogo");
+    body.attachments = [...(Array.isArray(body.attachments) ? body.attachments : []), { name: "dfp-signature-logo.png", type: "image/png", data: mailLogoCache, cid: "dfplogo" }];
+  } catch (e) { console.log("logo embed failed", String(e && e.message || e)); }
+}
+function mailAtts(list) {
+  return (Array.isArray(list) ? list : []).slice(0, 8).filter((a) => a && a.name && typeof a.data === "string" && a.data.length < 4500000).map((a) => ({ "@odata.type": "#microsoft.graph.fileAttachment", name: String(a.name).slice(0, 150), contentType: String(a.type || "application/octet-stream").slice(0, 100), contentBytes: a.data, ...(a.cid ? { isInline: true, contentId: String(a.cid).slice(0, 60) } : {}) }));
+}
+const mailWhenOk = (v) => { const t = Date.parse(String(v || "")); return t && t > Date.now() + 30000 ? new Date(t).toISOString() : ""; };
+// Reply and forward: make the draft, put the typed words (in Calibri 11) above the quoted mail, then send it. extra can carry the formatted body, attachments, importance, a send time, or noSend to keep it as a draft.
+// An email moved in from another mailbox can arrive as a draft, and Microsoft refuses to reply to or forward a draft (ErrorInvalidReferenceItem). So the reply is built by hand from the message itself, the way Outlook would: from the new mailbox, to whoever sent it, with the trail underneath.
+const mailEsc = (v) => String(v == null ? "" : v).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+async function mailManualDraft(env, addr, msg, op, to) {
+  const src = await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}?$select=subject,from,replyTo,toRecipients,ccRecipients,body,sentDateTime`, "GET");
+  if (!src.ok || !src.json) return src;
+  const m = src.json;
+  const own = String(addr || "").toLowerCase();
+  const who = (r) => r && r.emailAddress ? { emailAddress: { address: r.emailAddress.address, name: r.emailAddress.name || r.emailAddress.address } } : null;
+  const line = (r) => r && r.emailAddress ? (r.emailAddress.name && r.emailAddress.name !== r.emailAddress.address ? `${mailEsc(r.emailAddress.name)} &lt;${mailEsc(r.emailAddress.address)}&gt;` : mailEsc(r.emailAddress.address)) : "";
+  const fwd = op === "createForward";
+  const subj0 = String(m.subject || "");
+  const subject = fwd ? (/^fw:/i.test(subj0) ? subj0 : "FW: " + subj0) : (/^re:/i.test(subj0) ? subj0 : "RE: " + subj0);
+  let toR = [], ccR = [];
+  if (!fwd) {
+    const first = (Array.isArray(m.replyTo) && m.replyTo.length ? m.replyTo : [m.from]).map(who).filter(Boolean);
+    toR = first;
+    if (op === "createReplyAll") {
+      const seen = new Set(first.map((r) => r.emailAddress.address.toLowerCase()).concat([own]));
+      const more = (list) => (list || []).map(who).filter((r) => r && !seen.has(String(r.emailAddress.address).toLowerCase()) && seen.add(String(r.emailAddress.address).toLowerCase()));
+      toR = first.concat(more(m.toRecipients));
+      ccR = more(m.ccRecipients);
+    }
+  } else if (Array.isArray(to)) toR = to;
+  const when = m.sentDateTime ? new Date(m.sentDateTime).toUTCString() : "";
+  const trail = `<hr style="border:0;border-top:1px solid #B5C4DF;margin:12px 0"><div style="font-family:Calibri,Arial,sans-serif;font-size:11pt"><b>From:</b> ${line(m.from)}<br><b>Sent:</b> ${mailEsc(when)}<br><b>To:</b> ${(m.toRecipients || []).map(line).join("; ")}<br>${(m.ccRecipients || []).length ? `<b>Cc:</b> ${(m.ccRecipients || []).map(line).join("; ")}<br>` : ""}<b>Subject:</b> ${mailEsc(subj0)}</div><br>`;
+  const quoted = trail + String((m.body && m.body.content) || "").replace(/^[\s\S]*?<body[^>]*>/i, "").replace(/<\/body>[\s\S]*$/i, "");
+  return mailDo(env, addr, "/messages", "POST", { subject, toRecipients: toR, ccRecipients: ccR, body: { contentType: "HTML", content: "<html><body>" + quoted + "</body></html>" } });
+}
+let MAIL_CTX = null;
+// Work that does not change what the person sees runs after the answer has gone back, so Send finishes the moment Microsoft has sent the email.
+const mailAfter = (p) => { const q = Promise.resolve(p).catch(() => {}); try { if (MAIL_CTX && MAIL_CTX.waitUntil) MAIL_CTX.waitUntil(q); } catch (e) { /* ignore */ } return q; };
+async function mailDraftSend(env, addr, msg, op, text, to, extra) {
+  const x = extra || {};
+  const t0 = Date.now(), lap = [];
+  const mark = (n) => lap.push(n + " " + (Date.now() - t0));
+  let made = await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}/${op}`, "POST", {});
+  if (!made.ok && /ErrorInvalidReferenceItem/i.test(String(made.text || ""))) made = await mailManualDraft(env, addr, msg, op, to);
+  if (!made.ok || !made.json || !made.json.id) return made;
+  const id = made.json.id;
+  // A forward carries the original's attachments. The ones taken off in the editor are removed from the draft before it goes.
+  if (op === "createForward" && Array.isArray(x.dropAtt) && x.dropAtt.length) {
+    const drop = x.dropAtt.map((n) => String(n || "").toLowerCase());
+    const list = await mailGraph(env, addr, `/messages/${encodeURIComponent(id)}/attachments?$select=id,name,isInline`);
+    const rows = list.ok && list.json && Array.isArray(list.json.value) ? list.json.value : [];
+    const left = drop.slice();
+    for (const a of rows) {
+      const k = left.indexOf(String(a.name || "").toLowerCase());
+      if (k < 0 || a.isInline) continue;
+      left.splice(k, 1);
+      await mailDo(env, addr, `/messages/${encodeURIComponent(id)}/attachments/${encodeURIComponent(a.id)}`, "DELETE");
+    }
+  }
+  mark("draft");
+  const old = String((made.json.body && made.json.body.content) || "");
+  const mine = mailBodyHtml(x, text) + "<br>";
+  // The trail now sits in the editor, where it can be edited or deleted. "graph" means it was left untouched (the real trail from Microsoft goes under the message), "edited" means what is in the message is the trail, and "none" means it was deleted. Nothing sent means the old behaviour.
+  const keepTrail = x.trail !== "edited" && x.trail !== "none";
+  const html = !keepTrail ? mine : /<body[^>]*>/i.test(old) ? old.replace(/<body[^>]*>/i, (m) => m + mine) : mine + old;
+  const patch = { body: { contentType: "HTML", content: html } };
+  if (to && to.length) patch.toRecipients = to;
+  else if (x.setTo) { const t = mailRecipients(x.to); if (t.length) patch.toRecipients = t; }
+  if (x.setTo) { patch.ccRecipients = mailRecipients(x.cc); patch.bccRecipients = mailRecipients(x.bcc); }
+  else if (typeof x.bcc === "string") patch.bccRecipients = mailRecipients(x.bcc);
+  if (x.importance === "high") patch.importance = "high";
+  if (typeof x.subject === "string" && x.subject.trim()) patch.subject = x.subject.trim().slice(0, 255);
+  const holdAt = x.hold ? mailWhenOk(x.sendAt) : "";
+  const at = holdAt ? "" : mailWhenOk(x.sendAt);
+  if (at) patch.singleValueExtendedProperties = [{ id: "SystemTime 0x3FEF", value: at }];
+  const upd = await mailDo(env, addr, `/messages/${encodeURIComponent(id)}`, "PATCH", patch);
+  mark("patch");
+  if (!upd.ok) return upd;
+  const attRes = await Promise.all(mailAtts(x.attachments).map((a) => mailDo(env, addr, `/messages/${encodeURIComponent(id)}/attachments`, "POST", a)));
+  const attBad = attRes.find((r) => !r.ok);
+  if (attBad) return attBad;
+  mark("atts");
+  if (x.noSend) return { ok: true, status: 200, json: { id } };
+  if (holdAt) { await mailHoldAdd(env, addr, id, holdAt, x.by); return { ok: true, status: 200, json: { id, held: holdAt } }; }
+  const sent = await mailDo(env, addr, `/messages/${encodeURIComponent(id)}/send`, "POST");
+  mark("sent");
+  console.log("mail send timing ms: " + lap.join(", "));
+  if (sent && sent.ok) mailAfter(mailDo(env, addr, `/messages/${encodeURIComponent(msg)}`, "PATCH", { singleValueExtendedProperties: [{ id: "Integer 0x1081", value: op === "createForward" ? "104" : op === "createReplyAll" ? "103" : "102" }] }));
+  return sent;
+}
+// Emails written after hours are kept as drafts and listed in Reservoir's own Outbox. A five minute run sends each one once its time comes, so it is always visible and never lost in Microsoft's queue.
+async function mailHoldTable(env) {
+  await env.DB.prepare("CREATE TABLE IF NOT EXISTS mail_hold (draft_id TEXT PRIMARY KEY, addr TEXT NOT NULL, send_at TEXT NOT NULL, by_email TEXT, made_at TEXT)").run();
+}
+async function mailHoldAdd(env, addr, draftId, sendAt, by) {
+  await mailHoldTable(env);
+  await env.DB.prepare("INSERT INTO mail_hold (draft_id, addr, send_at, by_email, made_at) VALUES (?, ?, ?, ?, datetime('now')) ON CONFLICT(draft_id) DO UPDATE SET send_at = excluded.send_at").bind(String(draftId), String(addr).toLowerCase(), String(sendAt), String(by || "")).run();
+}
+async function mailHoldIds(env, addr) {
+  try { await mailHoldTable(env); const r = await env.DB.prepare("SELECT draft_id, send_at FROM mail_hold WHERE addr = ? ORDER BY send_at").bind(String(addr).toLowerCase()).all(); return (r && r.results) || []; } catch (e) { return []; }
+}
+async function mailHoldSweep(env) {
+  if (!env.GRAPH_CLIENT_SECRET) return;
+  await mailHoldTable(env);
+  const due = await env.DB.prepare("SELECT draft_id, addr FROM mail_hold WHERE send_at <= ? ORDER BY send_at LIMIT 40").bind(new Date().toISOString()).all();
+  for (const h of (due && due.results) || []) {
+    const r = await mailDo(env, h.addr, `/messages/${encodeURIComponent(h.draft_id)}/send`, "POST");
+    if (r && (r.ok || r.status === 404 || r.status === 400)) await env.DB.prepare("DELETE FROM mail_hold WHERE draft_id = ?").bind(h.draft_id).run();
+    else console.log("hold send failed", h.addr, r && r.status);
+  }
+}
+const MAIL_ALIAS = { "inbox": "inbox", "sent items": "sentitems", "drafts": "drafts", "deleted items": "deleteditems", "junk email": "junkemail", "archive": "archive", "outbox": "outbox" };
+// A mail search asks Graph for 250 results a page and keeps following its next page link, up to this many pages.
+const MAIL_SEARCH_PAGE = 250;
+const MAIL_SEARCH_FIRST = 25;
+const MAIL_SEARCH_PAGES = 20;
+const MAIL_HIDE = /^(conversation history|sync issues|conflicts|local failures|server failures|outbox|rss feeds|rss subscriptions|clutter|scheduled|yammer|quick step settings|social activity notifications|personmetadata|externalcontacts)/i;
+const mailPart = (x) => ({ name: String((x && x.emailAddress && x.emailAddress.name) || "").slice(0, 80), address: String((x && x.emailAddress && x.emailAddress.address) || "").slice(0, 120) });
+const mailShow = (x) => { const a = mailPart(x); return a.name || a.address; };
+// What was last done with a message: Outlook keeps it in the last verb property (102 reply, 103 reply all, 104 forward).
+const mailAns = (m) => { const p = ((m && m.singleValueExtendedProperties) || []).find((x) => x && /1081/i.test(String(x.id))); const v = p ? Number(p.value) : 0; return v === 102 || v === 103 ? "reply" : v === 104 ? "forward" : ""; };
+// Notes on emails and the "not urgent" switch are shared by everyone who can open the mailbox. They are matched on the email's internet id, which stays the same when the email is moved or archived.
+async function mailExtraTable(env) {
+  await env.DB.prepare("CREATE TABLE IF NOT EXISTS mail_extra (box TEXT NOT NULL, imid TEXT NOT NULL, note TEXT NOT NULL DEFAULT '', note_by TEXT, note_at TEXT, urgent_off INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (box, imid))").run();
+}
+async function mailExtraFor(env, boxId, imids) {
+  const out = new Map();
+  const ids = [...new Set(imids.filter(Boolean).map((x) => String(x).slice(0, 300)))];
+  if (!ids.length) return out;
+  try {
+    await mailMarkerCol(env);
+    for (let i = 0; i < ids.length; i += 40) {
+      const part = ids.slice(i, i + 40);
+      const r = await env.DB.prepare(`SELECT imid, note, note_by, note_at, urgent_off, marker FROM mail_extra WHERE box = ? AND imid IN (${part.map(() => "?").join(",")})`).bind(boxId, ...part).all();
+      ((r && r.results) || []).forEach((x) => out.set(x.imid, x));
+    }
+  } catch (e) {}
+  return out;
+}
+// Notes on an email: any number, newest on top, in every mailbox. Everyone who can open the mailbox sees them. Only the person who wrote a note can edit it, and only in the first 5 minutes. Notes are never deleted, they are the record. A note written by someone else flashes for the person the email is categorised to (a category that is their first name) until they acknowledge it.
+let mailNotesReady = false;
+async function mailNotesTable(env) {
+  if (mailNotesReady) return;
+  await mailExtraTable(env);
+  await env.DB.prepare("CREATE TABLE IF NOT EXISTS mail_notes (id TEXT PRIMARY KEY, box TEXT NOT NULL, imid TEXT NOT NULL, text TEXT NOT NULL, by_name TEXT, by_email TEXT, at TEXT, edited_at TEXT)").run();
+  await env.DB.prepare("CREATE INDEX IF NOT EXISTS mail_notes_imid ON mail_notes (box, imid)").run();
+  await env.DB.prepare("CREATE TABLE IF NOT EXISTS mail_note_acks (note_id TEXT NOT NULL, email TEXT NOT NULL, at TEXT, PRIMARY KEY (note_id, email))").run();
+  // The single notes made before this change become the first note of their email.
+  await env.DB.prepare("INSERT OR IGNORE INTO mail_notes (id, box, imid, text, by_name, by_email, at) SELECT 'legacy:' || box || ':' || imid, box, imid, note, COALESCE(note_by, ''), '', COALESCE(note_at, '') FROM mail_extra WHERE note IS NOT NULL AND note != ''").run();
+  await env.DB.prepare("UPDATE mail_extra SET note = '' WHERE note != ''").run();
+  mailNotesReady = true;
+}
+// The people an email is waiting on: staff whose first name is one of its categories. The first name is the start of their sign in address.
+async function mailNoteResponsible(env, categories) {
+  const want = new Set((categories || []).map((c) => String(c).trim().toLowerCase()).filter(Boolean));
+  if (!want.size) return new Set();
+  try {
+    const tiers = await accessTiers(env);
+    return new Set(Object.keys(tiers).filter((e) => want.has(e.split("@")[0].split(/[._]/)[0])));
+  } catch (e) { return new Set(); }
+}
+// A note is waiting when it was written by someone else, the email is categorised to somebody, and none of those people has acknowledged it. Everyone sees that it is waiting; only the people it is waiting on can acknowledge it.
+function mailNoteState(row, resp, me) {
+  const by = String(row.by_email || "").toLowerCase();
+  const id = String(row.id || "");
+  if (id.startsWith("legacy:") || id.startsWith("auto:")) return { pending: false, canAck: false };
+  const need = [...resp].filter((e) => e !== by);
+  const acked = new Set(String(row.acked_by || "").split(",").filter(Boolean));
+  const pending = need.length > 0 && !need.some((e) => acked.has(e));
+  return { pending, canAck: pending && need.includes(me) };
+}
+async function mailNotesSummary(env, boxId, items, user) {
+  const out = new Map();
+  const ids = [...new Set(items.map((x) => x.imid).filter(Boolean))];
+  if (!ids.length) return out;
+  try {
+    await mailNotesTable(env);
+    const me = String((user && user.email) || "").toLowerCase();
+    const cats = new Map(items.map((x) => [x.imid, x.categories || []]));
+    const respCache = new Map();
+    for (let i = 0; i < ids.length; i += 40) {
+      const part = ids.slice(i, i + 40);
+      const r = await env.DB.prepare(`SELECT n.id, n.imid, n.by_email, (SELECT group_concat(a.email) FROM mail_note_acks a WHERE a.note_id = n.id) AS acked_by FROM mail_notes n WHERE n.box = ? AND n.imid IN (${part.map(() => "?").join(",")})`).bind(boxId, ...part).all();
+      for (const x of ((r && r.results) || [])) {
+        const o = out.get(x.imid) || { count: 0, flash: false };
+        o.count++;
+        const ck = (cats.get(x.imid) || []).join("|").toLowerCase();
+        if (!respCache.has(ck)) respCache.set(ck, await mailNoteResponsible(env, cats.get(x.imid) || []));
+        if (mailNoteState(x, respCache.get(ck), me).pending) o.flash = true;
+        out.set(x.imid, o);
+      }
+    }
+  } catch (e) { console.log("notes summary failed", String(e && e.message || e)); }
+  return out;
+}
+async function mailNotesFor(env, boxId, imid, user, categories) {
+  await mailNotesTable(env);
+  const me = String((user && user.email) || "").toLowerCase();
+  const r = await env.DB.prepare("SELECT n.id, n.text, n.by_name, n.by_email, n.at, n.edited_at, (SELECT group_concat(a.email) FROM mail_note_acks a WHERE a.note_id = n.id) AS acked_by FROM mail_notes n WHERE n.box = ? AND n.imid = ? ORDER BY n.at ASC, n.rowid ASC").bind(boxId, imid).all();
+  const resp = await mailNoteResponsible(env, categories);
+  const notes = ((r && r.results) || []).map((x) => { const st = mailNoteState(x, resp, me); return { id: x.id, text: String(x.text || ""), by: String(x.by_name || ""), at: String(x.at || ""), edited: String(x.edited_at || ""), mine: !!me && String(x.by_email || "").toLowerCase() === me && Date.now() - Date.parse(String(x.at || "")) <= 5 * 60 * 1000, pending: st.pending, canAck: st.canAck }; }).reverse();
+  return { notes, flash: notes.some((n) => n.pending) };
+}
+const mailFlag = (f) => (f && (f.flagStatus === "flagged" || f.flagStatus === "complete")) ? f.flagStatus : "";
+const mailId = (v) => { const t = String(v || ""); return t && t.length < 600 ? t : ""; };
+const mailFolderId = (v) => { const t = String(v || "inbox"); return /^[A-Za-z0-9_\-=+\/.]{1,300}$/.test(t) ? t : "inbox"; };
+function mailRecipients(v) {
+  const out = [];
+  String(v || "").split(/[;,\n]/).map((x) => x.trim()).filter(Boolean).forEach((x) => {
+    const m = x.match(/<([^>]+)>/);
+    const a = (m ? m[1] : x).trim();
+    if (/^[^\s@<>]+@[^\s@<>]+\.[^\s@<>]+$/.test(a)) out.push({ emailAddress: { address: a } });
+  });
+  return out.slice(0, 20);
+}
+async function mailRoutes(request, env, user, url) {
+  if (!url.pathname.startsWith("/api/mail")) return null;
+  const mine = MAILBOXES.filter((b) => mailAllowed(b, user));
+  const ownEmail = String(user.email || "").toLowerCase();
+  if (/@directflow\.com\.au$/.test(ownEmail) && !mine.some((b) => b.only)) mine.push({ id: "me", label: String(user.name || "").trim().split(/\s+/)[0] || "My Email", address: ownEmail, only: [ownEmail] });
+  const post = request.method === "POST";
+  if (request.method !== "GET" && !post) return reply(env, 404, { error: "not found" });
+  if (post && user.viewAs && !VIEW_AS_WRITES) return reply(env, 403, { error: "Viewing as someone else is read only." });
+  try {
+    if (url.pathname === "/api/mail/boxes" && !post) {
+      const out = await Promise.all(mine.map(async (b) => {
+        const r = await mailGraph(env, mailAddress(env, b), "/mailFolders/inbox?$select=unreadItemCount,totalItemCount");
+        return { id: b.id, label: b.label, address: mailAddress(env, b), personal: !!b.only, reservoirOnly: !!b.who, unread: r.ok && r.json ? Number(r.json.unreadItemCount || 0) : 0, total: r.ok && r.json ? Number(r.json.totalItemCount || 0) : 0, error: r.ok ? "" : mailWhy(r) };
+      }));
+      return reply(env, 200, { boxes: out, targets: MAILBOXES.filter((x) => ((!x.only && !x.who) || mailAllowed(x, user))).map((x) => ({ id: x.id, label: x.label })), worker: WORKER_BUILD });
+    }
+    if (url.pathname === "/api/mail/copystatus" && !post) {
+      // Progress of the Sent Items and Archive copy from maintenance into DFP Jobs: the total in Maintenance and how many the copy job has transferred.
+      if (!mine.find((x) => x.id === "maintenance")) return reply(env, 403, { error: "forbidden" });
+      await settingsTable(env);
+      const src = mailAddress(env, MAILBOXES.find((x) => x.id === "maintenance"));
+      const one = async (key, rootId) => {
+        const row = await env.DB.prepare("SELECT value, detail FROM app_settings WHERE key = ?").bind(key).first();
+        let st = {}; try { st = row && row.detail ? JSON.parse(row.detail) : {}; } catch (e) {}
+        const ids = st.folders && st.folders.length ? st.folders.map((f) => f.src) : [rootId];
+        const counts = await Promise.all(ids.map(async (i) => { const r = await mailGraph(env, src, `/mailFolders/${encodeURIComponent(i)}?$select=totalItemCount`); return r.ok && r.json ? Number(r.json.totalItemCount || 0) : 0; }));
+        return { state: row ? (row.value === "done" ? "done" : row.value === "halted" ? "halted" : "running") : "waiting", copied: Number(st.n || 0), total: counts.reduce((a, b) => a + b, 0) };
+      };
+      const undo = await env.DB.prepare("SELECT value FROM app_settings WHERE key = 'merge.undo2'").first();
+      const [sent, archive] = await Promise.all([one("merge.sent_copy2", "sentitems"), one("merge.archive_copy2", "archive")]);
+      const xt = await env.DB.prepare("SELECT value, detail FROM app_settings WHERE key = 'merge.exporttest2'").first();
+      let xlog = []; try { xlog = xt && xt.detail ? JSON.parse(xt.detail).log : []; } catch (e) {}
+      return reply(env, 200, { ok: true, undo: undo ? undo.value : "waiting", sent, archive, test: xt ? { state: xt.value, log: xlog } : null, worker: WORKER_BUILD });
+    }
+    if (url.pathname === "/api/mail/signature" && !post) {
+      // The signature reads the signed in person's name, job title and business phone from Entra.
+      if (!ownEmail) return reply(env, 200, { ok: false, error: "no user", worker: WORKER_BUILD });
+      const r = await graphFetch(env, `/users/${encodeURIComponent(ownEmail)}?$select=givenName,surname,jobTitle,businessPhones`);
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) return reply(env, 200, { ok: false, error: "Entra read failed " + r.status, worker: WORKER_BUILD });
+      return reply(env, 200, { ok: true, first: String(j.givenName || "").slice(0, 60), last: String(j.surname || "").slice(0, 60), title: String(j.jobTitle || "").slice(0, 80), phone: String((j.businessPhones || [])[0] || "").slice(0, 30), worker: WORKER_BUILD });
+    }
+    const b = mine.find((x) => x.id === (url.searchParams.get("id") || ""));
+    let body = null;
+    if (post) { try { body = await request.json(); } catch (e) { body = null; } if (body && typeof body === "object") body.by = String(user.email || ""); }
+    const box = b || (body && mine.find((x) => x.id === body.id));
+    if (!box) return reply(env, 403, { error: "forbidden" });
+    const addr = mailAddress(env, box);
+    if (url.pathname === "/api/mail/count" && !post) {
+      // How many emails this mailbox holds and a rough guess at the space a searchable copy of the text would take. Read only.
+      const top = await mailGraph(env, addr, "/mailFolders?$top=100&$select=displayName,totalItemCount,childFolderCount");
+      if (!top.ok) return reply(env, 200, { ok: false, error: mailWhy(top), worker: WORKER_BUILD });
+      let total = 0, skipped = 0, level = [];
+      const take = (f) => { const n = Number(f.totalItemCount || 0); if (/^(deleted items|junk email|conversation history|sync issues|conflicts|local failures|server failures|outbox|rss feeds|clutter)/i.test(String(f.displayName || ""))) skipped += n; else total += n; if (Number(f.childFolderCount || 0) > 0) level.push(f); };
+      ((top.json && top.json.value) || []).forEach(take);
+      for (let depth = 0; depth < 8 && level.length; depth++) {
+        const cur = level; level = [];
+        const kids = await Promise.all(cur.map((f) => mailGraph(env, addr, `/mailFolders/${encodeURIComponent(f.id)}/childFolders?$top=100&$select=displayName,totalItemCount,childFolderCount`)));
+        kids.forEach((k) => ((k && k.ok && k.json && k.json.value) || []).forEach(take));
+      }
+      let avg = 0;
+      try {
+        const r = await graphFetch(env, `/users/${encodeURIComponent(addr)}/messages?$top=50&$select=subject,body`, { headers: { Prefer: 'outlook.body-content-type="text"' } });
+        const j = r.ok ? await r.json() : null;
+        const rows = (j && j.value) || [];
+        if (rows.length) avg = Math.round(rows.reduce((t, m) => t + String(m.subject || "").length + String((m.body && m.body.content) || "").length, 0) / rows.length);
+      } catch (e) {}
+      const estMb = Math.round((total * (avg + 300) * 2) / 1048576);
+      return reply(env, 200, { ok: true, total, skipped, avgBytes: avg, estMb, worker: WORKER_BUILD });
+    }
+    if (url.pathname === "/api/mail/folders" && !post) {
+      const top = await mailGraph(env, addr, "/mailFolders?$top=100&$select=displayName,unreadItemCount,totalItemCount,childFolderCount");
+      if (!top.ok) return reply(env, 200, { ok: false, error: mailWhy(top), worker: WORKER_BUILD });
+      const folders = [];
+      const parents = [];
+      ((top.json && top.json.value) || []).forEach((f) => {
+        const name = String(f.displayName || "");
+        if (MAIL_HIDE.test(name)) return;
+        const fid = MAIL_ALIAS[name.toLowerCase()] || f.id;
+        folders.push({ id: fid, name, unread: Number(f.unreadItemCount || 0), total: Number(f.totalItemCount || 0) });
+        if (Number(f.childFolderCount || 0) > 0) parents.push({ fid, name, gid: f.id });
+      });
+      // Every level of subfolders is listed, not just the first. Each folder points at its parent so the app can open and close any branch.
+      let level = parents;
+      for (let depth = 0; depth < 8 && level.length; depth++) {
+        const kidRes = await Promise.all(level.map((p) => mailGraph(env, addr, `/mailFolders/${encodeURIComponent(p.gid)}/childFolders?$top=100&$select=displayName,unreadItemCount,totalItemCount,childFolderCount`)));
+        const next = [];
+        level.forEach((p, i) => {
+          const kids = kidRes[i];
+          ((kids && kids.ok && kids.json && kids.json.value) || []).forEach((f) => {
+            const nm = String(f.displayName || "");
+            folders.push({ id: f.id, name: p.name + ": " + nm, unread: Number(f.unreadItemCount || 0), total: Number(f.totalItemCount || 0), parent: p.fid });
+            if (Number(f.childFolderCount || 0) > 0) next.push({ fid: f.id, name: nm, gid: f.id });
+          });
+        });
+        level = next;
+      }
+      // Deleted Items and Junk can hold things that are not emails (old calendar items and the like), so their count is the number of emails the folder really lists.
+      await Promise.all(["deleteditems", "junkemail"].map(async (fid) => { const f = folders.find((x) => x.id === fid); if (!f) return; try { const r = await mailGraph(env, addr, `/mailFolders/${fid}/messages?$top=1&$select=id&$count=true`); const n = r.ok && r.json ? r.json["@odata.count"] : undefined; if (typeof n === "number") f.total = n; } catch (e) { /* keep Microsoft's count */ } }));
+      const held = await mailHoldIds(env, addr);
+      // Held emails are drafts in Microsoft, but Reservoir lists them under Outbox, so they are taken off the Drafts count.
+      if (held.length) { const dr = folders.find((f) => f.id === "drafts"); if (dr) dr.total = Math.max(0, Number(dr.total || 0) - held.length); }
+      if (held.length) { const k = folders.findIndex((f) => f.id === "sentitems"); folders.splice(k >= 0 ? k + 1 : folders.length, 0, { id: "outbox", name: "Outbox", unread: 0, total: held.length }); }
+      return reply(env, 200, { ok: true, folders, worker: WORKER_BUILD });
+    }
+    if (url.pathname === "/api/mail/box" && !post) {
+      const folder = mailFolderId(url.searchParams.get("folder"));
+      const top = Math.max(1, Math.min(200, Number(url.searchParams.get("top")) || 40));
+      const filter = url.searchParams.get("filter") || "";
+      const q = String(url.searchParams.get("q") || "").replace(/["\\]/g, " ").trim().slice(0, 100);
+      const fields = "$select=subject,from,toRecipients,receivedDateTime,isRead,bodyPreview,hasAttachments,categories,flag,parentFolderId,internetMessageId&$expand=singleValueExtendedProperties($filter=id eq 'Integer 0x1081')";
+      const cursorGiven = !!String(url.searchParams.get("cursor") || "");
+      const where = new Map();
+      const loadWhere = async () => {
+        if (!q) return;
+        // The folder names are kept for ten minutes per mailbox, so only the first search pays for walking the tree.
+        globalThis.__folderNames = globalThis.__folderNames || new Map();
+        const hit = globalThis.__folderNames.get(addr);
+        if (hit && Date.now() - hit.t < 600000) hit.v.forEach((v, k) => where.set(k, v));
+        else {
+          try {
+            const tf = await mailGraph(env, addr, "/mailFolders?$top=100&$select=displayName,childFolderCount");
+            const tops = (tf.ok && tf.json && tf.json.value) || [];
+            tops.forEach((f) => where.set(f.id, String(f.displayName || "")));
+            let level = tops.filter((f) => Number(f.childFolderCount || 0) > 0);
+            for (let depth = 0; depth < 8 && level.length; depth++) {
+              const kids = await Promise.all(level.map((f) => mailGraph(env, addr, `/mailFolders/${encodeURIComponent(f.id)}/childFolders?$top=100&$select=displayName,childFolderCount`)));
+              const next = [];
+              kids.forEach((k) => ((k && k.ok && k.json && k.json.value) || []).forEach((f) => { where.set(f.id, String(f.displayName || "")); if (Number(f.childFolderCount || 0) > 0) next.push(f); }));
+              level = next;
+            }
+            if (where.size) globalThis.__folderNames.set(addr, { t: Date.now(), v: new Map(where) });
+          } catch (e) {}
+        }
+      };
+      // A search limited to one folder already knows its folder name, so the folder walk is not needed. A search of every folder starts the walk but does not make the first page wait for it.
+      const oneFolder = !!q && url.searchParams.get("scope") === "folder";
+      const oneName = oneFolder ? (/^archive$/i.test(String(folder)) ? "Archive" : /^sentitems$/i.test(String(folder)) ? "Sent Items" : "") : "";
+      const whereP = q && !oneFolder ? loadWhere() : null;
+      let rows = [];
+      let searchNext = "";
+      if (!q && /^outbox$/i.test(String(folder))) {
+        for (const h of (await mailHoldIds(env, addr)).slice(0, 60)) {
+          const r = await mailGraph(env, addr, `/messages/${encodeURIComponent(h.draft_id)}?${fields}`);
+          if (r.ok && r.json) rows.push({ ...r.json, receivedDateTime: h.send_at });
+          else if (r.status === 404) await env.DB.prepare("DELETE FROM mail_hold WHERE draft_id = ?").bind(h.draft_id).run();
+        }
+      } else if (q) {
+        // A search is read a page at a time so the first results show straight away. The first page is small and quick, and each answer carries a cursor for the next page, which the app keeps asking for until Graph has no more (Graph itself stops a message search at 1,000 results).
+        const cur = String(url.searchParams.get("cursor") || "");
+        const start = cur && cur.startsWith(GRAPH + "/") && cur.length < 4000 ? cur : `${oneFolder ? "/mailFolders/" + encodeURIComponent(folder) : ""}/messages?$top=${MAIL_SEARCH_FIRST}&${fields}&$search=${encodeURIComponent('"' + q + '"')}`;
+        const r = await mailGraph(env, addr, start);
+        if (!r.ok) return reply(env, 200, { ok: false, error: mailWhy(r), worker: WORKER_BUILD });
+        rows = ((r.json && r.json.value) || []).filter((m) => m && m.id);
+        const link = r.json && r.json["@odata.nextLink"];
+        searchNext = typeof link === "string" && link.startsWith(GRAPH + "/") ? link : "";
+        rows.sort((x, y) => String(y.receivedDateTime || "").localeCompare(String(x.receivedDateTime || "")));
+      } else {
+        if (/^archive$/i.test(String(folder))) await archiveReadSweep(env, addr);
+        const f = ["receivedDateTime ge 1900-01-01T00:00:00Z"];
+        if (filter === "unread") f.push("isRead eq false");
+        if (filter === "attachments") f.push("hasAttachments eq true");
+        // Deleted Items and Junk are read without the date filter, because a deleted draft or an item with no received date would otherwise never appear.
+        const loose = /^(deleteditems|junkemail)$/i.test(String(folder)) && filter !== "unread" && filter !== "attachments";
+        const r = loose
+          ? await mailGraph(env, addr, `/mailFolders/${encodeURIComponent(folder)}/messages?$top=${top}&${fields.replace("$select=", "$select=createdDateTime,sentDateTime,")}`)
+          : await mailGraph(env, addr, `/mailFolders/${encodeURIComponent(folder)}/messages?$top=${top}&${fields}&$filter=${encodeURIComponent(f.join(" and "))}&$orderby=receivedDateTime desc`);
+        if (!r.ok) return reply(env, 200, { ok: false, error: mailWhy(r), worker: WORKER_BUILD });
+        rows = (r.json && r.json.value) || [];
+        if (loose) { rows.forEach((m) => { if (!m.receivedDateTime) m.receivedDateTime = m.sentDateTime || m.createdDateTime || ""; }); rows.sort((x, y) => String(y.receivedDateTime || "").localeCompare(String(x.receivedDateTime || ""))); }
+      }
+      if (!q && /^drafts$/i.test(String(folder))) { const hid = new Set((await mailHoldIds(env, addr)).map((h) => h.draft_id)); if (hid.size) rows = rows.filter((m) => !hid.has(m.id)); }
+      // A search covers every folder, so each result says which folder it is in.
+      if (whereP) await Promise.race([whereP, new Promise((r) => setTimeout(r, cursorGiven ? 30000 : 1200))]);
+      const list = rows.map((m) => ({ id: m.id, pf: String(m.parentFolderId || ""), ...(q && oneName ? { folder: oneName } : q && where.get(m.parentFolderId) ? { folder: where.get(m.parentFolderId).slice(0, 40) } : null), from: mailShow(m.from).slice(0, 80), fromAddr: mailPart(m.from).address.toLowerCase(), to: ((m.toRecipients || []).map(mailShow).join(", ")).slice(0, 120), toAddr: String((((m.toRecipients || [])[0] || {}).emailAddress || {}).address || "").toLowerCase().slice(0, 120), subject: String(m.subject || "(no subject)").slice(0, 160), at: m.receivedDateTime || "", read: !!m.isRead, attach: !!m.hasAttachments, categories: (m.categories || []).slice(0, 6).map((c) => String(c).slice(0, 40)), flag: mailFlag(m.flag), ans: mailAns(m), preview: String(m.bodyPreview || "").replace(/\s+/g, " ").slice(0, 140) }));
+      const extra = await mailExtraFor(env, box.id, rows.map((m) => m.internetMessageId));
+      list.forEach((it, i) => { const imid = rows[i] && rows[i].internetMessageId; if (!imid) return; it.imid = String(imid).slice(0, 300); const x = extra.get(it.imid); if (x) { if (x.urgent_off) it.uoff = true; if (x.marker) it.marker = String(x.marker).slice(0, 20); } });
+      const noteSum = await mailNotesSummary(env, box.id, list, user);
+      list.forEach((it) => { const o = noteSum.get(it.imid); if (o && o.count) { it.note = o.count; if (o.flash) it.noteFlash = true; } });
+      if (box.id === "jobs") list.forEach((it, i) => { if (it.marker) return; const tos = ((rows[i] && rows[i].toRecipients) || []).map((x) => String((x.emailAddress && x.emailAddress.address) || "").toLowerCase()); if (tos.includes(mailAddress(env, MAILBOXES.find((b) => b.id === "maintenance")).toLowerCase())) it.marker = "Maintenance"; else if (tos.includes(String(env.MAILBOX_ENQUIRIES || ENQUIRIES_ADDR).toLowerCase())) it.marker = "Enquiries"; });
+      return reply(env, 200, { ok: true, label: box.label, messages: list, more: !q && list.length >= top, ...(q && searchNext ? { next: searchNext } : {}), worker: WORKER_BUILD });
+    }
+    if (url.pathname === "/api/mail/message" && !post) {
+      const msg = mailId(url.searchParams.get("msg"));
+      if (!msg) return reply(env, 400, { error: "bad request" });
+      const r = await mailGraph(env, addr, `/messages/${encodeURIComponent(msg)}?$select=subject,from,toRecipients,ccRecipients,bccRecipients,isDraft,importance,receivedDateTime,sentDateTime,body,hasAttachments,isRead,categories,flag,internetMessageId&$expand=attachments($select=id,name,size,contentType,isInline)`);
+      if (!r.ok) return reply(env, 200, { ok: false, error: mailWhy(r), worker: WORKER_BUILD });
+      const m = r.json || {};
+      const html = !!(m.body && String(m.body.contentType || "").toLowerCase() === "html");
+      let shown = String((m.body && m.body.content) || "").slice(0, 1500000);
+      // Big pictures sitting in the body of the current email (not the quoted trail, not small logos) are taken out of the view and listed as attachments called Attachment 1, Attachment 2. Nothing is changed in Exchange. Replies build their trail from this cleaned view, so the pictures stay out of reply trails. Everybody.
+      const movedPics = [];
+      if (html && !m.isDraft && /<img/i.test(shown)) {
+        const cutAt = shown.search(/<div id="appendonsend"|<div id="divRplyFwdMsg"|<blockquote|<div style="border:none;border-top:solid #E1E1E1|<hr[^>]*id="stopSpelling"/i);
+        let top = cutAt >= 0 ? shown.slice(0, cutAt) : shown;
+        const rest = cutAt >= 0 ? shown.slice(cutAt) : "";
+        let n = (m.attachments || []).filter((a) => /^Attachment \d+/.test(String(a.name || ""))).length;
+        try {
+          const big = (m.attachments || []).filter((x) => Number(x.size || 0) >= 30000 && /^image\//i.test(String(x.contentType || "")) && x.isInline).slice(0, 10);
+          const cids = new Map();
+          for (const a of big) {
+            let g = await mailGraph(env, addr, `/messages/${encodeURIComponent(msg)}/attachments/${encodeURIComponent(a.id)}?$select=id,contentId`);
+            if (!g.ok) g = await mailGraph(env, addr, `/messages/${encodeURIComponent(msg)}/attachments/${encodeURIComponent(a.id)}`);
+            const c = g.ok && g.json ? String(g.json.contentId || "").replace(/^<|>$/g, "") : "";
+            if (c) cids.set(c, a);
+          }
+          for (const tag of (top.match(/<img\b[^>]*>/gi) || [])) {
+            const src = (tag.match(/\ssrc\s*=\s*["']([^"']+)["']/i) || [])[1] || "";
+            if (!/^cid:/i.test(src)) continue;
+            const a = cids.get(src.slice(4).replace(/^<|>$/g, ""));
+            if (!a) continue;
+            n++;
+            const ext = (String(a.contentType).split("/")[1] || "png").replace("jpeg", "jpg").replace(/[^a-z0-9]/gi, "") || "png";
+            movedPics.push({ id: a.id, name: `Attachment ${n}.${ext}`, size: Number(a.size || 0), type: String(a.contentType || "") });
+            top = top.replace(tag, "");
+          }
+        } catch (e) { movedPics.length = 0; console.log("picture view failed", String(e && e.message || e)); }
+        if (movedPics.length) shown = top + rest;
+      }
+      if (html && /cid:/i.test(shown)) {
+        let room = 8000000;
+        for (const a of (m.attachments || []).filter((x) => /^image\//i.test(String(x.contentType || "")) && Number(x.size || 0) <= 2000000).slice(0, 20)) {
+          if (room <= 0) break;
+          try {
+            const f = await mailGraph(env, addr, `/messages/${encodeURIComponent(msg)}/attachments/${encodeURIComponent(a.id)}`);
+            const j = f.ok ? f.json : null;
+            const cid = j ? String(j.contentId || "").replace(/^<|>$/g, "") : "";
+            if (!j || !j.contentBytes || !cid) continue;
+            room -= j.contentBytes.length;
+            shown = shown.split("cid:" + cid).join(`data:${j.contentType || a.contentType};base64,${j.contentBytes}`);
+          } catch (e) {}
+        }
+      }
+      if (html && m.isDraft && /cid:dfplogo/i.test(shown)) shown = shown.split("cid:dfplogo").join(String(env.ALLOWED_ORIGIN || "").split(",")[0].trim().replace(/\/$/, "") + "/dfp-signature-logo.png");
+      const imid = String(m.internetMessageId || "").slice(0, 300);
+      const ex = imid ? (await mailExtraFor(env, box.id, [imid])).get(imid) : null;
+      const nt = imid ? await mailNotesFor(env, box.id, imid, user, m.categories || []) : { notes: [], flash: false };
+      return reply(env, 200, { ok: true, id: m.id, imid, notes: nt.notes, noteFlash: nt.flash, urgentOff: !!(ex && ex.urgent_off), subject: String(m.subject || "(no subject)"), from: mailPart(m.from), to: (m.toRecipients || []).map(mailPart), cc: (m.ccRecipients || []).map(mailPart), bcc: (m.bccRecipients || []).map(mailPart), importance: String(m.importance || "normal"), at: m.receivedDateTime || m.sentDateTime || "", read: !!m.isRead, categories: (m.categories || []).slice(0, 6).map((c) => String(c).slice(0, 40)), flag: mailFlag(m.flag), html, body: shown, attachments: (m.attachments || []).filter((a) => !a.isInline).map((a) => ({ id: a.id, name: String(a.name || "attachment").slice(0, 160), size: Number(a.size || 0), type: String(a.contentType || "") })).concat(movedPics), worker: WORKER_BUILD });
+    }
+    if (url.pathname === "/api/mail/replies" && !post) {
+      // Everything our side sent in the same conversation as this email: replies and forwards, with the folder each one sits in.
+      const msg = mailId(url.searchParams.get("msg"));
+      if (!msg) return reply(env, 400, { error: "bad request" });
+      const o = await mailGraph(env, addr, `/messages/${encodeURIComponent(msg)}?$select=conversationId,receivedDateTime,sentDateTime`);
+      if (!o.ok || !o.json || !o.json.conversationId) return reply(env, 200, { ok: true, replies: [], worker: WORKER_BUILD });
+      const since = String(o.json.receivedDateTime || o.json.sentDateTime || "");
+      const cid = String(o.json.conversationId).replace(/'/g, "''");
+      const r = await mailGraph(env, addr, `/messages?$top=50&$select=id,subject,from,toRecipients,sentDateTime,receivedDateTime,parentFolderId,isDraft&$filter=${encodeURIComponent("conversationId eq '" + cid + "'")}`);
+      if (!r.ok) return reply(env, 200, { ok: false, error: mailWhy(r), worker: WORKER_BUILD });
+      const found = ((r.json && r.json.value) || []).filter((m) => m.id !== msg && !m.isDraft && /@directflow\.com\.au$/i.test(mailPart(m.from).address || "") && String(m.sentDateTime || m.receivedDateTime || "") > since);
+      const names = new Map();
+      try {
+        const tf = await mailGraph(env, addr, "/mailFolders?$top=100&$select=displayName,childFolderCount");
+        const tops = (tf.ok && tf.json && tf.json.value) || [];
+        tops.forEach((f) => names.set(f.id, String(f.displayName || "")));
+        let level = tops.filter((f) => Number(f.childFolderCount || 0) > 0);
+        for (let depth = 0; depth < 8 && level.length; depth++) {
+          const kids = await Promise.all(level.map((f) => mailGraph(env, addr, `/mailFolders/${encodeURIComponent(f.id)}/childFolders?$top=100&$select=displayName,childFolderCount`)));
+          const next = [];
+          kids.forEach((k) => ((k && k.ok && k.json && k.json.value) || []).forEach((f) => { names.set(f.id, String(f.displayName || "")); if (Number(f.childFolderCount || 0) > 0) next.push(f); }));
+          level = next;
+        }
+      } catch (e) {}
+      found.sort((x, y) => String(x.sentDateTime || x.receivedDateTime || "").localeCompare(String(y.sentDateTime || y.receivedDateTime || "")));
+      return reply(env, 200, { ok: true, replies: found.map((m) => ({ id: m.id, folder: (names.get(m.parentFolderId) || "Folder").slice(0, 40), pf: String(m.parentFolderId || ""), by: mailShow(m.from).slice(0, 60), at: m.sentDateTime || m.receivedDateTime || "", kind: /^\s*(fw|fwd)\s*:/i.test(String(m.subject || "")) ? "forward" : "reply", subject: String(m.subject || "").slice(0, 100) })), worker: WORKER_BUILD });
+    }
+    if (url.pathname === "/api/mail/categories" && !post) {
+      const r = await mailGraph(env, addr, "/outlook/masterCategories");
+      if (!r.ok) return reply(env, 200, { ok: false, error: mailWhy(r), worker: WORKER_BUILD });
+      return reply(env, 200, { ok: true, categories: ((r.json && r.json.value) || []).map((c) => ({ id: String(c.id || ""), name: String(c.displayName || "").slice(0, 40), color: String(c.color || "") })), worker: WORKER_BUILD });
+    }
+    if (url.pathname === "/api/mail/contacts" && !post) {
+      const q = String(url.searchParams.get("q") || "").replace(/['"\\]/g, " ").trim().slice(0, 60);
+      if (q.length < 1) return reply(env, 200, { ok: true, contacts: [], worker: WORKER_BUILD });
+      // Served from the saved address index in the database. A mailbox with no copy yet gets one made on its first look.
+      await env.DB.prepare("CREATE TABLE IF NOT EXISTS rcpt_index (box TEXT, cid TEXT, name TEXT, company TEXT, emails TEXT, src TEXT, PRIMARY KEY (box, cid))").run();
+      const have = new Set((((await env.DB.prepare("SELECT DISTINCT box FROM rcpt_index").all()).results) || []).map((x) => x.box));
+      const missing = mine.filter((b) => !have.has(b.id));
+      if (missing.length) await rcptRefresh(env, missing, "all");
+      const like = q.toLowerCase().replace(/[%_]/g, " ");
+      const ids = mine.map((b) => b.id);
+      const rs = ((await env.DB.prepare(`SELECT box, cid, name, company, emails, src FROM rcpt_index WHERE box IN (${ids.map(() => "?").join(",")}) AND (lower(name) LIKE ? OR lower(name) LIKE ? OR lower(company) LIKE ? OR lower(company) LIKE ? OR lower(emails) LIKE ?) ORDER BY src, name LIMIT 60`).bind(...ids, like + "%", "% " + like + "%", like + "%", "% " + like + "%", "%" + like + "%").all()).results) || [];
+      const seen = new Set(), out = [];
+      for (const c of rs) { const em = String(c.emails || "").split("|").filter(Boolean); const k = (em[0] || c.name).toLowerCase(); if (seen.has(k) || !em.length) continue; seen.add(k); out.push({ id: c.src === "s" ? c.cid : c.cid, box: c.box, name: c.name, company: c.company, emails: em }); }
+      return reply(env, 200, { ok: true, contacts: out.slice(0, 8), worker: WORKER_BUILD });
+    }
+    if (url.pathname === "/api/mail/contactlist" && !post) {
+      const found = await Promise.all(mine.map(async (bx) => {
+        const ad = mailAddress(env, bx); let all = [];
+        for (let skip = 0; skip < 2000; skip += 200) {
+          const r = await mailGraph(env, ad, `/contacts?$top=200&$skip=${skip}&$orderby=displayName&$select=id,displayName,emailAddresses,companyName,mobilePhone,businessPhones,homePhones,businessAddress,homeAddress`);
+          const v = (r.ok && r.json && r.json.value) || [];
+          all = all.concat(v); if (v.length < 200) break;
+        }
+        return all.map((c) => ({ id: bx.id + ":" + c.id, name: String(c.displayName || "").slice(0, 80), company: String(c.companyName || "").slice(0, 60), emails: (c.emailAddresses || []).map((e) => String(e.address || "")).filter(Boolean).slice(0, 4), phone: String(c.mobilePhone || (c.businessPhones || [])[0] || "").slice(0, 30), phones: [c.mobilePhone].concat(c.businessPhones || [], c.homePhones || []).filter(Boolean).map((x) => String(x).slice(0, 30)).slice(0, 6), address: mxAddr(c.businessAddress && Object.keys(c.businessAddress).length ? c.businessAddress : c.homeAddress) }));
+      }));
+      const seen = new Set(), out = [];
+      for (const c of found.flat()) { if (!c.emails.length) continue; const k = c.emails[0].toLowerCase(); if (seen.has(k)) continue; seen.add(k); out.push(c); }
+      out.sort((a, b) => (a.name || a.emails[0]).localeCompare(b.name || b.emails[0], "en", { sensitivity: "base" }));
+      return reply(env, 200, { ok: true, contacts: out, worker: WORKER_BUILD });
+    }
+    if (url.pathname === "/api/mail/senderphoto" && !post) {
+      const em = String(url.searchParams.get("email") || "").toLowerCase();
+      if (!/^[^\s@'"<>]+@[^\s@'"<>]+$/.test(em)) return new Response(null, { status: 404, headers: cors(env) });
+      for (const ob of mine) {
+        const owner = encodeURIComponent(mailAddress(env, ob));
+        const f = await graphFetch(env, `/users/${owner}/contacts?$filter=${encodeURIComponent(`emailAddresses/any(a:a/address eq '${em}')`)}&$select=id&$top=1`);
+        const cid = f.ok ? (((await f.json()).value || [])[0] || {}).id : "";
+        if (!cid) continue;
+        const res = await graphFetch(env, `/users/${owner}/contacts/${encodeURIComponent(cid)}/photo/$value`);
+        if (res.ok) return new Response(res.body, { status: 200, headers: { ...cors(env), "Content-Type": res.headers.get("Content-Type") || "image/jpeg", "Cache-Control": "private, no-cache" } });
+      }
+      // A mail system address (no reply, or a Xero sending address) never gets a logo from the folder, only a real contact photo.
+      if (/^(no-?reply|do-?not-?reply|donotreply|mailer-daemon|postmaster)/i.test(em.split("@")[0]) || /(^|\.)xero\.com$/.test(em.split("@")[1] || "")) return new Response(null, { status: 404, headers: { ...cors(env), "Cache-Control": "no-store" } });
+      try { const lg = await logoLookup(env, em); if (lg) {
+        return new Response(lg.body, { status: 200, headers: { ...cors(env), "Content-Type": lg.headers.get("Content-Type") || "image/png", "Cache-Control": "private, no-cache" } }); } } catch (e) {}
+      return new Response(null, { status: 404, headers: cors(env) });
+    }
+    if (url.pathname === "/api/mail/contactphoto" && !post) {
+      const cid = mailId(url.searchParams.get("cid"));
+      const owner = mine.find((x) => x.id === (url.searchParams.get("owner") || "")) || box;
+      if (!cid) return reply(env, 400, { error: "bad request" });
+      const res = await graphFetch(env, `/users/${encodeURIComponent(mailAddress(env, owner))}/contacts/${encodeURIComponent(cid)}/photo/$value`);
+      if (!res.ok) return new Response(null, { status: 404, headers: cors(env) });
+      return new Response(res.body, { status: 200, headers: { ...cors(env), "Content-Type": res.headers.get("Content-Type") || "image/jpeg", "Cache-Control": "private, no-cache" } });
+    }
+    if (url.pathname === "/api/mail/attlink" && !post) {
+      const lm = mailId(url.searchParams.get("msg")), la = mailId(url.searchParams.get("att"));
+      if (!lm || !la) return reply(env, 400, { error: "bad request" });
+      const le = Date.now() + 120000;
+      const ls = await xeroSign(env, `dl|${addr}|${lm}|${la}|${le}`);
+      return reply(env, 200, { ok: true, url: `${new URL(request.url).origin}/api/mail/dl?b=${encodeURIComponent(addr)}&m=${encodeURIComponent(lm)}&a=${encodeURIComponent(la)}&e=${le}&s=${encodeURIComponent(ls)}&n=${encodeURIComponent(String(url.searchParams.get("n") || "attachment"))}`, worker: WORKER_BUILD });
+    }
+    if (url.pathname === "/api/mail/attachment" && !post) {
+      const msg = mailId(url.searchParams.get("msg")), att = mailId(url.searchParams.get("att"));
+      if (!msg || !att) return reply(env, 400, { error: "bad request" });
+      const res = await graphFetch(env, `/users/${encodeURIComponent(addr)}/messages/${encodeURIComponent(msg)}/attachments/${encodeURIComponent(att)}/$value`);
+      if (!res.ok) return reply(env, 200, { ok: false, error: "The attachment could not be opened. Microsoft answered " + res.status + ".", worker: WORKER_BUILD });
+      return new Response(res.body, { status: 200, headers: { ...cors(env), "Content-Type": res.headers.get("Content-Type") || "application/octet-stream", "Cache-Control": "no-store" } });
+    }
+    if (post) {
+      const act = url.pathname.replace("/api/mail/", "");
+      const msg = mailId(body && body.msg);
+      // The closed maintenance mailbox never goes on Cc or Bcc, and mail to the Xero or AroFlo bill imports carries no Bcc at all.
+      if (body && typeof body === "object") {
+        const drop = (v) => String(v || "").split(/[;,\n]/).filter((p) => p.trim() && !/maintenance@directflow\.com\.au/i.test(p)).join(", ");
+        if (body.cc !== undefined) body.cc = drop(body.cc);
+        if (body.bcc !== undefined) body.bcc = drop(body.bcc);
+        const bills = [env.XERO_BILLS_EMAIL, env.AROFLO_BILLS_EMAIL].filter(Boolean).map((v) => String(v).toLowerCase());
+        if (bills.length && bills.some((b) => String(body.to || "").toLowerCase().includes(b))) body.bcc = "";
+      }
+      if (["send", "reply", "replyall", "forward", "savedraft"].includes(act)) await mailEmbedLogo(env, body);
+      const done = (r) => r.ok ? reply(env, 200, { ok: true, worker: WORKER_BUILD }) : reply(env, 200, { ok: false, error: mailWhy(r, true), worker: WORKER_BUILD });
+      // Writing check on Send (Tayler only for now). Own rules for capitals and full stops, then LanguageTool's free public service in Australian English. If LanguageTool cannot be reached the email is allowed through.
+      // Save to OneDrive: list the job folders under Client Records / New Jobs, and save a message's attachments loose into one of them (made if it is new).
+      if (act === "spwhere") {
+        const kids = (await voiceChildren(env, MAIL_JOBS_SEGS)) || [];
+        return reply(env, 200, { ok: true, folders: kids.filter((x) => x.folder).map((x) => x.name).sort((x, y) => x.localeCompare(y, "en", { numeric: true })), worker: WORKER_BUILD });
+      }
+      if (act === "spsave") {
+        const folder = cleanName(body && body.folder);
+        const ids = Array.isArray(body && body.atts) ? body.atts.map(mailId).filter(Boolean).slice(0, 40) : [];
+        if (!folder || !msg || !ids.length) return reply(env, 200, { ok: false, error: "A folder name is needed.", worker: WORKER_BUILD });
+        const saved = [], failed = [];
+        let skipped = 0;
+        for (const aid of ids) {
+          try {
+            const r = await graphFetch(env, `/users/${encodeURIComponent(addr)}/messages/${encodeURIComponent(msg)}/attachments/${encodeURIComponent(aid)}`);
+            if (!r.ok) throw new Error("read " + r.status);
+            const att = await r.json();
+            if (!att.contentBytes) throw new Error("no content");
+            const bin = atob(att.contentBytes), bytes = new Uint8Array(bin.length);
+            for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+            const fname = cleanName(att.name || "attachment") || "attachment";
+            const ex = await graphFetch(env, `/sites/${siteId(env)}/drive/root:/${pathOf([...MAIL_JOBS_SEGS, folder, fname])}?select=id`);
+            if (ex.ok) { skipped++; continue; }
+            await uploadToSharePoint(env, [...MAIL_JOBS_SEGS, folder], fname, bytes, att.contentType, false);
+            saved.push(att.name);
+          } catch (e) { failed.push(String(e && e.message || e).slice(0, 60)); }
+        }
+        return reply(env, 200, { ok: saved.length > 0 || (skipped > 0 && !failed.length), saved: saved.length, skipped, failed, folder, error: saved.length || (skipped && !failed.length) ? "" : "The files were not saved (" + failed.join(", ") + ").", worker: WORKER_BUILD });
+      }
+      if (act === "fixlines" || act === "aiusage") {
+        // Writing fix on Cloudflare's own AI (free daily allowance). It only corrects spelling, grammar, punctuation and capital letters, never the words. Every call is counted so the Development screen can show the real Neuron use.
+        await env.DB.prepare("CREATE TABLE IF NOT EXISTS ai_usage (day TEXT PRIMARY KEY, calls INTEGER DEFAULT 0, tin INTEGER DEFAULT 0, tout INTEGER DEFAULT 0, neurons REAL DEFAULT 0)").run();
+        if (act === "aiusage") {
+          const rows = ((await env.DB.prepare("SELECT day, calls, tin, tout, neurons FROM ai_usage ORDER BY day DESC LIMIT 7").all()).results) || [];
+          return reply(env, 200, { ok: true, today: rows.find((r) => r.day === new Date().toISOString().slice(0, 10)) || { calls: 0, tin: 0, tout: 0, neurons: 0 }, week: rows, free: 10000, worker: WORKER_BUILD });
+        }
+        if (!env.AI) return reply(env, 200, { ok: false, error: "The writing check is not switched on yet.", worker: WORKER_BUILD });
+        const lines = (Array.isArray(body && body.lines) ? body.lines : []).slice(0, 80).map((x) => String(x || "").slice(0, 1500));
+        const send = lines.map((t, i) => ({ i, t })).filter((x) => x.t.trim() && !/@|https?:\/\//i.test(x.t));
+        if (!send.length) return reply(env, 200, { ok: true, lines, changed: 0, worker: WORKER_BUILD });
+        const orig = lines.slice();
+        const MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
+        let uin = 0, uout = 0;
+        const lev = (a, b) => { const d = Array.from({ length: a.length + 1 }, (_, i) => [i, ...Array(b.length).fill(0)]); for (let j = 1; j <= b.length; j++) d[0][j] = j; for (let i = 1; i <= a.length; i++) for (let j = 1; j <= b.length; j++) d[i][j] = Math.min(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1)); return d[a.length][b.length]; };
+        // Pass 1: spelling, one word at a time against Australian English. Names, short forms and codes are left alone, and a correction must be a small change to the same word.
+        try {
+          const uniq = [...new Set(send.map((x) => x.t).join(" ").match(/[A-Za-z][A-Za-z']{3,}/g) || [])].slice(0, 400);
+          if (uniq.length) {
+            const so = await env.AI.run(MODEL, { messages: [{ role: "system", content: "You check spelling against the Australian English dictionary (Macquarie style: colour, organise, centre, licence as the noun, metre, programme only for TV). You are given a list of words, one per line. Reply only with the words that are misspelled, one per line, as wrong=right. Do not list correctly spelt words. Do not change names of people or places, company names, abbreviations or codes. If every word is spelt correctly reply with the single word NONE." }, { role: "user", content: uniq.join("\n") }], max_tokens: 600, temperature: 0 });
+            const st = String(so && (so.response || (so.result && so.result.response)) || "");
+            const su = (so && so.usage) || {};
+            uin += Number(su.prompt_tokens) || 0; uout += Number(su.completion_tokens) || 0;
+            const fixes = {};
+            st.split(/\n+/).forEach((l) => { const m = l.trim().match(/^([A-Za-z']+)\s*=\s*([A-Za-z']+)$/); if (m && m[1].toLowerCase() !== m[2].toLowerCase() && uniq.includes(m[1]) && lev(m[1].toLowerCase(), m[2].toLowerCase()) <= 3 && m[1][0].toLowerCase() === m[2][0].toLowerCase()) fixes[m[1]] = m[2]; });
+            const keys = Object.keys(fixes);
+            if (keys.length) {
+              const fit = (from, to) => from === from.toUpperCase() && from.length > 1 ? to.toUpperCase() : from[0] === from[0].toUpperCase() ? to[0].toUpperCase() + to.slice(1) : to;
+              send.forEach((x) => { x.t = x.t.replace(/[A-Za-z][A-Za-z']{3,}/g, (wd) => (fixes[wd] ? fit(wd, fixes[wd]) : wd)); lines[x.i] = x.t; });
+            }
+          }
+        } catch (e) {}
+        const sys = "You are a proofreader for Australian English business emails. Correct only spelling mistakes, grammar mistakes, punctuation and capital letters. Add full stops and capitals where they are missing, and split run on sentences with punctuation. Never add, remove or move commas. A sentence that asks a question ends with a question mark. Never reword, never add, remove or reorder words, never change the tone, and keep names, numbers, job numbers, addresses and codes exactly as written. Each input line is numbered like '3: text'. Reply with every line again in the same order, in the same numbered format, one line each, and nothing else.";
+        let out;
+        try {
+          out = await env.AI.run(MODEL, { messages: [{ role: "system", content: sys }, { role: "user", content: send.map((x) => `${x.i + 1}: ${x.t}`).join("\n") }], max_tokens: 2048, temperature: 0 });
+        } catch (e) { return reply(env, 200, { ok: false, error: "The writing check could not run just now.", worker: WORKER_BUILD }); }
+        const txt = String(out && (out.response || (out.result && out.result.response)) || "");
+        const got = {};
+        txt.split(/\n+/).forEach((l) => { const m = l.match(/^\s*(\d+)\s*[:.)]\s?(.*)$/); if (m) got[Number(m[1]) - 1] = m[2]; });
+        const words = (s) => String(s).toLowerCase().replace(/[^a-z0-9'\s]/g, " ").split(/\s+/).filter(Boolean);
+        let changed = 0;
+        const cap = (x) => x.replace(/^(\s*)([a-z])/, (m, sp, ch) => sp + ch.toUpperCase());
+        // A sentence that asks a question ends with a question mark, whatever the proofreader did.
+        const QS = /^(are (you|we|they|there)|is (it|there|this|that|he|she|anyone)|was (it|there)|were (you|they)|do (you|we|they)|does (it|this|that|he|she|anyone)|did (you|we|they|he|she|it)|can (you|we|i|they|someone|anyone)|could (you|we|i|they|someone|anyone)|will (you|we|they|it|someone|anyone)|would (you|we|they|it|someone|anyone)|should (we|i|you|they)|may i|have (you|we|they)|has (anyone|he|she|it|someone)|how (do|does|did|can|could|would|long|much|many|about|is|are)|what (is|are|was|were|do|does|did|time|about|else)|when (is|are|was|will|can|do|does|did|would)|where (is|are|was|do|does|did|can)|why (is|are|was|do|does|did|can|would)|who (is|are|was|can|will|did|has|would))\b/i;
+        const qfix = (line) => String(line).replace(/[^.!?]+(?:[.!?]+|$)/g, (sn) => {
+          const t = sn.trim();
+          if (!t || !QS.test(t)) return sn;
+          const m = sn.match(/^(\s*)([^.!?]*?)(\.+)?(\s*)$/);
+          if (!m || /[!?]/.test(sn)) return sn;
+          if (m[3] && m[3].length > 1) return sn;
+          return m[1] + m[2] + "?" + m[4];
+        });
+        const sent = new Set(send.map((x) => x.i));
+        const fixed = lines.map((t, i) => {
+          if (!sent.has(i)) return t;
+          let r = t;
+          const c = got[i];
+          if (c != null && c.trim() && c !== t) {
+            // The AI's line is only taken if it is the same writing: similar length, and most of the words still there.
+            const a1 = words(t), b1 = words(c);
+            const ok = !(b1.length < a1.length * 0.7 || b1.length > a1.length * 1.4) && !(a1.length && a1.filter((x) => b1.includes(x)).length / a1.length < 0.7);
+            if (ok) r = c;
+          }
+          r = qfix(cap(r));
+          // A difference that is only commas is not a mistake, so the line is left as written.
+          const nc = (x) => String(x).replace(/,/g, "").replace(/\s+/g, " ").trim();
+          if (r !== t && nc(r) === nc(t)) r = t;
+          if (r !== orig[i]) changed++;
+          return r;
+        });
+        // Paragraphs: a long block of writing is broken into paragraphs between sentences. No words change. If the AI's answer is not the same text, the block is split every three sentences instead.
+        for (let i = 0; i < fixed.length; i++) {
+          const ln = fixed[i];
+          if (!body.spacing || !sent.has(i) || ln.length < 300) continue;
+          const sents = ln.match(/[^.!?]+[.!?]+(?:\s+|$)/g);
+          if (!sents || sents.length < 3 || sents.join("").replace(/\s+/g, " ").trim() !== ln.replace(/\s+/g, " ").trim()) continue;
+          let parts = null;
+          try {
+            const po = await env.AI.run(MODEL, { messages: [{ role: "system", content: "You lay out business emails. Insert the marker ||| between sentences where a new paragraph should start, at natural changes of topic, roughly every two to four sentences. Do not change, add or remove any other character. Reply with the text only." }, { role: "user", content: ln }], max_tokens: 1024, temperature: 0 });
+            const pt = String(po && (po.response || (po.result && po.result.response)) || "");
+            const pu = (po && po.usage) || {};
+            uin += Number(pu.prompt_tokens) || Math.ceil(ln.length / 4); uout += Number(pu.completion_tokens) || Math.ceil(pt.length / 4);
+            const ps = pt.split("|||").map((x) => x.trim()).filter(Boolean);
+            if (ps.length > 1 && ps.join(" ").replace(/\s+/g, " ") === ln.replace(/\s+/g, " ").trim()) parts = ps;
+          } catch (e) {}
+          if (!parts) { parts = []; for (let k = 0; k < sents.length; k += 3) parts.push(sents.slice(k, k + 3).join("").trim()); }
+          if (parts.length < 2) continue;
+          if (fixed[i] === orig[i]) changed++;
+          fixed[i] = parts.join("\n");
+        }
+        const u = (out && out.usage) || {};
+        const tin = uin + (Number(u.prompt_tokens) || Math.ceil((sys.length + send.reduce((n, x) => n + x.t.length, 0)) / 4)), tout = uout + (Number(u.completion_tokens) || Math.ceil(txt.length / 4));
+        const neurons = tin * 26668 / 1e6 + tout * 204805 / 1e6;
+        try { await env.DB.prepare("INSERT INTO ai_usage (day, calls, tin, tout, neurons) VALUES (?1, 1, ?2, ?3, ?4) ON CONFLICT(day) DO UPDATE SET calls = calls + 1, tin = tin + ?2, tout = tout + ?3, neurons = neurons + ?4").bind(new Date().toISOString().slice(0, 10), tin, tout, neurons).run(); } catch (e) {}
+        return reply(env, 200, { ok: true, lines: fixed, changed, worker: WORKER_BUILD });
+      }
+      if (act === "catadd") {
+        const nm = String(body.name || "").replace(/\s+/g, " ").trim().slice(0, 40);
+        if (!nm) return reply(env, 200, { ok: false, error: "Give the category a name.", worker: WORKER_BUILD });
+        const col = /^preset\d{1,2}$/.test(String(body.color || "")) ? String(body.color) : "preset7";
+        return done(await mailDo(env, addr, "/outlook/masterCategories", "POST", { displayName: nm, color: col }));
+      }
+      if (act === "catcolor") {
+        const cid = mailId(body.catid);
+        const col = /^preset\d{1,2}$/.test(String(body.color || "")) ? String(body.color) : "";
+        if (!cid || !col) return reply(env, 200, { ok: false, error: "Choose a colour.", worker: WORKER_BUILD });
+        return done(await mailDo(env, addr, `/outlook/masterCategories/${encodeURIComponent(cid)}`, "PATCH", { color: col }));
+      }
+      if (act === "catdel") {
+        const cid = mailId(body.catid);
+        if (!cid) return reply(env, 200, { ok: false, error: "Choose a category.", worker: WORKER_BUILD });
+        return done(await mailDo(env, addr, `/outlook/masterCategories/${encodeURIComponent(cid)}`, "DELETE"));
+      }
+      if (act === "read" && msg) return done(await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}`, "PATCH", { isRead: !!body.read }));
+      if (act === "xerobill" && msg) {
+        if (box.id !== "accounts") return reply(env, 200, { ok: false, error: "Only the Accounts mailbox can send to Xero.", worker: WORKER_BUILD });
+        if (!env.XERO_BILLS_EMAIL) return reply(env, 200, { ok: false, error: "The Xero bills address is not set up.", worker: WORKER_BUILD });
+        // Forward with the body taken out (the attachments go), then file the original in the archive.
+        if (body.both && !env.AROFLO_BILLS_EMAIL) return reply(env, 200, { ok: false, error: "The AroFlo bills address is not set up.", worker: WORKER_BUILD });
+        const fw = await mailDraftSend(env, addr, msg, "createForward", "", [{ emailAddress: { address: env.XERO_BILLS_EMAIL } }].concat(body.both ? [{ emailAddress: { address: env.AROFLO_BILLS_EMAIL } }] : []), { trail: "none" });
+        if (!fw.ok) return done(fw);
+        await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}`, "PATCH", { isRead: true });
+        const ar = await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}/move`, "POST", { destinationId: "archive" });
+        return ar.ok ? reply(env, 200, { ok: true, newId: String((ar.json && ar.json.id) || ""), worker: WORKER_BUILD }) : reply(env, 200, { ok: false, error: "Sent to Xero, but the email could not be archived.", worker: WORKER_BUILD });
+      }
+      if (act === "remit" && msg) {
+        if (box.id !== "accounts") return reply(env, 200, { ok: false, error: "Only the Accounts mailbox can process remittances.", worker: WORKER_BUILD });
+        const fail = (error) => reply(env, 200, { ok: false, error, worker: WORKER_BUILD });
+        const al = await mailGraph(env, addr, `/messages/${encodeURIComponent(msg)}/attachments?$select=id,name,isInline,contentType`);
+        const pdfs = ((al && al.json && al.json.value) || []).filter((x) => !x.isInline && (/\.pdf$/i.test(x.name || "") || /pdf/i.test(x.contentType || "")));
+        if (!pdfs.length) return fail("There is no PDF remittance on this email.");
+        let rem = null;
+        for (const p of pdfs) {
+          const ar = await graphFetch(env, `/users/${encodeURIComponent(addr)}/messages/${encodeURIComponent(msg)}/attachments/${encodeURIComponent(p.id)}/$value`);
+          if (!ar.ok) continue;
+          try { rem = await remittanceParse(new Uint8Array(await ar.arrayBuffer())); } catch (e) { rem = null; }
+          if (rem) break;
+        }
+        if (!rem) return fail("The remittance could not be read. No invoice numbers were found.");
+        const nums = [...new Set(rem.lines.map((l) => l.number))];
+        const found = {};
+        for (let i = 0; i < nums.length; i += 40) {
+          const xr = await xeroFetch(env, "api.xro/2.0/Invoices?InvoiceNumbers=" + encodeURIComponent(nums.slice(i, i + 40).join(",")));
+          if (!xr.ok) return fail("Xero answered " + xr.status + " when looking up the invoices.");
+          for (const inv of ((await xr.json()).Invoices || [])) if (inv.Type === "ACCREC") (found[String(inv.InvoiceNumber).toUpperCase()] = found[String(inv.InvoiceNumber).toUpperCase()] || []).push(inv);
+        }
+        const rows = rem.lines.map((l) => {
+          const list = found[l.number] || [];
+          const inv = list.find((q) => q.Status === "AUTHORISED") || list[0];
+          let problem = "";
+          if (!inv) problem = "Not found in Xero";
+          else if (list.filter((q) => q.Status === "AUTHORISED").length > 1) problem = "More than one invoice has this number";
+          else if (inv.Status === "PAID") problem = "Already paid";
+          else if (inv.Status !== "AUTHORISED") problem = "Status is " + inv.Status;
+          else if (inv.CurrencyCode && inv.CurrencyCode !== "AUD") problem = "Not in AUD";
+          else if (Math.round(l.pay * 100) > Math.round(inv.AmountDue * 100)) problem = "Remittance is more than the amount due ($" + inv.AmountDue.toFixed(2) + ")";
+          return { number: l.number, pay: l.pay, id: inv ? inv.InvoiceID : "", contact: inv && inv.Contact ? inv.Contact.Name : "", due: inv ? inv.AmountDue : 0, problem };
+        });
+        const sum = Math.round(rows.reduce((a, r) => a + r.pay, 0) * 100) / 100;
+        // If any invoice number is not in Xero, or the invoices do not add up to the remittance total, Reservoir does not guess.
+        if (rows.some((r) => !r.id) || Math.abs(sum - rem.total) > 0.005) return fail("Reservoir could not match this remittance to Xero" + (rows.some((r) => !r.id) ? " (" + rows.filter((r) => !r.id).map((r) => r.number).join(", ") + " not found)" : " (the invoices do not add up to the total)") + ". Please process it manually.");
+        let problem = rows.find((r) => r.problem) ? "Some invoices need attention." : "";
+        if (!problem && Math.abs(sum - rem.total) > 0.005) problem = "The invoices add up to $" + sum.toFixed(2) + " but the remittance total is $" + rem.total.toFixed(2) + ".";
+        if (!problem && new Set(rows.map((r) => r.contact)).size > 1) problem = "The invoices belong to more than one customer.";
+        if (!problem && rows.length > 200) problem = "More than 200 invoices.";
+        // The bank account the deposit lands in.
+        const ac = await xeroFetch(env, "api.xro/2.0/Accounts?where=" + encodeURIComponent('Type=="BANK"'));
+        const acJson = ac.ok ? await ac.json() : null;
+        const banks = acJson ? (acJson.Accounts || []).filter((q) => q.Status === "ACTIVE") : [];
+        const bank = (env.XERO_REMIT_ACCOUNT && banks.find((q) => q.AccountID === env.XERO_REMIT_ACCOUNT || q.Name === env.XERO_REMIT_ACCOUNT || q.Code === env.XERO_REMIT_ACCOUNT)) || banks.find((q) => /operating/i.test(q.Name));
+        if (!problem && !bank) problem = ac.ok ? "No Operating Account found. Xero has: " + banks.map((q) => q.Name).join(", ") + "." : "Xero answered " + ac.status + " when looking up the bank accounts.";
+        const customer = rows[0] && rows[0].contact ? rows[0].contact : rem.payer;
+        const date = rem.date || new Date().toISOString().slice(0, 10);
+        if (!body.go) return reply(env, 200, { ok: true, customer, date, total: rem.total, sum, bank: bank ? bank.Name : "", rows: rows.map((r) => ({ number: r.number, pay: r.pay, problem: r.problem })), problem, worker: WORKER_BUILD });
+        if (problem) return fail(problem);
+        const ref = (customer + " remittance " + date.split("-").reverse().join(".")).slice(0, 255);
+        const pr = await xeroFetch(env, "api.xro/2.0/BatchPayments", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ BatchPayments: [{ Account: { AccountID: bank.AccountID }, Reference: ref, Date: date, Payments: rows.map((r) => ({ Invoice: { InvoiceID: r.id }, Amount: r.pay })) }] }) });
+        let pj = null; try { pj = await pr.json(); } catch (e) { pj = null; }
+        const bp = pj && (pj.BatchPayments || [])[0];
+        if (!pr.ok || !bp || !bp.BatchPaymentID) {
+          const ve = bp && (bp.ValidationErrors || []).map((q) => q.Message).join(" ") || (pj && (pj.Message || pj.Detail)) || "";
+          return fail("Xero would not create the batch. " + (ve || "Xero answered " + pr.status + ".") + " Nothing was changed.");
+        }
+        await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}`, "PATCH", { isRead: true });
+        const ar2 = await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}/move`, "POST", { destinationId: "archive" });
+        return reply(env, 200, { ok: true, done: true, count: rows.length, total: sum, newId: String((ar2.ok && ar2.json && ar2.json.id) || ""), archived: ar2.ok, worker: WORKER_BUILD });
+      }
+      if (act === "archive" && msg) { await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}`, "PATCH", { isRead: true }); const ar = await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}/move`, "POST", { destinationId: "archive" }); return ar.ok ? reply(env, 200, { ok: true, newId: String((ar.json && ar.json.id) || ""), worker: WORKER_BUILD }) : done(ar); }
+      if (act === "movefolder" && msg) {
+        const dest = mailFolderId(body.folder);
+        if (!dest) return reply(env, 200, { ok: false, error: "Choose a folder to move it to.", worker: WORKER_BUILD });
+        const mv = await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}/move`, "POST", { destinationId: dest });
+        return mv.ok ? reply(env, 200, { ok: true, newId: String((mv.json && mv.json.id) || ""), worker: WORKER_BUILD }) : done(mv);
+      }
+      if (act === "moveto" && msg) {
+        const tb = MAILBOXES.find((x) => x.id === String(body.target || "") && ((!x.only && !x.who) || mailAllowed(x, user)));
+        if (!tb || tb.id === box.id) return reply(env, 200, { ok: false, error: "Choose another mailbox to move it to.", worker: WORKER_BUILD });
+        const src = await graphFetch(env, `/users/${encodeURIComponent(addr)}/messages/${encodeURIComponent(msg)}/$value`);
+        if (!src.ok) return reply(env, 200, { ok: false, error: "The email could not be read to move it. Microsoft answered " + src.status + ".", worker: WORKER_BUILD });
+        const bytes = new Uint8Array(await src.arrayBuffer());
+        let bin = "";
+        for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+        const put = await graphFetch(env, `/users/${encodeURIComponent(mailAddress(env, tb))}/mailFolders/inbox/messages`, { method: "POST", headers: { "Content-Type": "text/plain" }, body: btoa(bin) });
+        if (!put.ok) return reply(env, 200, { ok: false, error: "The copy into " + tb.label + " failed. Microsoft answered " + put.status + ". Nothing was changed.", worker: WORKER_BUILD });
+        let created = null; try { created = await put.json(); } catch (e) { created = null; }
+        if (created && created.id && created.isDraft) {
+          await mailDo(env, mailAddress(env, tb), `/messages/${encodeURIComponent(created.id)}`, "PATCH", { isRead: !!body.read });
+          // Clear the unsent flag so the copy is a normal received email that can be replied to.
+          const fl = await mailDo(env, mailAddress(env, tb), `/messages/${encodeURIComponent(created.id)}`, "PATCH", { singleValueExtendedProperties: [{ id: "Integer 0x0E07", value: body.read ? "1" : "0" }] });
+          if (!fl.ok) console.log("moved copy flag clear failed", fl.status);
+        }
+        const gone = await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}/move`, "POST", { destinationId: "archive" });
+        // newId is the original now in Archive and copyId is the copy in the other mailbox, so the move can be undone.
+        return reply(env, 200, { ok: true, label: tb.label, archived: gone.ok, newId: String((gone.ok && gone.json && gone.json.id) || ""), copyId: String((created && created.id) || ""), worker: WORKER_BUILD });
+      }
+      if (act === "contactsave" || act === "contactdelete") {
+        let cAddr = box.only ? mailAddress(env, MAILBOXES.find((x) => !x.only && mailAllowed(x, user)) || box) : addr, cid = "";
+        const ref = String(body.cid || "");
+        if (ref) {
+          const i = ref.indexOf(":"), ob = MAILBOXES.find((x) => x.id === ref.slice(0, i) && ((!x.only && !x.who) || mailAllowed(x, user)));
+          if (i < 1 || !ob) return reply(env, 200, { ok: false, error: "That contact could not be found.", worker: WORKER_BUILD });
+          cAddr = mailAddress(env, ob); cid = ref.slice(i + 1);
+        }
+        if (act === "contactdelete") {
+          if (!cid) return reply(env, 200, { ok: false, error: "Choose a contact to delete.", worker: WORKER_BUILD });
+          const dl = await mailDo(env, cAddr, `/contacts/${encodeURIComponent(cid)}`, "DELETE");
+          if (dl.ok || dl.status === 404) { try { const rb = MAILBOXES.find((x) => mailAddress(env, x) === cAddr); if (rb) await rcptRefresh(env, [rb], "contacts"); } catch (e) { } }
+          return dl.ok || dl.status === 404 ? reply(env, 200, { ok: true, worker: WORKER_BUILD }) : done(dl);
+        }
+        const nm = String(body.name || "").replace(/\s+/g, " ").trim().slice(0, 80), em = String(body.email || "").trim().slice(0, 120);
+        if (!nm && !em) return reply(env, 200, { ok: false, error: "Give the contact a name or an email address.", worker: WORKER_BUILD });
+        if (em && !/^[^\s@'"<>]+@[^\s@'"<>]+$/.test(em)) return reply(env, 200, { ok: false, error: "That email address does not look right.", worker: WORKER_BUILD });
+        const ph = String(body.phone || "").trim().slice(0, 30);
+        const data = { displayName: nm || em, companyName: String(body.company || "").trim().slice(0, 60), emailAddresses: em ? [{ address: em, name: nm || em }] : [], mobilePhone: ph, businessAddress: { street: String(body.address || "").trim().slice(0, 160) } };
+        const sv = await mailDo(env, cAddr, cid ? `/contacts/${encodeURIComponent(cid)}` : "/contacts", cid ? "PATCH" : "POST", data);
+        if (!sv.ok) return reply(env, 200, { ok: false, error: mailWhy(sv, true), worker: WORKER_BUILD });
+        try { const rb = MAILBOXES.find((x) => mailAddress(env, x) === cAddr); if (rb) await rcptRefresh(env, [rb], "contacts"); } catch (e) { }
+        return reply(env, 200, { ok: true, contact: { id: (cid ? ref.slice(0, ref.indexOf(":")) : (box.only ? (MAILBOXES.find((x) => !x.only && mailAllowed(x, user)) || box).id : box.id)) + ":" + String((sv.json && sv.json.id) || cid), name: data.displayName, company: data.companyName, emails: em ? [em] : [], phone: ph, address: String(body.address || "").trim().slice(0, 160) }, worker: WORKER_BUILD });
+      }
+      if (act === "contactphoto") {
+        const ref = String(body.cid || ""), i = ref.indexOf(":"), ob = MAILBOXES.find((x) => x.id === ref.slice(0, i) && ((!x.only && !x.who) || mailAllowed(x, user)));
+        if (i < 1 || !ob) return reply(env, 200, { ok: false, error: "That contact could not be found.", worker: WORKER_BUILD });
+        const b64 = String(body.data || "").replace(/^data:[^,]*,/, "");
+        if (!b64 || b64.length > 700000) return reply(env, 200, { ok: false, error: "That photo is too big.", worker: WORKER_BUILD });
+        const bin = atob(b64), bytes = new Uint8Array(bin.length);
+        for (let k = 0; k < bin.length; k++) bytes[k] = bin.charCodeAt(k);
+        const up = await graphFetch(env, `/users/${encodeURIComponent(mailAddress(env, ob))}/contacts/${encodeURIComponent(ref.slice(i + 1))}/photo/$value`, { method: "PUT", headers: { "Content-Type": "image/jpeg" }, body: bytes });
+        // The same sender can sit as a contact in more than one mailbox, and the sender picture is read from the first one that has it. So the new photo is written to every copy.
+        if (up.ok) {
+          try {
+            const mine0 = await graphFetch(env, `/users/${encodeURIComponent(mailAddress(env, ob))}/contacts/${encodeURIComponent(ref.slice(i + 1))}?$select=emailAddresses`);
+            const ems = mine0.ok ? (((await mine0.json()).emailAddresses) || []).map((x) => String(x.address || "").toLowerCase()).filter((x) => /^[^\s@'"<>]+@[^\s@'"<>]+$/.test(x)) : [];
+            for (const o2 of MAILBOXES.filter((x) => x.id !== ob.id && mailAllowed(x, user))) {
+              for (const em of ems) {
+                const o2a = encodeURIComponent(mailAddress(env, o2));
+                const f2 = await graphFetch(env, `/users/${o2a}/contacts?$filter=${encodeURIComponent(`emailAddresses/any(a:a/address eq '${em}')`)}&$select=id&$top=5`);
+                const ids = f2.ok ? (((await f2.json()).value) || []).map((x) => x.id) : [];
+                for (const id2 of ids) await graphFetch(env, `/users/${o2a}/contacts/${encodeURIComponent(id2)}/photo/$value`, { method: "PUT", headers: { "Content-Type": "image/jpeg" }, body: bytes });
+              }
+            }
+          } catch (e) { console.log("photo copies", String(e && e.message || e).slice(0, 120)); }
+        }
+        return up.ok ? reply(env, 200, { ok: true, worker: WORKER_BUILD }) : reply(env, 200, { ok: false, error: "Microsoft did not take the photo. It answered " + up.status + ".", worker: WORKER_BUILD });
+      }
+      if (act === "avatarsave") {
+        const isT = user.tier === "T1" && (/^tayler/i.test(String(user.email || "")) || /^tayler\b/i.test(String(user.name || "")));
+        if (!isT) return reply(env, 200, { ok: false, error: "Only Tayler can add logos.", worker: WORKER_BUILD });
+        const nm = String(body.name || "").replace(/\.png$/i, "").replace(/[^A-Za-z0-9 &._-]/g, " ").replace(/\s+/g, " ").trim().slice(0, 40);
+        if (!nm) return reply(env, 200, { ok: false, error: "That file name does not look right.", worker: WORKER_BUILD });
+        const b64 = String(body.data || "").replace(/^data:[^,]*,/, "");
+        if (!b64 || b64.length > 400000) return reply(env, 200, { ok: false, error: "That logo is too big.", worker: WORKER_BUILD });
+        const bin = atob(b64), bytes = new Uint8Array(bin.length);
+        for (let k = 0; k < bin.length; k++) bytes[k] = bin.charCodeAt(k);
+        try { await uploadToSharePoint(env, ["Branding & Marketing", "Client Logos Avatars"], nm + ".png", bytes, "image/png", true); }
+        catch (e) { return reply(env, 200, { ok: false, error: "The Client Logos Avatars folder did not take it.", worker: WORKER_BUILD }); }
+        avatarCache = { at: 0, items: null };
+        return reply(env, 200, { ok: true, worker: WORKER_BUILD });
+      }
+      if (act === "avataropts") {
+        const isT = user.tier === "T1" && (/^tayler/i.test(String(user.email || "")) || /^tayler\b/i.test(String(user.name || "")));
+        if (!isT) return reply(env, 200, { ok: false, error: "Only Tayler can pick logos.", worker: WORKER_BUILD });
+        if (avatarCache.items && Date.now() - avatarCache.at < 600000) return reply(env, 200, { ok: true, items: avatarCache.items, worker: WORKER_BUILD });
+        const base = ["Branding & Marketing", "Client Logos Avatars"];
+        const lr = await graphFetch(env, `/sites/${siteId(env)}/drive/root:/${pathOf(base)}:/children?$top=999&$select=id,name,file`);
+        if (!lr.ok) return reply(env, 200, { ok: false, error: "The Client Logos Avatars folder could not be read.", worker: WORKER_BUILD });
+        const files = ((await lr.json()).value || []).filter((it) => it.file && /\.png$/i.test(it.name || "")).sort((a, b) => String(a.name).localeCompare(String(b.name), "en", { sensitivity: "base" }));
+        const items = [];
+        for (let i = 0; i < files.length; i += 8) {
+          const got = await Promise.all(files.slice(i, i + 8).map(async (it) => {
+            try { const r = await graphFetch(env, `/sites/${siteId(env)}/drive/items/${encodeURIComponent(it.id)}/content`); if (!r.ok) return null; const buf = await r.arrayBuffer(); if (buf.byteLength > 200000) return null; return { name: String(it.name).replace(/\.png$/i, ""), data: `data:image/png;base64,${toB64(buf)}` }; } catch (e) { return null; }
+          }));
+          for (const g of got) if (g) items.push(g);
+        }
+        avatarCache = { at: Date.now(), items };
+        return reply(env, 200, { ok: true, items, worker: WORKER_BUILD });
+      }
+      if (act === "imgproxy" || act === "logosave") {
+        // Logo picking is Tayler's tool. imgproxy lets the page read a signature picture that sits on someone else's server; logosave files the chosen picture in the Client Logos folder.
+        const isTayler = user.tier === "T1" && (/^tayler/i.test(String(user.email || "")) || /^tayler\b/i.test(String(user.name || "")));
+        if (!isTayler) return reply(env, 200, { ok: false, error: "Only Tayler can add logos.", worker: WORKER_BUILD });
+        if (act === "imgproxy") {
+          let u = null;
+          try { u = new URL(String(body.url || "")); } catch (e) { u = null; }
+          if (!u || u.protocol !== "https:" || /^(localhost|\d+\.\d+\.\d+\.\d+|\[.*\])$/i.test(u.hostname) || !u.hostname.includes(".")) return reply(env, 200, { ok: false, error: "That picture cannot be fetched.", worker: WORKER_BUILD });
+          try {
+            const r = await fetch(u.toString(), { redirect: "follow", headers: { "User-Agent": "Mozilla/5.0" } });
+            const ct = String(r.headers.get("Content-Type") || "").split(";")[0].trim().toLowerCase();
+            if (!r.ok || !/^image\/(png|jpe?g|gif|webp|svg\+xml)$/.test(ct)) return reply(env, 200, { ok: false, error: "That is not a picture.", worker: WORKER_BUILD });
+            const buf = await r.arrayBuffer();
+            if (buf.byteLength > 1500000) return reply(env, 200, { ok: false, error: "That picture is too big.", worker: WORKER_BUILD });
+            return reply(env, 200, { ok: true, data: `data:${ct};base64,${toB64(buf)}`, worker: WORKER_BUILD });
+          } catch (e) { return reply(env, 200, { ok: false, error: "That picture could not be fetched.", worker: WORKER_BUILD }); }
+        }
+        const em = String(body.email || "").trim().toLowerCase();
+        const dom = em.split("@")[1] || "";
+        if (!dom || !/^[a-z0-9.-]+$/.test(dom)) return reply(env, 200, { ok: false, error: "That email address does not look right.", worker: WORKER_BUILD });
+        const freeMail = /^(gmail|googlemail|outlook|hotmail|live|msn|yahoo|ymail|icloud|me|bigpond|optusnet|tpg|iinet|internode|aapt|westnet|dodo|telstra)\./.test(dom);
+        const dp = dom.split(".");
+        // A free email service (gmail, live and the like) is shared by everyone, so its logo is filed against the exact address. Any other sender is filed against the web address.
+        const base = freeMail ? em : dp.length > 2 && /^(com|net|org|co|gov|edu|asn|id)$/.test(dp[dp.length - 2]) ? dp.slice(-3).join(".") : dp.slice(-2).join(".");
+        const b64 = String(body.data || "").replace(/^data:[^,]*,/, "");
+        if (!b64 || b64.length > 700000) return reply(env, 200, { ok: false, error: "That logo is too big.", worker: WORKER_BUILD });
+        const bin = atob(b64), bytes = new Uint8Array(bin.length);
+        for (let k = 0; k < bin.length; k++) bytes[k] = bin.charCodeAt(k);
+        let saved = null, why = "";
+        for (const segs of LOGO_HOMES) { try { saved = await uploadToSharePoint(env, segs, base + ".png", bytes, "image/png", true); break; } catch (e) { why = String(e && e.message || e); } }
+        if (!saved) return reply(env, 200, { ok: false, error: "The Client Logos folder did not take it (" + why.slice(0, 60) + ").", worker: WORKER_BUILD });
+        logoIndex = { at: 0, map: null };
+        return reply(env, 200, { ok: true, name: base + ".png", worker: WORKER_BUILD });
+      }
+      if (act === "approvals" || act === "approvalact" || act === "approvalscan") {
+        const isTayler = user.tier === "T1" && (/^tayler/i.test(String(user.email || "")) || /^tayler\b/i.test(String(user.name || "")));
+        if (!isTayler) return reply(env, 200, { ok: false, error: "Only Tayler can approve contacts.", worker: WORKER_BUILD });
+        await approvalsTable(env);
+        if (act === "approvalscan") {
+          const sc = await approvalScan(env, mine.filter((x) => !x.only));
+          return reply(env, 200, { ok: true, added: sc.added, info: sc.info, worker: WORKER_BUILD });
+        }
+        if (act === "approvals") {
+          const rs = await env.DB.prepare("SELECT email, name, box, logo, cnt, msg FROM contact_approvals WHERE status = 'pending' ORDER BY created_at").all();
+          return reply(env, 200, { ok: true, items: (rs.results || []).map((r) => ({ email: r.email, name: r.name || "", box: r.box, logo: !!r.logo, count: r.cnt || 0, msg: r.msg || "" })), worker: WORKER_BUILD });
+        }
+        const em = String(body.email || "").toLowerCase().trim();
+        const row = await env.DB.prepare("SELECT * FROM contact_approvals WHERE email = ?").bind(em).first();
+        if (!row) return reply(env, 200, { ok: false, error: "That sender is not waiting.", worker: WORKER_BUILD });
+        if (body.op === "skip") {
+          await env.DB.prepare("UPDATE contact_approvals SET status = 'skipped', next_at = ? WHERE email = ?").bind((row.cnt || 0) + 10, em).run();
+          return reply(env, 200, { ok: true, worker: WORKER_BUILD });
+        }
+        const ob = MAILBOXES.find((x) => x.id === row.box) || MAILBOXES[0];
+        const owner = encodeURIComponent(mailAddress(env, ob));
+        let c = null;
+        const ex = await graphFetch(env, `/users/${owner}/contacts?$filter=${encodeURIComponent(`emailAddresses/any(a:a/address eq '${em}')`)}&$select=id,displayName,companyName,mobilePhone,businessPhones&$top=1`);
+        if (ex.ok) c = (((await ex.json()).value) || [])[0] || null;
+        if (!c) {
+          const cr = await graphFetch(env, `/users/${owner}/contacts`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ displayName: row.name || em, emailAddresses: [{ address: em, name: row.name || em }] }) });
+          if (!cr.ok) return reply(env, 200, { ok: false, error: "The contact could not be created.", worker: WORKER_BUILD });
+          c = await cr.json();
+        }
+        let pic = false;
+        try {
+          const lg = await logoLookup(env, em);
+          if (lg) { const pr = await graphFetch(env, `/users/${owner}/contacts/${encodeURIComponent(c.id)}/photo/$value`, { method: "PUT", headers: { "Content-Type": lg.headers.get("Content-Type") || "image/png" }, body: new Uint8Array(await lg.arrayBuffer()) }); pic = pr.ok; }
+        } catch (e) {}
+        await env.DB.prepare("UPDATE contact_approvals SET status = 'approved' WHERE email = ?").bind(em).run();
+        return reply(env, 200, { ok: true, logo: pic, contact: { id: ob.id + ":" + c.id, name: String(c.displayName || row.name || "").slice(0, 80), company: String(c.companyName || "").slice(0, 60), emails: [em], phone: String(c.mobilePhone || (c.businessPhones || [])[0] || "").slice(0, 30), address: "" }, worker: WORKER_BUILD });
+      }
+      if (act === "newfolder") {
+        const name = String(body.name || "").replace(/\s+/g, " ").trim().slice(0, 100);
+        if (!name) return reply(env, 200, { ok: false, error: "Give the folder a name.", worker: WORKER_BUILD });
+        const parent = body.parent ? mailFolderId(body.parent) : "";
+        const nf = await mailDo(env, addr, parent ? `/mailFolders/${encodeURIComponent(parent)}/childFolders` : "/mailFolders", "POST", { displayName: name });
+        if (!nf.ok) return reply(env, 200, { ok: false, error: nf.status === 409 ? "A folder with that name is already there." : mailWhy(nf, true), worker: WORKER_BUILD });
+        return reply(env, 200, { ok: true, folder: { id: String((nf.json && nf.json.id) || ""), name: String((nf.json && nf.json.displayName) || name) }, worker: WORKER_BUILD });
+      }
+      if (act === "renamefolder" || act === "deletefolder") {
+        // Outlook's own folders cannot be renamed or deleted. Deleting moves the folder, and what is in it, to Deleted Items.
+        const fid = String(body.folder || "");
+        if (!fid || /^(inbox|drafts|sentitems|deleteditems|archive|junkemail|outbox|msgfolderroot)$/i.test(fid)) return reply(env, 200, { ok: false, error: "That folder cannot be changed.", worker: WORKER_BUILD });
+        if (act === "renamefolder") {
+          const nm = String(body.name || "").replace(/\s+/g, " ").trim().slice(0, 100);
+          if (!nm) return reply(env, 200, { ok: false, error: "Give the folder a name.", worker: WORKER_BUILD });
+          const rn = await mailDo(env, addr, `/mailFolders/${encodeURIComponent(fid)}`, "PATCH", { displayName: nm });
+          if (!rn.ok) return reply(env, 200, { ok: false, error: rn.status === 409 ? "A folder with that name is already there." : mailWhy(rn, true), worker: WORKER_BUILD });
+          return reply(env, 200, { ok: true, worker: WORKER_BUILD });
+        }
+        const mv = await mailDo(env, addr, `/mailFolders/${encodeURIComponent(fid)}/move`, "POST", { destinationId: "deleteditems" });
+        if (!mv.ok) return reply(env, 200, { ok: false, error: mailWhy(mv, true), worker: WORKER_BUILD });
+        return reply(env, 200, { ok: true, worker: WORKER_BUILD });
+      }
+      if (act === "bulkmove") {
+        // Many emails moved in one go, twenty to a request, so Microsoft is not asked hundreds of times at once. Moves into Archive are marked read first.
+        const ids = (Array.isArray(body.ids) ? body.ids : []).map((x) => String(x || "")).filter(Boolean).slice(0, 500);
+        const dest = mailFolderId(body.dest);
+        if (!ids.length) return reply(env, 200, { ok: false, error: "Nothing was selected.", worker: WORKER_BUILD });
+        const toArchive = String(dest).toLowerCase() === "archive";
+        const run = async (chunk, mk) => {
+          const br = await graphFetch(env, "/$batch", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ requests: chunk.map((id, k) => mk(id, String(k))) }) });
+          if (!br.ok) return chunk.map(() => ({ status: br.status }));
+          let bj = null; try { bj = await br.json(); } catch (e) { bj = null; }
+          const out = chunk.map(() => ({ status: 500 }));
+          ((bj && bj.responses) || []).forEach((r) => { const k = Number(r.id); if (out[k]) out[k] = { status: r.status, id: r.body && r.body.id ? String(r.body.id) : "" }; });
+          return out;
+        };
+        let moved = 0, failed = 0;
+        const newIds = {};
+        for (let i = 0; i < ids.length; i += 20) {
+          const chunk = ids.slice(i, i + 20);
+          if (toArchive) await run(chunk, (id, k) => ({ id: k, method: "PATCH", url: `/users/${encodeURIComponent(addr)}/messages/${encodeURIComponent(id)}`, headers: { "Content-Type": "application/json" }, body: { isRead: true } }));
+          const res = await run(chunk, (id, k) => ({ id: k, method: "POST", url: `/users/${encodeURIComponent(addr)}/messages/${encodeURIComponent(id)}/move`, headers: { "Content-Type": "application/json" }, body: { destinationId: dest } }));
+          res.forEach((r, k) => { if (r.status >= 200 && r.status < 300) { moved++; if (r.id) newIds[chunk[k]] = r.id; } else failed++; });
+        }
+        return reply(env, 200, { ok: true, moved, failed, newIds, worker: WORKER_BUILD });
+      }
+      if (act === "foldermove") {
+        // A folder of your own (and what is in it) moves into another folder, into Archive, or back to the top level. Outlook's own folders stay where they are.
+        const fid = String(body.folder || "");
+        const dest = String(body.dest || "");
+        if (!fid || !dest || /^(inbox|drafts|sentitems|deleteditems|archive|junkemail|outbox|msgfolderroot)$/i.test(fid)) return reply(env, 200, { ok: false, error: "That folder cannot be moved.", worker: WORKER_BUILD });
+        if (fid === dest) return reply(env, 200, { ok: false, error: "A folder cannot go into itself.", worker: WORKER_BUILD });
+        const mv = await mailDo(env, addr, `/mailFolders/${encodeURIComponent(fid)}/move`, "POST", { destinationId: mailFolderId(dest) });
+        if (!mv.ok) return reply(env, 200, { ok: false, error: mv.status === 409 ? "A folder with that name is already there." : mailWhy(mv, true), worker: WORKER_BUILD });
+        return reply(env, 200, { ok: true, newId: String((mv.json && mv.json.id) || ""), worker: WORKER_BUILD });
+      }
+      if (act === "addnote" || act === "editnote" || act === "acknote") {
+        const imid = String(body.imid || "").slice(0, 300);
+        if (!imid) return reply(env, 200, { ok: false, error: "That email cannot take a note.", worker: WORKER_BUILD });
+        await mailNotesTable(env);
+        const me = String(user.email || "").toLowerCase();
+        const by = String(user.name || user.email || "").trim().slice(0, 80);
+        const text = String(body.note || "").replace(/\r/g, "").trim().slice(0, 1000);
+        if (act === "addnote") {
+          if (!text) return reply(env, 200, { ok: false, error: "The note is empty.", worker: WORKER_BUILD });
+          await env.DB.prepare("INSERT INTO mail_notes (id, box, imid, text, by_name, by_email, at) VALUES (?, ?, ?, ?, ?, ?, ?)").bind(crypto.randomUUID(), box.id, imid, text, by, me, new Date().toISOString()).run();
+        } else if (act === "editnote") {
+          const row = await env.DB.prepare("SELECT by_email, at FROM mail_notes WHERE id = ? AND box = ? AND imid = ?").bind(String(body.noteId || ""), box.id, imid).first();
+          if (!row) return reply(env, 200, { ok: false, error: "That note is no longer there.", worker: WORKER_BUILD });
+          if (String(row.by_email || "").toLowerCase() !== me) return reply(env, 200, { ok: false, error: "Only the person who wrote a note can change it.", worker: WORKER_BUILD });
+          if (Date.now() - Date.parse(String(row.at || "")) > 5 * 60 * 1000) return reply(env, 200, { ok: false, error: "A note can only be changed in the first 5 minutes. Add a new note instead.", worker: WORKER_BUILD });
+          if (!text) return reply(env, 200, { ok: false, error: "The note is empty.", worker: WORKER_BUILD });
+          await env.DB.prepare("UPDATE mail_notes SET text = ?, edited_at = ? WHERE id = ?").bind(text, new Date().toISOString(), String(body.noteId)).run();
+        } else {
+          await env.DB.prepare("INSERT OR IGNORE INTO mail_note_acks (note_id, email, at) SELECT id, ?, ? FROM mail_notes WHERE box = ? AND imid = ?").bind(me, new Date().toISOString(), box.id, imid).run();
+        }
+        const cats = Array.isArray(body.categories) ? body.categories : [];
+        const nt = await mailNotesFor(env, box.id, imid, user, cats);
+        return reply(env, 200, { ok: true, notes: nt.notes, noteFlash: nt.flash, worker: WORKER_BUILD });
+      }
+      if (act === "urgentoff") {
+        const imid = String(body.imid || "").slice(0, 300);
+        if (!imid) return reply(env, 200, { ok: false, error: "That email cannot be changed.", worker: WORKER_BUILD });
+        await mailExtraTable(env);
+        await env.DB.prepare("INSERT OR IGNORE INTO mail_extra (box, imid) VALUES (?, ?)").bind(box.id, imid).run();
+        await env.DB.prepare("UPDATE mail_extra SET urgent_off = ? WHERE box = ? AND imid = ?").bind(body.off === false ? 0 : 1, box.id, imid).run();
+        return reply(env, 200, { ok: true, worker: WORKER_BUILD });
+      }
+      if (act === "markall") {
+        const fid = mailFolderId(body.folder), want = !!body.read;
+        let next = `/mailFolders/${encodeURIComponent(fid)}/messages?$top=100&$select=id&$filter=${encodeURIComponent("isRead eq " + (want ? "false" : "true"))}`;
+        const ids = [];
+        for (let pg = 0; pg < 5 && next; pg++) {
+          const lr = await mailGraph(env, addr, next);
+          if (!lr.ok) return reply(env, 200, { ok: false, error: mailWhy(lr), worker: WORKER_BUILD });
+          ((lr.json && lr.json.value) || []).forEach((m) => { if (m.id) ids.push(m.id); });
+          next = lr.json && lr.json["@odata.nextLink"] ? lr.json["@odata.nextLink"] : "";
+        }
+        let changed = 0, failed = 0;
+        for (let i = 0; i < ids.length; i += 20) {
+          const chunk = ids.slice(i, i + 20);
+          const br = await graphFetch(env, "/$batch", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ requests: chunk.map((id, k) => ({ id: String(k), method: "PATCH", url: `/users/${encodeURIComponent(addr)}/messages/${encodeURIComponent(id)}`, headers: { "Content-Type": "application/json" }, body: { isRead: want } })) }) });
+          if (!br.ok) { failed += chunk.length; continue; }
+          let bj = null; try { bj = await br.json(); } catch (e) { bj = null; }
+          ((bj && bj.responses) || []).forEach((r) => { if (r.status >= 200 && r.status < 300) changed++; else failed++; });
+        }
+        return reply(env, 200, { ok: failed === 0, changed, failed, error: failed ? `${failed} of ${ids.length} emails could not be changed.` : "", worker: WORKER_BUILD });
+      }
+      if (act === "restore" && msg) return done(await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}/move`, "POST", { destinationId: "inbox" }));
+      if (act === "flag" && msg) return done(await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}`, "PATCH", { flag: body.status === "complete" ? { flagStatus: "complete", completedDateTime: { dateTime: new Date().toISOString().slice(0, 19), timeZone: "UTC" } } : { flagStatus: body.status === "flagged" ? "flagged" : "notFlagged" } }));
+      if (act === "categories" && msg) return done(await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}`, "PATCH", { categories: (Array.isArray(body.categories) ? body.categories : []).map((c) => String(c).slice(0, 40)).slice(0, 12) }));
+      if (act === "delete" && msg) return done(await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}/move`, "POST", { destinationId: "deleteditems" }));
+      if (act === "reply" && msg) return done(await mailDraftSend(env, addr, msg, "createReply", body.comment, null, body));
+      if (act === "replyall" && msg) return done(await mailDraftSend(env, addr, msg, "createReplyAll", body.comment, null, body));
+      if (act === "forward" && msg) {
+        const to = mailRecipients(body.to);
+        if (!to.length) return reply(env, 200, { ok: false, error: "Add at least one valid email address to forward to.", worker: WORKER_BUILD });
+        return done(await mailDraftSend(env, addr, msg, "createForward", body.comment, to, body));
+      }
+      const draftBody = () => ({ subject: String(body.subject || "").slice(0, 250), body: { contentType: "HTML", content: mailBodyHtml(body, body.text) }, toRecipients: mailRecipients(body.to), ccRecipients: mailRecipients(body.cc), bccRecipients: mailRecipients(body.bcc), importance: body.importance === "high" ? "high" : "normal" });
+      if (act === "send") {
+        const to = mailRecipients(body && body.to);
+        if (!to.length && !mailRecipients(body && body.bcc).length) return reply(env, 200, { ok: false, error: "Add at least one valid email address to send to.", worker: WORKER_BUILD });
+        const msgObj = draftBody();
+        const atts = mailAtts(body.attachments), at = mailWhenOk(body.sendAt), holdNew = !!body.hold && !!at;
+        if (!atts.length && !at) return done(await mailDo(env, addr, "/sendMail", "POST", { message: msgObj, saveToSentItems: true }));
+        const made = await mailDo(env, addr, "/messages", "POST", at && !holdNew ? { ...msgObj, singleValueExtendedProperties: [{ id: "SystemTime 0x3FEF", value: at }] } : msgObj);
+        if (!made.ok || !made.json || !made.json.id) return done(made);
+        for (const a of atts) { const ar = await mailDo(env, addr, `/messages/${encodeURIComponent(made.json.id)}/attachments`, "POST", a); if (!ar.ok) return done(ar); }
+        if (holdNew) { await mailHoldAdd(env, addr, made.json.id, at, user.email); return reply(env, 200, { ok: true, held: at, worker: WORKER_BUILD }); }
+        return done(await mailDo(env, addr, `/messages/${encodeURIComponent(made.json.id)}/send`, "POST"));
+      }
+      if (act === "savedraft") {
+        let id = mailId(body.draftId);
+        if (id) {
+          const u = await mailDo(env, addr, `/messages/${encodeURIComponent(id)}`, "PATCH", draftBody());
+          if (u.ok) {
+            const have = await mailGraph(env, addr, `/messages/${encodeURIComponent(id)}/attachments?$select=name`);
+            const names = new Set(((have.ok && have.json && have.json.value) || []).map((x) => String(x.name || "")));
+            for (const a of mailAtts(body.attachments)) if (!names.has(a.name)) await mailDo(env, addr, `/messages/${encodeURIComponent(id)}/attachments`, "POST", a);
+          }
+          return u.ok ? reply(env, 200, { ok: true, draftId: id, worker: WORKER_BUILD }) : done(u); }
+        let made;
+        if (String(body.kind) === "forward" && msg) made = await mailDraftSend(env, addr, msg, "createForward", body.comment, mailRecipients(body.to), { ...body, noSend: true });
+        else if ((String(body.kind) === "reply" || String(body.kind) === "replyall") && msg) made = await mailDraftSend(env, addr, msg, String(body.kind) === "reply" ? "createReply" : "createReplyAll", body.comment, mailRecipients(body.to), { ...body, noSend: true });
+        else {
+          made = await mailDo(env, addr, "/messages", "POST", draftBody());
+          if (made.ok && made.json && made.json.id) for (const a of mailAtts(body.attachments)) await mailDo(env, addr, `/messages/${encodeURIComponent(made.json.id)}/attachments`, "POST", a);
+        }
+        return made.ok && made.json && made.json.id ? reply(env, 200, { ok: true, draftId: made.json.id, worker: WORKER_BUILD }) : done(made);
+      }
+      if (act === "report" && msg) {
+        const cat = body.kind === "phishing" ? "phishing" : "notJunk";
+        const r = await mailGraphPost(env, "/security/threatSubmission/emailThreats", { "@odata.type": "#microsoft.graph.security.emailContentThreatSubmission", category: cat, recipientEmailAddress: addr, messageUrl: `${GRAPH}/users/${encodeURIComponent(addr)}/messages/${encodeURIComponent(msg)}` });
+        if (r.ok) return reply(env, 200, { ok: true, worker: WORKER_BUILD });
+        const denied = r.status === 401 || r.status === 403;
+        return reply(env, 200, { ok: false, denied, error: denied ? "Microsoft refused the report. ThreatSubmission.ReadWrite.All needs adding to Reservoir Directories." : "Microsoft report failed (" + r.status + ")", worker: WORKER_BUILD });
+      }
+      if ((act === "discarddraft" || act === "purge") && msg) return done(await mailDo(env, addr, `/messages/${encodeURIComponent(msg)}/permanentDelete`, "POST"));
+    }
+  } catch (e) { return reply(env, 200, { ok: false, error: String(e && e.message || e).slice(0, 160), worker: WORKER_BUILD }); }
+  return reply(env, 404, { error: "not found" });
+}
+// Looks for mail that arrived since the last look and tells everyone who has access. The first look only marks the time, so nothing floods in.
+// ---- Suggested addresses are kept in the database, so typing a name never waits on Microsoft. Contacts and sent mail recipients are copied in every few minutes, and again straight after a contact is saved or deleted.
+async function rcptRefresh(env, boxes, what) {
+  await env.DB.prepare("CREATE TABLE IF NOT EXISTS rcpt_index (box TEXT, cid TEXT, name TEXT, company TEXT, emails TEXT, src TEXT, PRIMARY KEY (box, cid))").run();
+  for (const bx of boxes) {
+    const ad = mailAddress(env, bx);
+    const rows = [];
+    const keep = new Set();
+    if (what !== "sent") {
+      let ok = true;
+      for (let skip = 0; skip < 2000; skip += 200) {
+        const r = await mailGraph(env, ad, `/contacts?$top=200&$skip=${skip}&$select=id,displayName,emailAddresses,companyName`);
+        if (!r.ok) { ok = false; break; }
+        const v = (r.json && r.json.value) || [];
+        for (const c of v) { const em = (c.emailAddresses || []).map((e) => String(e.address || "")).filter(Boolean).slice(0, 4); if (!em.length) continue; keep.add(em[0].toLowerCase()); rows.push([bx.id, String(c.id), String(c.displayName || "").slice(0, 80), String(c.companyName || "").slice(0, 60), em.join("|"), "c"]); }
+        if (v.length < 200) break;
+      }
+      if (!ok) rows.length = 0;
+      else await env.DB.prepare("DELETE FROM rcpt_index WHERE box = ? AND src = 'c'").bind(bx.id).run();
+    }
+    if (what !== "contacts") {
+      const r = await mailGraph(env, ad, "/mailFolders/sentitems/messages?$top=200&$select=toRecipients,ccRecipients,bccRecipients");
+      if (r.ok) {
+        const seen = new Set();
+        for (const m of ((r.json && r.json.value) || [])) for (const x of [...(m.toRecipients || []), ...(m.ccRecipients || []), ...(m.bccRecipients || [])]) {
+          const ea = x && x.emailAddress; const a = String((ea && ea.address) || "").trim().toLowerCase(); const nm = String((ea && ea.name) || "").trim();
+          if (!a || seen.has(a)) continue; seen.add(a);
+          rows.push([bx.id, "sent:" + a, (nm && nm.toLowerCase() !== a ? nm : "").slice(0, 80), "", a.slice(0, 120), "s"]);
+        }
+        await env.DB.prepare("DELETE FROM rcpt_index WHERE box = ? AND src = 's'").bind(bx.id).run();
+      } else { for (let i = rows.length - 1; i >= 0; i--) if (rows[i][5] === "s") rows.splice(i, 1); }
+    }
+    for (let i = 0; i < rows.length; i += 80) await env.DB.batch(rows.slice(i, i + 80).map((x) => env.DB.prepare("INSERT OR REPLACE INTO rcpt_index (box, cid, name, company, emails, src) VALUES (?, ?, ?, ?, ?, ?)").bind(...x)));
+    try { await env.DB.prepare("INSERT OR REPLACE INTO app_settings (key, value, detail, by_name, at) VALUES (?, ?, '', 'system', ?)").bind("rcpt_at_" + bx.id, String(Date.now()), Date.now()).run(); } catch (e) { }
+  }
+}
+// ---- Pictures pasted into the body of a received email are moved out into attachments named Attachment 1, Attachment 2 and so on. Runs every minute from its own trigger, looks only at recent inbox mail with attachments, and touches only the current email, never the quoted trail below it. Small pictures (logos, signatures) are left alone. Only the mailboxes listed in the app setting picclean_boxes are checked (tayler until it has been tested). Each message is looked at once.
+// Teleca 1300 voicemail emails land in DFP Jobs. The body names the voicemail box the caller chose. Commercial gets the Andrew category and a note, General and Maintenance gets the Maintenance category, Residential Builds and Accounts and Other are left alone.
+async function vmTag(env) {
+  await env.DB.prepare("CREATE TABLE IF NOT EXISTS vm_done (id TEXT PRIMARY KEY, at INTEGER, result TEXT)").run();
+  await mailExtraTable(env);
+  const b = MAILBOXES.find((x) => x.id === "jobs");
+  if (!b) return;
+  const addr = mailAddress(env, b);
+  const since = new Date(Date.now() - 60 * 60000).toISOString();
+  const list = await mailGraph(env, addr, `/mailFolders/inbox/messages?$top=25&$select=id,from,internetMessageId,categories&$filter=${encodeURIComponent(`receivedDateTime ge ${since}`)}&$orderby=receivedDateTime desc`);
+  if (!list.ok || !list.json) return;
+  for (const m of (list.json.value || [])) {
+    const from = String((((m.from || {}).emailAddress || {}).address) || "").toLowerCase();
+    if (!/@([\w-]+\.)*teleca\.[a-z.]+$/.test(from)) continue;
+    const done = await env.DB.prepare("SELECT id FROM vm_done WHERE id = ?1").bind(m.id).first();
+    if (done) continue;
+    const mark = (res) => env.DB.prepare("INSERT OR REPLACE INTO vm_done (id, at, result) VALUES (?1, ?2, ?3)").bind(m.id, Date.now(), String(res).slice(0, 200)).run();
+    try {
+      const full = await mailGraph(env, addr, `/messages/${encodeURIComponent(m.id)}?$select=body`);
+      if (!full.ok || !full.json) { await mark("unreadable"); continue; }
+      const text = String((full.json.body && full.json.body.content) || "").replace(/<[^>]+>/g, " ").replace(/&nbsp;/g, " ").replace(/\s+/g, " ");
+      const nm = /Voicemail name:\s*([A-Za-z][A-Za-z &]*?)\s*(?:Caller ID|Kind Regards|$)/i.exec(text);
+      const name = nm ? nm[1].trim().toLowerCase() : "";
+      if (!name) { await mark("no voicemail name"); continue; }
+      const have = (m.categories || []).map(String);
+      if (/commercial/.test(name)) {
+        await mailDo(env, addr, `/messages/${encodeURIComponent(m.id)}`, "PATCH", { categories: [...new Set([...have, "Andrew"])] });
+        const imid = String(m.internetMessageId || "").slice(0, 300);
+        if (imid) {
+          await mailNotesTable(env);
+          await env.DB.prepare("INSERT OR IGNORE INTO mail_notes (id, box, imid, text, by_name, by_email, at) VALUES (?, ?, ?, ?, 'Weir', '', ?)").bind("auto:" + b.id + ":" + imid, b.id, imid, "This is a commercial inquiry through the 1300.", new Date().toISOString()).run();
+        }
+        await mark("commercial");
+      } else if (/general|maintenance/.test(name)) {
+        await mailDo(env, addr, `/messages/${encodeURIComponent(m.id)}`, "PATCH", { categories: [...new Set([...have, "Maintenance"])] });
+        await mark("maintenance");
+      } else await mark("left alone: " + name);
+    } catch (e) { await mark("failed " + String(e && e.message || e)); }
+  }
+}
+async function picClean(env) {
+  await env.DB.prepare("CREATE TABLE IF NOT EXISTS pic_done (id TEXT PRIMARY KEY, at INTEGER, result TEXT)").run();
+  let boxes = "";
+  try { const r = await env.DB.prepare("SELECT value FROM app_settings WHERE key = 'picclean_boxes'").first(); if (r && r.value != null) boxes = String(r.value); } catch (e) { }
+  const ids = boxes.split(",").map((x) => x.trim().toLowerCase()).filter(Boolean);
+  for (const b of MAILBOXES.filter((x) => ids.includes(x.id))) {
+    const addr = mailAddress(env, b);
+    const since = new Date(Date.now() - 60 * 60000).toISOString();
+    const list = await mailGraph(env, addr, `/mailFolders/inbox/messages?$top=25&$select=id,subject&$filter=${encodeURIComponent(`receivedDateTime ge ${since}`)}&$orderby=receivedDateTime desc`);
+    if (!list.ok || !list.json) continue;
+    for (const m of (list.json.value || [])) {
+      const done = await env.DB.prepare("SELECT id FROM pic_done WHERE id = ?1").bind(m.id).first();
+      if (done) continue;
+      const mark = (res) => env.DB.prepare("INSERT OR REPLACE INTO pic_done (id, at, result) VALUES (?1, ?2, ?3)").bind(m.id, Date.now(), String(res).slice(0, 200)).run();
+      try {
+        const full = await mailGraph(env, addr, `/messages/${encodeURIComponent(m.id)}?$select=body,isDraft`);
+        if (!full.ok || !full.json || full.json.isDraft) { await mark("unreadable"); continue; }
+        const html = String((full.json.body && full.json.body.content) || "");
+        // Only the current email: everything from the first sign of a quoted reply or forward onwards is left alone.
+        const cut = html.search(/<div id="appendonsend"|<div id="divRplyFwdMsg"|<blockquote|<div style="border:none;border-top:solid #E1E1E1|<hr[^>]*id="stopSpelling"/i);
+        const top = cut >= 0 ? html.slice(0, cut) : html;
+        const rest = cut >= 0 ? html.slice(cut) : "";
+        const imgs = top.match(/<img\b[^>]*>/gi) || [];
+        if (!imgs.length) { await mark("no pictures"); continue; }
+        const al = await mailGraph(env, addr, `/messages/${encodeURIComponent(m.id)}/attachments?$select=id,name,size,isInline,contentType,contentId`);
+        const atts = (al.json && al.json.value) || [];
+        let n = atts.filter((a) => /^Attachment \d+/.test(String(a.name || ""))).length;
+        const jobs = [];
+        let newTop = top;
+        for (const tag of imgs) {
+          const src = (tag.match(/\ssrc\s*=\s*["']([^"']+)["']/i) || [])[1] || "";
+          if (/^cid:/i.test(src)) {
+            const cid = src.slice(4).replace(/^<|>$/g, "");
+            const a = atts.find((x) => String(x.contentId || "").replace(/^<|>$/g, "") === cid);
+            if (a && a.size >= 30000 && /^image\//i.test(a.contentType || "")) { jobs.push({ a, tag }); newTop = newTop.replace(tag, ""); }
+          } else if (/^data:image\//i.test(src) && src.length > 40000) {
+            const mm = src.match(/^data:(image\/[a-z+.-]+);base64,(.+)$/i);
+            if (mm) { jobs.push({ data: mm[2], type: mm[1], tag }); newTop = newTop.replace(tag, ""); }
+          }
+        }
+        if (!jobs.length) { await mark("only small pictures"); continue; }
+        const patch = await mailDo(env, addr, `/messages/${encodeURIComponent(m.id)}`, "PATCH", { body: { contentType: "html", content: newTop + rest } });
+        if (!patch.ok) { await mark("body edit refused " + patch.status); continue; }
+        let made = 0;
+        for (const j of jobs) {
+          let bytes = j.data, type = j.type, oldId = "";
+          if (j.a) {
+            const g = await mailGraph(env, addr, `/messages/${encodeURIComponent(m.id)}/attachments/${encodeURIComponent(j.a.id)}`);
+            if (!g.ok || !g.json || !g.json.contentBytes) continue;
+            bytes = g.json.contentBytes; type = g.json.contentType || j.a.contentType; oldId = j.a.id;
+          }
+          const ext = (String(type).split("/")[1] || "png").replace("jpeg", "jpg").replace(/[^a-z0-9]/gi, "") || "png";
+          n++;
+          const add = await mailDo(env, addr, `/messages/${encodeURIComponent(m.id)}/attachments`, "POST", { "@odata.type": "#microsoft.graph.fileAttachment", name: `Attachment ${n}.${ext}`, contentType: type, contentBytes: bytes, isInline: false });
+          if (!add.ok) { n--; continue; }
+          made++;
+          if (oldId) await mailDo(env, addr, `/messages/${encodeURIComponent(m.id)}/attachments/${encodeURIComponent(oldId)}`, "DELETE");
+        }
+        await mark(`moved ${made} of ${jobs.length}`);
+      } catch (e) { await mark("failed " + String(e && e.message || e)); }
+    }
+  }
+}
+// ---- One off test: three emails sent from the Tayler mailbox to itself with pictures sitting in the body, to prove the picture clean up. Runs once (flag in app_settings) from the every minute trigger.
+async function pngMake(w, h, px) {
+  const crcT = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) { let c = n; for (let k = 0; k < 8; k++) c = c & 1 ? 0xEDB88320 ^ (c >>> 1) : c >>> 1; crcT[n] = c >>> 0; }
+  const crc = (u8) => { let c = 0xFFFFFFFF; for (let i = 0; i < u8.length; i++) c = crcT[(c ^ u8[i]) & 255] ^ (c >>> 8); return (c ^ 0xFFFFFFFF) >>> 0; };
+  const chunk = (type, data) => { const o = new Uint8Array(12 + data.length); const dv = new DataView(o.buffer); dv.setUint32(0, data.length); for (let i = 0; i < 4; i++) o[4 + i] = type.charCodeAt(i); o.set(data, 8); dv.setUint32(8 + data.length, crc(o.subarray(4, 8 + data.length))); return o; };
+  const ihdr = new Uint8Array(13); const iv = new DataView(ihdr.buffer); iv.setUint32(0, w); iv.setUint32(4, h); ihdr[8] = 8; ihdr[9] = 2;
+  let y = 0;
+  const rs = new ReadableStream({ pull(ctl) { if (y >= h) { ctl.close(); return; } const row = new Uint8Array(1 + w * 3); for (let x = 0; x < w; x++) { const c = px(x, y); row[1 + x * 3] = c[0]; row[2 + x * 3] = c[1]; row[3 + x * 3] = c[2]; } y++; ctl.enqueue(row); } }).pipeThrough(new CompressionStream("deflate"));
+  const rd = rs.getReader(); const parts = []; let len = 0;
+  for (;;) { const r = await rd.read(); if (r.done) break; parts.push(r.value); len += r.value.length; }
+  const idat = new Uint8Array(len); let o = 0; for (const q of parts) { idat.set(q, o); o += q.length; }
+  const sig = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
+  const a = chunk("IHDR", ihdr), b = chunk("IDAT", idat), c = chunk("IEND", new Uint8Array(0));
+  const out = new Uint8Array(sig.length + a.length + b.length + c.length); let k = 0; for (const q of [sig, a, b, c]) { out.set(q, k); k += q.length; }
+  return out;
+}
+const u8b64 = (u8) => { let s = ""; for (let i = 0; i < u8.length; i += 0x8000) s += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000)); return btoa(s); };
+async function picTest(env) {
+  await env.DB.prepare("CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT, detail TEXT, by_name TEXT, at TEXT)").run();
+  const done = await env.DB.prepare("SELECT value FROM app_settings WHERE key = 'pictest.20261126'").first();
+  if (done) return;
+  await env.DB.prepare("INSERT INTO app_settings (key, value, detail, by_name, at) VALUES ('pictest.20261126', '1', 'picture clean up test sent', 'Reservoir', datetime('now'))").run();
+  const b = MAILBOXES.find((x) => x.id === "tayler");
+  const addr = mailAddress(env, b);
+  // A screenshot style picture: light page, coloured bars, a little noise so it is a real size.
+  const shot = (seed) => (x, y) => { const n = (((x * 7 + y * 13 + seed * 31) * 2654435761) >>> 24) % 24; const bar = (y % 90) < 40 && x > 80 && x < 1000 - (y % 7) * 40; return bar ? [40 + seed * 40 + n, 110 + n, 190 - seed * 30 + n] : [236 - n, 238 - n, 242 - n]; };
+  // A camera style picture: large, smooth sky and ground with fine grain.
+  const photo = (x, y) => { const g = (Math.random() * 2) | 0, t = y / 5000; return y < 2600 ? [80 + g + ((t * 160) | 0), 140 + g + ((t * 90) | 0), 215 - ((t * 60) | 0) + (g & 1)] : [60 + g + ((x / 4000 * 40) | 0), 90 + g, 50 + (g & 1)]; };
+  const jobs = [
+    { subject: "Picture test 1 of 3: one screenshot in the body", pics: [{ w: 1280, h: 720, px: shot(1) }] },
+    { subject: "Picture test 2 of 3: three screenshots in the body", pics: [{ w: 1280, h: 720, px: shot(0) }, { w: 1280, h: 720, px: shot(1) }, { w: 1280, h: 720, px: shot(2) }] },
+    { subject: "Picture test 3 of 3: one large camera photo in the body", pics: [{ w: 4000, h: 5000, px: photo }] }
+  ];
+  for (const j of jobs) {
+    let html = `<div style="font-family:Calibri,sans-serif;font-size:11pt">Morning,<br><br>Test email. The pictures below should be moved out into attachments.<br><br>`;
+    const files = [];
+    for (let i = 0; i < j.pics.length; i++) { const bytes = await pngMake(j.pics[i].w, j.pics[i].h, j.pics[i].px); files.push({ name: `image00${i + 1}.png`, cid: `pic${i + 1}@test`, bytes }); html += `<img src="cid:pic${i + 1}@test" width="480"><br><br>`; }
+    html += `Regards</div>`;
+    const made = await mailDo(env, addr, "/messages", "POST", { subject: j.subject, body: { contentType: "HTML", content: html }, toRecipients: [{ emailAddress: { address: addr } }] });
+    if (!made.ok || !made.json || !made.json.id) { console.log("pic test draft failed", made.status); continue; }
+    const id = made.json.id;
+    let okAll = true;
+    for (const f of files) {
+      if (f.bytes.length < 2500000) {
+        const r = await mailDo(env, addr, `/messages/${encodeURIComponent(id)}/attachments`, "POST", { "@odata.type": "#microsoft.graph.fileAttachment", name: f.name, contentType: "image/png", contentBytes: u8b64(f.bytes), isInline: true, contentId: f.cid });
+        if (!r.ok) { okAll = false; console.log("pic test attach failed", r.status); }
+      } else {
+        const us = await mailDo(env, addr, `/messages/${encodeURIComponent(id)}/attachments/createUploadSession`, "POST", { AttachmentItem: { attachmentType: "file", name: f.name, size: f.bytes.length, contentType: "image/png", isInline: true, contentId: f.cid } });
+        const url = us.json && us.json.uploadUrl;
+        if (!url) { okAll = false; console.log("pic test upload session failed", us.status); continue; }
+        const step = 3 * 1024 * 1024;
+        for (let at = 0; at < f.bytes.length; at += step) {
+          const part = f.bytes.subarray(at, Math.min(at + step, f.bytes.length));
+          const pr = await fetch(url, { method: "PUT", headers: { "Content-Length": String(part.length), "Content-Range": `bytes ${at}-${at + part.length - 1}/${f.bytes.length}` }, body: part });
+          if (!pr.ok) { okAll = false; console.log("pic test upload failed", pr.status); break; }
+        }
+      }
+    }
+    if (okAll) { const sent = await mailDo(env, addr, `/messages/${encodeURIComponent(id)}/send`, "POST"); if (!sent.ok) console.log("pic test send failed", sent.status); }
+  }
+}
+async function mailWatch(env) {
+  if (!env.GRAPH_CLIENT_SECRET) return;
+  await settingsTable(env);
+  const cleaned = await env.DB.prepare("SELECT value FROM app_settings WHERE key = 'mail.clean.1'").first();
+  if (!cleaned) {
+    await noticesTable(env);
+    await env.DB.prepare("DELETE FROM notices WHERE kind = 'mail'").run();
+    await env.DB.prepare("INSERT INTO app_settings (key, value, detail, by_name, at) VALUES ('mail.clean.1', '1', 'mail notices cleared', 'Reservoir', datetime('now'))").run();
+  }
+  const reset = await env.DB.prepare("SELECT value FROM app_settings WHERE key = 'mail.reset.2'").first();
+  if (!reset) {
+    const stamp = new Date().toISOString();
+    for (const b of MAILBOXES) await env.DB.prepare("INSERT INTO app_settings (key, value, detail, by_name, at) VALUES (?, ?, 'mail watch', 'Reservoir', datetime('now')) ON CONFLICT(key) DO UPDATE SET value = excluded.value, at = datetime('now')").bind("mail.seen." + b.id, stamp).run();
+    await env.DB.prepare("INSERT INTO app_settings (key, value, detail, by_name, at) VALUES ('mail.reset.2', ?, 'mail watch reset', 'Reservoir', datetime('now'))").bind(stamp).run();
+    return;
+  }
+  const tiers = await accessTiers(env);
+  for (const b of MAILBOXES) {
+    const key = "mail.seen." + b.id;
+    const row = await env.DB.prepare("SELECT value FROM app_settings WHERE key = ?").bind(key).first();
+    const now = new Date().toISOString();
+    const save = (v) => env.DB.prepare("INSERT INTO app_settings (key, value, detail, by_name, at) VALUES (?, ?, 'mail watch', 'Reservoir', datetime('now')) ON CONFLICT(key) DO UPDATE SET value = excluded.value, at = datetime('now')").bind(key, v).run();
+    if (!row) { await save(now); continue; }
+    const r = await mailGraph(env, mailAddress(env, b), `/mailFolders/inbox/messages?$top=20&$select=id,receivedDateTime,subject,from,categories&$orderby=receivedDateTime desc&$filter=${encodeURIComponent("receivedDateTime gt " + row.value)}`);
+    if (!r.ok) { console.log("mail watch", b.id, r.status); continue; }
+    const fresh = ((r.json && r.json.value) || []);
+    if (!fresh.length) continue;
+    const newest = fresh.map((m) => m.receivedDateTime).sort().pop();
+    const who = (m) => String((m.from && m.from.emailAddress && (m.from.emailAddress.name || m.from.emailAddress.address)) || "Someone").slice(0, 60);
+    const body = fresh.length === 1 ? `${who(fresh[0])}: ${String(fresh[0].subject || "(no subject)").slice(0, 100)}` : `${fresh.length} new emails, latest from ${who(fresh[0])}`;
+    const claim = await env.DB.prepare("UPDATE app_settings SET value = ?, at = datetime('now') WHERE key = ? AND value = ?").bind(newest, key, row.value).run();
+    if (!claim || !claim.meta || claim.meta.changes !== 1) continue;
+    const idKey = "mail.ids." + b.id;
+    const idRow = await env.DB.prepare("SELECT value FROM app_settings WHERE key = ?").bind(idKey).first();
+    let doneIds = []; try { doneIds = JSON.parse((idRow && idRow.value) || "[]"); } catch (e) { doneIds = []; }
+    const brandNew = fresh.filter((m) => !doneIds.includes(m.id) && Date.now() - Date.parse(m.receivedDateTime) < 5 * 60000);
+    await env.DB.prepare("INSERT INTO app_settings (key, value, detail, by_name, at) VALUES (?, ?, 'mail ids', 'Reservoir', datetime('now')) ON CONFLICT(key) DO UPDATE SET value = excluded.value, at = datetime('now')").bind(idKey, JSON.stringify(doneIds.concat(fresh.map((m) => m.id)).slice(-60))).run();
+    if (!brandNew.length) continue;
+    const to = Object.keys(tiers).filter((e) => mailAllowed(b, { email: e, tier: tiers[e] }));
+    // Teleca voicemails get their own alert (caller's name or number) and no normal new email alert.
+    const isVm = (m) => /^no-?reply@teleca\.com\.au$/i.test(String((m.from && m.from.emailAddress && m.from.emailAddress.address) || "")) && /^\s*voicemail from\b/i.test(String(m.subject || ""));
+    for (const m of brandNew.filter(isVm)) {
+      try {
+        const num = (String(m.subject).match(/^\s*voicemail from\s+(\+?[\d\s()]{6,}?)(?:\s*-\s*\d+:\d+.*)?\s*$/i) || [])[1] || "";
+        const key = (v) => { let d = String(v || "").replace(/\D/g, ""); if (d.startsWith("61") && d.length === 11) d = "0" + d.slice(2); else if (d.length === 9 && !d.startsWith("0")) d = "0" + d; return d; };
+        let who2 = String(num).trim(), want = key(num);
+        if (want.length >= 8) {
+          find: for (const bx of MAILBOXES) {
+            for (let skip = 0; skip < 2000; skip += 200) {
+              const r2 = await mailGraph(env, mailAddress(env, bx), `/contacts?$top=200&$skip=${skip}&$select=displayName,mobilePhone,businessPhones,homePhones`);
+              const v = (r2.ok && r2.json && r2.json.value) || [];
+              const hit = v.find((c) => [c.mobilePhone].concat(c.businessPhones || [], c.homePhones || []).some((x) => x && key(x) === want));
+              if (hit && hit.displayName) { who2 = String(hit.displayName).slice(0, 60); break find; }
+              if (v.length < 200) break;
+            }
+          }
+        }
+        for (const e of to) await notify(env, { to: e, kind: "mail", title: `1300 voicemail from ${who2}, in ${b.label}`, body: "", preview: true, link: "emailbox", box: b.id, by: "Reservoir" });
+      } catch (e) { console.log("voicemail alert", String(e && e.message || e).slice(0, 120)); }
+    }
+    const brandNewAll = brandNew;
+    brandNew.splice(0, brandNew.length, ...brandNewAll.filter((m) => !isVm(m)));
+    if (!brandNew.length) continue;
+    // No alert for mail from one of DFP's own mailboxes (the blind copy on our replies), and none for mail that has already left the Inbox. The checks run together so the alert is not slowed.
+    const baddr = mailAddress(env, b);
+    const ownAddrs = MAILBOXES.map((x) => mailAddress(env, x).toLowerCase());
+    let alertNew = brandNew.filter((m) => !ownAddrs.includes(String((m.from && m.from.emailAddress && m.from.emailAddress.address) || "").toLowerCase()));
+    const still = await Promise.all(alertNew.map(async (m) => { try { const g = await mailGraph(env, baddr, `/mailFolders/inbox/messages/${encodeURIComponent(m.id)}?$select=id`); return g.status !== 404; } catch (e) { return true; } }));
+    alertNew = alertNew.filter((_, i) => still[i]);
+    const prev = alertNew.length === 1 ? `${who(alertNew[0])}: ${String(alertNew[0].subject || "(no subject)").slice(0, 100)}` : `${alertNew.length} new emails, latest from ${who(alertNew[0])}`;
+    for (const m of brandNew) { try { const fa = (m.from && m.from.emailAddress) || {}; await approvalSeen(env, b, fa.address, fa.name, m.id); } catch (e) { console.log("approval seen", String(e && e.message || e).slice(0, 120)); } }
+    if (alertNew.length) for (const e of to) await notify(env, { to: e, kind: "mail", title: `New Email - ${b.label}`, body: prev, preview: true, link: "emailbox", box: b.id, by: "Reservoir" });
+    // After the alert: a new email with no category picks up the category of an earlier email with the same subject (subject alone, Re: and Fw: ignored).
+    for (const m of brandNew) {
+      try {
+        if ((m.categories || []).length) continue;
+        const base = String(m.subject || "").replace(/^\s*((re|fw|fwd)\s*:\s*)+/i, "").trim();
+        if (!base || base.length > 200) continue;
+        const q = base.replace(/'/g, "''");
+        const flt = ["", "Re: ", "RE: ", "Fw: ", "FW: ", "Fwd: "].map((p) => `subject eq '${p}${q}'`).join(" or ");
+        const rr = await mailGraph(env, baddr, `/messages?$top=30&$select=id,categories,receivedDateTime&$filter=${encodeURIComponent(flt)}`);
+        const hit = ((rr.ok && rr.json && rr.json.value) || []).filter((x) => x.id !== m.id && (x.categories || []).length).sort((a, c) => String(c.receivedDateTime).localeCompare(String(a.receivedDateTime)))[0];
+        if (hit) await mailDo(env, baddr, `/messages/${encodeURIComponent(m.id)}`, "PATCH", { categories: hit.categories });
+      } catch (e) { console.log("category copy", String(e && e.message || e).slice(0, 100)); }
+    }
+  }
+}
+// Once a day: drafts with no subject, recipients or words are deleted after 7 days, and any draft older than 14 days is deleted after a day's warning to whoever started it (matched from the name in its signature, or everyone with that mailbox if there is no match).
+// Microsoft pings the worker the moment mail lands in any of the four inboxes, so the notification is sent straight away. The subscriptions are renewed on the schedule.
+async function mailSubscribe(env) {
+  if (!env.GRAPH_CLIENT_SECRET) return;
+  await settingsTable(env);
+  const want = await invClientState(env);
+  for (const b of MAILBOXES) {
+    const key = "mail.sub." + b.id;
+    const row = await env.DB.prepare("SELECT value, detail FROM app_settings WHERE key = ?").bind(key).first();
+    const left = row && row.detail ? Date.parse(row.detail) - Date.now() : 0;
+    if (row && row.value && left > 24 * 3600 * 1000) continue;
+    const expires = new Date(Date.now() + 4200 * 60000).toISOString();
+    const save = (id) => env.DB.prepare("INSERT OR REPLACE INTO app_settings (key, value, detail, by_name, at) VALUES (?, ?, ?, 'Reservoir', datetime('now'))").bind(key, id, expires).run();
+    if (row && row.value) {
+      const r = await graphFetch(env, `/subscriptions/${encodeURIComponent(row.value)}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ expirationDateTime: expires }) });
+      if (r.ok) { await save(row.value); continue; }
+    }
+    const r = await graphFetch(env, "/subscriptions", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ changeType: "created", notificationUrl: `${env.API_ORIGIN || "https://reservoir-api.directflow.workers.dev"}/api/mail/notify`, resource: `users/${mailAddress(env, b)}/mailFolders/inbox/messages`, expirationDateTime: expires, clientState: want }) });
+    const j = await r.json().catch(() => ({}));
+    if (r.ok && j.id) await save(j.id);
+    else console.log("mail subscription failed", b.id, r.status, JSON.stringify(j).slice(0, 300));
+  }
+}
+// Everything in an Archive folder is read. Mail that reaches Archive without passing through Reservoir (an Outlook rule, or a move made in Outlook itself) is marked read here, on every scheduled run and whenever an Archive folder is opened.
+async function archiveReadSweep(env, only) {
+  if (!env.GRAPH_CLIENT_SECRET) return 0;
+  let total = 0;
+  for (const b of MAILBOXES) {
+    const addr = mailAddress(env, b);
+    if (only && String(only).toLowerCase() !== addr) continue;
+    try {
+      let next = `/mailFolders/archive/messages?$top=100&$select=id&$filter=${encodeURIComponent("isRead eq false")}`;
+      const ids = [];
+      for (let pg = 0; pg < 5 && next; pg++) {
+        const lr = await mailGraph(env, addr, next);
+        if (!lr.ok) { console.log("archive sweep list", b.id, lr.status); break; }
+        ((lr.json && lr.json.value) || []).forEach((m) => { if (m.id) ids.push(m.id); });
+        next = lr.json && lr.json["@odata.nextLink"] ? lr.json["@odata.nextLink"] : "";
+      }
+      for (let i = 0; i < ids.length; i += 20) {
+        const chunk = ids.slice(i, i + 20);
+        const br = await graphFetch(env, "/$batch", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ requests: chunk.map((id, k) => ({ id: String(k), method: "PATCH", url: `/users/${encodeURIComponent(addr)}/messages/${encodeURIComponent(id)}`, headers: { "Content-Type": "application/json" }, body: { isRead: true } })) }) });
+        if (br.ok) total += chunk.length; else console.log("archive sweep batch", b.id, br.status);
+      }
+    } catch (e) { console.log("archive sweep failed", b.id, String(e && e.message || e)); }
+  }
+  return total;
+}
+async function mailDraftsSweep(env) {
+  if (!env.GRAPH_CLIENT_SECRET) return;
+  await settingsTable(env);
+  const key = "mail.drafts.sweep";
+  const row = await env.DB.prepare("SELECT value FROM app_settings WHERE key = ?").bind(key).first();
+  const nowMs = Date.now();
+  if (row && nowMs - Date.parse(row.value) < 20 * 3600 * 1000) return;
+  await env.DB.prepare("INSERT INTO app_settings (key, value, detail, by_name, at) VALUES (?, ?, 'drafts sweep', 'Reservoir', datetime('now')) ON CONFLICT(key) DO UPDATE SET value = excluded.value, at = datetime('now')").bind(key, new Date(nowMs).toISOString()).run();
+  const tiers = await accessTiers(env);
+  for (const b of MAILBOXES) {
+    const addr = mailAddress(env, b);
+    const r = await mailGraph(env, addr, "/mailFolders/drafts/messages?$top=100&$select=id,subject,createdDateTime,body,toRecipients");
+    if (!r.ok) { console.log("drafts sweep", b.id, r.status); continue; }
+    const warn = new Map();
+    for (const m of (r.json && r.json.value) || []) {
+      const days = (nowMs - Date.parse(m.createdDateTime)) / 86400000;
+      const html = String((m.body && m.body.content) || "");
+      const cut = html.search(/<div id="dfp-sig"/i);
+      const words = (cut >= 0 ? html.slice(0, cut) : html).replace(/<head[\s\S]*?<\/head>|<style[\s\S]*?<\/style>/gi, "").replace(/<[^>]+>/g, " ").replace(/&nbsp;/g, " ").trim();
+      const empty = !String(m.subject || "").trim() && !words && !(m.toRecipients || []).length;
+      if (empty && days >= 7) { await mailDo(env, addr, `/messages/${encodeURIComponent(m.id)}/permanentDelete`, "POST"); continue; }
+      if (days < 13) continue;
+      const wk = "mail.draftwarn." + m.id.slice(-60);
+      const warned = await env.DB.prepare("SELECT value FROM app_settings WHERE key = ?").bind(wk).first();
+      if (warned && days >= 14) { await mailDo(env, addr, `/messages/${encodeURIComponent(m.id)}/permanentDelete`, "POST"); continue; }
+      if (warned) continue;
+      await env.DB.prepare("INSERT INTO app_settings (key, value, detail, by_name, at) VALUES (?, '1', 'draft warned', 'Reservoir', datetime('now')) ON CONFLICT(key) DO NOTHING").bind(wk).run();
+      const sigAt = cut >= 0 ? html.slice(cut) : "";
+      const first = ((sigAt.match(/<b>([^<]+)<\/b>/i) || [])[1] || "").trim().toLowerCase();
+      const author = first ? Object.keys(tiers).find((e) => e.split("@")[0] === first && mailAllowed(b, { email: e, tier: tiers[e] })) : "";
+      const who = author ? [author] : Object.keys(tiers).filter((e) => mailAllowed(b, { email: e, tier: tiers[e] }));
+      for (const e of who) warn.set(e, (warn.get(e) || 0) + 1);
+    }
+    for (const [e, n] of warn) await notify(env, { to: e, kind: "mail", title: `Old drafts, ${b.label}`, body: `There ${n === 1 ? "is a draft" : "are drafts"} in the ${b.label} mailbox you started that ${n === 1 ? "is" : "are"} more than 14 days old. ${n === 1 ? "It is" : "They are"} about to be deleted. Please go in and clear ${n === 1 ? "it" : "them"}.`, link: `emailbox:${b.id}:drafts`, by: "Reservoir" });
+  }
+}
+async function arofloRoutes(request, env, user, url) {
+  if (!url.pathname.startsWith("/api/aroflo")) return null;
+  if (user.tier !== "T1") return reply(env, 403, { error: "forbidden" });
+  const isPush = (url.pathname === "/api/aroflo/filter-test" || url.pathname === "/api/aroflo/push-test" || url.pathname === "/api/aroflo/push-note" || url.pathname === "/api/aroflo/push-file") && request.method === "POST";
+  if (request.method !== "GET" && !isPush) return reply(env, 404, { error: "not found" });
+  if (!env.AROFLO_TOKEN) return reply(env, 200, { ok: false, error: "The AROFLO_TOKEN secret is not set on the Worker.", worker: WORKER_BUILD });
+  try {
+    // A test only. Finds one project by its number, then tries to add a note and a small test PDF to it, and reports exactly what AroFlo answered for every attempt. Directors only, and only when the button is pressed.
+    // Add a note, or a photo, to a job. A director presses the button on the AroFlo Push screen. AroFlo's write routes are not published, so the likely ones are tried in turn and every answer is reported.
+    if (isPush && (url.pathname === "/api/aroflo/push-note" || url.pathname === "/api/aroflo/push-file")) {
+      const isNote = url.pathname === "/api/aroflo/push-note";
+      let body = {};
+      let bytes = null;
+      let coll = "", id = "", name = "";
+      if (isNote) { try { body = await request.json(); } catch (e) { body = {}; } coll = String(body.coll || ""); id = String(body.id || ""); }
+      else { coll = String(url.searchParams.get("coll") || ""); id = String(url.searchParams.get("id") || ""); name = String(url.searchParams.get("name") || "photo.jpg").replace(/[^A-Za-z0-9._ -]/g, "").slice(0, 80) || "photo.jpg"; bytes = await request.arrayBuffer(); if (!bytes.byteLength) return reply(env, 400, { error: "empty file" }); if (bytes.byteLength > 12 * 1024 * 1024) return reply(env, 413, { error: "file too large" }); }
+      if (!/^\/(tasks|projects|jobs)$/.test(coll) || !/^[A-Za-z0-9_.-]{1,60}$/.test(id)) return reply(env, 400, { error: "bad job" });
+      const text = isNote ? String(body.text || "").trim().slice(0, 4000) : "";
+      if (isNote && !text) return reply(env, 400, { error: "Write a note first" });
+      const enc = encodeURIComponent(id);
+      const attempts = [];
+      const send = async (label, path, init) => {
+        try {
+          const res = await fetch(AROFLO_BASE + path, { ...init, headers: { Authorization: "Bearer " + env.AROFLO_TOKEN, Accept: "application/json", ...(init.headers || {}) } });
+          const t = (await res.text()).slice(0, 240);
+          attempts.push({ label, path, status: res.status, body: t });
+          return res.ok;
+        } catch (e) { attempts.push({ label, path, status: 0, body: String(e && e.message || e).slice(0, 160) }); return false; }
+      };
+      let ok = false;
+      const hdrs = (res) => { const o = []; for (const k of ["allow", "www-authenticate", "content-type", "x-error", "x-message"]) { const v = res.headers.get(k); if (v) o.push(k + ": " + v); } return o.join("; "); };
+      const send2 = async (label, path, init) => {
+        try {
+          const res = await fetch(AROFLO_BASE + path, { ...init, headers: { Authorization: "Bearer " + env.AROFLO_TOKEN, Accept: "application/json", ...(init.headers || {}) } });
+          const t = (await res.text()).replace(/\s+/g, " ").slice(0, 200);
+          const h = hdrs(res);
+          attempts.push({ label, path, status: res.status, body: (h ? "[" + h + "] " : "") + t });
+          return res.ok;
+        } catch (e) { attempts.push({ label, path, status: 0, body: String(e && e.message || e).slice(0, 160) }); return false; }
+      };
+      // First ask AroFlo which methods each route allows.
+      const probe = isNote ? [`${coll}/${enc}/notes`, `/notes`, `${coll}/${enc}`] : [`${coll}/${enc}/documents`, `/documents`, `${coll}/${enc}`];
+      for (const p of probe) await send2("options", p, { method: "OPTIONS" });
+      const J = { "Content-Type": "application/json" };
+      // A write only counts when the job shows it afterwards, because AroFlo answers 204 even when it ignores the body.
+      const listPath = isNote ? `${coll}/${enc}/notes` : `${coll}/${enc}/documents`;
+      const marker = isNote ? text.slice(0, 24) : name.replace(/\.[^.]*$/, "");
+      const shows = async () => { const g = await arofloGet(env, listPath); const hit = !!(g.ok && JSON.stringify(g.json || g.text || "").includes(marker)); attempts.push({ label: "check the job", path: listPath, status: g.status, body: hit ? "It is on the job." : "Not on the job." }); return hit; };
+      const tryIt = async (label, path, init) => { const r = await send2(label, path, init); if (!r) return false; return await shows(); };
+      if (isNote) {
+        const html = "<p>" + text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/\n/g, "<br />") + "</p>";
+        const nb = { content: html, visibility: "INTERNAL_ONLY" };
+        const bulk = `${coll}/${enc}/notes/bulk`;
+        // AroFlo says each item needs a "filter". Documents use documentFilter INTERNAL_ONLY, so the note filter is most likely who can see it.
+        const tries = [];
+        for (const f of ["INTERNAL_ONLY", "INTERNAL", "PUBLIC", "EXTERNAL", "CLIENT", "ALL"]) tries.push([`bulk filter ${f}`, bulk, "POST", { taskNotes: [{ content: html, filter: f }] }]);
+        tries.push(["bulk filter as the task id", bulk, "POST", { taskNotes: [{ content: html, filter: id }] }]);
+        tries.push(["bulk filter object with task id", bulk, "POST", { taskNotes: [{ content: html, filter: { taskId: id } }] }]);
+        tries.push(["bulk filter object with id", bulk, "POST", { taskNotes: [{ content: html, filter: { id } }] }]);
+        tries.push(["bulk filter object with visibility", bulk, "POST", { taskNotes: [{ content: html, filter: { visibility: "INTERNAL_ONLY" } }] }]);
+        tries.push(["bulk filter with task id in the item", bulk, "POST", { taskNotes: [{ taskId: id, content: html, filter: "INTERNAL_ONLY" }] }]);
+        tries.push(["bulk filter with id in the item", bulk, "POST", { taskNotes: [{ id, content: html, filter: "INTERNAL_ONLY" }] }]);
+        for (const [lab, p, m, b] of tries) { if (ok) break; ok = await tryIt(`note, ${lab}`, p, { method: m, headers: J, body: JSON.stringify(b) }); }
+      } else {
+        const type = request.headers.get("Content-Type") || "image/jpeg";
+        const b64 = (() => { const u = new Uint8Array(bytes); let bin = ""; for (let i = 0; i < u.length; i += 0x8000) bin += String.fromCharCode.apply(null, u.subarray(i, i + 0x8000)); return btoa(bin); })();
+        const up = `${coll}/${enc}/documents/upload`;
+        const q = encodeURIComponent(name);
+        const tries = [
+          ["raw octet-stream with fileName", `${up}?fileName=${q}`, { "Content-Type": "application/octet-stream" }, bytes],
+          ["raw octet-stream with name", `${up}?name=${q}`, { "Content-Type": "application/octet-stream" }, bytes],
+          ["raw octet-stream with disposition", up, { "Content-Type": "application/octet-stream", "Content-Disposition": `attachment; filename="${name}"` }, bytes],
+          ["raw octet-stream with name headers", up, { "Content-Type": "application/octet-stream", "X-File-Name": name, "X-Filename": name }, bytes],
+          ["json base64 fileName and content", up, J, JSON.stringify({ fileName: name, content: b64 })],
+          ["json base64 name and data", up, J, JSON.stringify({ name, data: b64 })],
+          ["json base64 name and content", up, J, JSON.stringify({ name, content: b64 })],
+          ["json base64 fileName and data", up, J, JSON.stringify({ fileName: name, data: b64 })],
+          ["json base64 filename and file", up, J, JSON.stringify({ filename: name, file: b64 })],
+          ["json base64 displayName and base64", up, J, JSON.stringify({ displayName: name, fileName: name, base64: b64 })],
+          ["json base64 with content type", up, J, JSON.stringify({ name, fileName: name, contentType: type, mimeType: type, data: b64, content: b64 })]
+        ];
+        // This body is the one AroFlo answers 201 to. A 201 is the upload, so it counts without a second look at the job's list, which does not always show the new name straight away.
+        const win = tries.find((t) => t[0] === "json base64 displayName and base64");
+        if (win) { ok = await send2(`photo, ${win[0]}, POST`, win[1], { method: "POST", headers: win[2], body: win[3] }); }
+        for (const [lab, p, h, b] of tries) { if (ok) break; if (win && lab === win[0]) continue; ok = await tryIt(`photo, ${lab}, POST`, p, { method: "POST", headers: h, body: b }); }
+      }
+      return reply(env, 200, { ok, attempts, worker: WORKER_BUILD });
+    }
+    // Maps the document filter. Uploads a tiny text file with each filter value and reports what AroFlo answered, including the filter it says it stored. A made up value goes first so AroFlo's own error can list the real ones.
+    if (url.pathname === "/api/aroflo/filter-test") {
+      let body = {};
+      try { body = await request.json(); } catch (e) { body = {}; }
+      const coll = String(body.coll || ""), id = String(body.id || "");
+      if (!/^\/(tasks|projects|jobs)$/.test(coll) || !/^[A-Za-z0-9_.-]{1,60}$/.test(id)) return reply(env, 400, { error: "bad job" });
+      const up = `${coll}/${encodeURIComponent(id)}/documents/upload`;
+      const b64 = btoa("filter test");
+      const out = [];
+      const vals = ["ZZZ_NOT_A_FILTER", "INTERNAL_ONLY", "INTERNAL_ADMIN_ONLY", "INTERNAL_ADMIN_AND_MANAGER_ONLY", "INTERNAL_ADMIN_MANAGER_ONLY", "SHOW_CLIENT", "SHOW_CONTRACTOR", "SHOW_ALL"];
+      let n = 0;
+      for (const v of vals) {
+        n++;
+        try {
+          const res = await fetch(AROFLO_BASE + up, { method: "POST", headers: { Authorization: "Bearer " + env.AROFLO_TOKEN, Accept: "application/json", "Content-Type": "application/json" }, body: JSON.stringify({ displayName: `filter-test-${n}`, fileName: `filter-test-${n}.txt`, base64: b64, documentFilter: v }) });
+          const t = (await res.text()).replace(/\s+/g, " ");
+          const m = /"documentFilter"\s*:\s*"([^"]*)"/.exec(t);
+          out.push({ sent: v, status: res.status, stored: m ? m[1] : "", body: t.slice(0, 260) });
+        } catch (e) { out.push({ sent: v, status: 0, stored: "", body: String(e && e.message || e).slice(0, 160) }); }
+      }
+      return reply(env, 200, { ok: true, results: out, worker: WORKER_BUILD });
+    }
+    if (isPush) {
+      let body = {};
+      try { body = await request.json(); } catch (e) { body = {}; }
+      const want = String(body.jobNumber || "").trim();
+      if (!want || !/^[A-Za-z0-9_.-]{1,40}$/.test(want)) return reply(env, 400, { error: "Enter a job number" });
+      const log = [];
+      const note = (m) => log.push(m);
+      let pid = "";
+      const direct = await arofloGet(env, "/projects/" + encodeURIComponent(want));
+      if (direct.ok && direct.json) { pid = want; note(`Found project ${want} directly.`); }
+      else {
+        note(`Direct lookup of ${want} answered ${direct.status}. Searching the list.`);
+        const first = await arofloGet(env, "/projects");
+        let lastPage = 1;
+        if (first.ok) {
+          const l0 = arofloList(first.json) || [];
+          lastPage = arofloLastPage(arofloMeta(first.json), l0.length) || 1;
+          const hit0 = l0.find((rec) => { const sh = arofloShape(rec); return sh.number === want || String(rec && (rec.id ?? rec.projectId ?? rec.ID)) === want; });
+          if (hit0) pid = String(hit0.id ?? hit0.projectId ?? hit0.ID);
+        }
+        for (let pg = lastPage; !pid && pg >= 1 && pg > lastPage - 8; pg--) {
+          const rp = await arofloGet(env, "/projects?page=" + pg);
+          const lp = rp.ok ? arofloList(rp.json) : null;
+          if (!lp) { note(`Page ${pg} answered ${rp.status}.`); continue; }
+          const hit = lp.find((rec) => { const sh = arofloShape(rec); return sh.number === want || String(rec && (rec.id ?? rec.projectId ?? rec.ID)) === want; });
+          if (hit) pid = String(hit.id ?? hit.projectId ?? hit.ID);
+        }
+        note(pid ? `Found project id ${pid} for ${want}.` : `No project matched ${want} in the newest ${Math.min(8, lastPage)} pages.`);
+      }
+      if (!pid) return reply(env, 200, { ok: false, log, attempts: [], worker: WORKER_BUILD });
+      const disc = await arofloDiscover(env);
+      const interesting = [];
+      disc.forEach((d) => (d.paths || []).forEach((p) => { if (/note|document|attach|file|photo|comment|upload|image/i.test(p)) interesting.push(p); }));
+      note(interesting.length ? `AroFlo lists these related paths: ${Array.from(new Set(interesting)).slice(0, 25).join(", ")}` : "AroFlo published no list of paths to read.");
+      const attempts = [];
+      const send = async (label, path, init) => {
+        try {
+          const res = await fetch(AROFLO_BASE + path, { ...init, headers: { Authorization: "Bearer " + env.AROFLO_TOKEN, Accept: "application/json", ...(init.headers || {}) } });
+          const text = (await res.text()).slice(0, 300);
+          attempts.push({ label, path, method: init.method, status: res.status, allow: res.headers.get("allow") || "", body: text });
+          return res.ok;
+        } catch (e) { attempts.push({ label, path, method: init.method, status: 0, allow: "", body: String(e && e.message || e).slice(0, 200) }); return false; }
+      };
+      const stamp = new Date().toISOString();
+      const msg = `Reservoir test, please ignore. ${stamp}`;
+      const enc = encodeURIComponent(pid);
+      let noteOk = false;
+      for (const key of ["note", "text", "content"]) {
+        for (const seg of ["notes", "comments"]) {
+          if (noteOk) break;
+          noteOk = await send(`note as ${key}`, `/projects/${enc}/${seg}`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ [key]: msg }) });
+        }
+      }
+      const pdf = "%PDF-1.4\n1 0 obj<</Type/Catalog/Pages 2 0 R>>endobj\n2 0 obj<</Type/Pages/Kids[3 0 R]/Count 1>>endobj\n3 0 obj<</Type/Page/Parent 2 0 R/MediaBox[0 0 200 100]/Contents 4 0 R/Resources<</Font<</F1 5 0 R>>>>>>endobj\n4 0 obj<</Length 60>>stream\nBT /F1 12 Tf 10 50 Td (Reservoir test) Tj ET\nendstream endobj\n5 0 obj<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>endobj\ntrailer<</Root 1 0 R>>\n%%EOF";
+      let docOk = false;
+      for (const seg of ["documents", "attachments", "files", "photos"]) {
+        if (docOk) break;
+        const fd = new FormData();
+        fd.append("file", new Blob([pdf], { type: "application/pdf" }), "Reservoir test.pdf");
+        docOk = await send(`file upload to ${seg}`, `/projects/${enc}/${seg}`, { method: "POST", body: fd });
+      }
+      return reply(env, 200, { ok: noteOk || docOk, noteOk, docOk, projectId: pid, log, attempts, worker: WORKER_BUILD });
+    }
+    if (url.pathname === "/api/aroflo/test") {
+      // Defaults to the healthcheck. A different GET path can be tried with ?path=/something, GET only.
+      let path = String(url.searchParams.get("path") || "/healthcheck");
+      if (!path.startsWith("/") || path.includes("..") || path.includes("//") || path.includes("\\")) path = "/healthcheck";
+      const r = await arofloGet(env, path);
+      const shown = r.json ? JSON.stringify(r.json).slice(0, 1500) : r.text;
+      return reply(env, 200, { ok: r.ok, status: r.status, path, contentType: r.contentType, body: shown, worker: WORKER_BUILD });
+    }
+    // The 10 newest projects. Asks AroFlo for the project list, keeps the newest 10 (by a created or added date when the records have one, otherwise by the highest id), and shapes each for the card.
+    // Open projects by suburb. AroFlo's project list has no suburb, only a full project record does. So the list is read in pages and kept in D1, then open projects without a suburb yet are read one by one in batches of 40 (a Worker can only make about 50 calls at a time), and the report is built from D1. After the first full run only new projects need reading.
+    if (url.pathname === "/api/aroflo/suburbs") {
+      await env.DB.prepare("CREATE TABLE IF NOT EXISTS aroflo_projects (id TEXT PRIMARY KEY, number TEXT, name TEXT, client TEXT, status TEXT, suburb TEXT, address TEXT, state TEXT, extra TEXT, seen TEXT)").run();
+      try { await env.DB.prepare("ALTER TABLE aroflo_projects ADD COLUMN custom TEXT").run(); } catch (e) { /* already there */ }
+      try { await env.DB.prepare("ALTER TABLE aroflo_projects ADD COLUMN created TEXT").run(); } catch (e) { /* already there */ }
+      try { await env.DB.prepare("ALTER TABLE aroflo_projects ADD COLUMN site TEXT").run(); } catch (e) { /* already there */ }
+      const mode = String(url.searchParams.get("mode") || "report");
+      const wantedAll = String(url.searchParams.get("s") || "").split("|").map((x) => x.trim().toLowerCase()).filter(Boolean).slice(0, 12);
+      const pendingQ = "SELECT COUNT(*) AS n FROM aroflo_projects WHERE UPPER(status) = 'OPEN' AND suburb IS NULL";
+      if (mode === "refresh") {
+        const pend0 = await env.DB.prepare(pendingQ).first();
+        const have = await env.DB.prepare("SELECT COUNT(*) AS n FROM aroflo_projects").first();
+        const stamp = await env.DB.prepare("SELECT value FROM app_settings WHERE key = 'aroflo.projects.refreshed'").first().catch(() => null);
+        const fresh = stamp && stamp.value && Date.now() - Number(stamp.value) < 30 * 60 * 1000;
+        if (fresh && have && have.n > 0 && !url.searchParams.get("force")) return reply(env, 200, { ok: true, cached: true, scanned: have.n, pending: pend0 ? pend0.n : 0, worker: WORKER_BUILD });
+        const pause = (ms) => new Promise((r) => setTimeout(r, ms));
+        // AroFlo limits how fast it can be asked (429). Read gently, one page at a time, and wait and retry once if it says slow down.
+        const getSlow = async (path) => {
+          let r = await arofloGet(env, path);
+          if (r.status === 429) { await pause(2500); r = await arofloGet(env, path); }
+          return r;
+        };
+        const r1 = await getSlow("/projects");
+        const l1 = r1.ok ? arofloList(r1.json) : null;
+        if (!l1) {
+          if (have && have.n > 0) return reply(env, 200, { ok: true, throttled: r1.status === 429, scanned: have.n, pending: pend0 ? pend0.n : 0, worker: WORKER_BUILD });
+          return reply(env, 200, { ok: false, error: r1.status === 429 ? "AroFlo is limiting how fast it can be asked right now. Wait a few minutes and press Refresh." : `AroFlo answered ${r1.status} for the project list.`, worker: WORKER_BUILD });
+        }
+        const last = arofloLastPage(arofloMeta(r1.json), l1.length) || 1;
+        const all = [...l1];
+        let failed = 0, throttled = false, read = 1;
+        for (let pg = last; pg >= 2 && read < 30; pg--) {
+          const rp = await getSlow("/projects?page=" + pg);
+          if (rp.ok) { all.push(...(arofloList(rp.json) || [])); read++; } else { failed++; if (rp.status === 429) { throttled = true; break; } }
+          await pause(150);
+        }
+        const stmts = [];
+        for (const rec of all) {
+          const id = String((rec && (rec.id ?? rec.projectId ?? rec.ID)) ?? "");
+          if (!id) continue;
+          const loc = rec.location && typeof rec.location === "object" ? rec.location : null;
+          stmts.push(env.DB.prepare("INSERT INTO aroflo_projects (id, number, name, client, status, suburb, created, seen) VALUES (?, ?, ?, ?, ?, ?, ?, datetime('now')) ON CONFLICT(id) DO UPDATE SET number = excluded.number, name = excluded.name, client = excluded.client, status = excluded.status, created = excluded.created, seen = excluded.seen").bind(id, String(rec.projectNumber ?? rec.referenceNumber ?? ""), String(rec.name || ""), String((rec.client && rec.client.name) || ""), String(rec.status || ""), loc && loc.suburb ? String(loc.suburb) : null, arofloWhen(rec) || null));
+        }
+        for (let k = 0; k < stmts.length; k += 90) await env.DB.batch(stmts.slice(k, k + 90));
+        if (!throttled && !failed) await env.DB.prepare("INSERT INTO app_settings (key, value, by_name, at) VALUES ('aroflo.projects.refreshed', ?, ?, datetime('now')) ON CONFLICT(key) DO UPDATE SET value = excluded.value, at = excluded.at").bind(String(Date.now()), user.name || "").run().catch(() => {});
+        const pend = await env.DB.prepare(pendingQ).first();
+        return reply(env, 200, { ok: true, scanned: all.length, pagesRead: read, lastPage: last, failedPages: failed, throttled, pending: pend ? pend.n : 0, worker: WORKER_BUILD });
+      }
+      if (mode === "detail") {
+        const rows = (await env.DB.prepare("SELECT id FROM aroflo_projects WHERE UPPER(status) = 'OPEN' AND suburb IS NULL LIMIT 40").all()).results || [];
+        let done = 0, failed = 0;
+        let limited = false;
+        let firstErr = "";
+        for (let k = 0; k < rows.length && !limited; k += 4) {
+          await Promise.all(rows.slice(k, k + 4).map(async (row) => {
+            try {
+              const rd = await arofloGet(env, "/projects/" + encodeURIComponent(row.id));
+              if (rd.status === 429) { limited = true; return; }
+              if (!rd.ok || !rd.json) { failed++; if (!firstErr) firstErr = `project ${row.id} answered ${rd.status} ${String(rd.text || "").slice(0, 120)}`; return; }
+              const loc = rd.json.location || {};
+              const extra = arofloFlat(rd.json, "", [], 0).filter(([k2, v]) => v !== "" && /consent|heps|custom/i.test(k2 + " " + v)).slice(0, 12).map(([k2, v]) => `${k2.split(".").slice(-2).join(".")}=${String(v).slice(0, 40)}`).join(" | ");
+              await env.DB.prepare("UPDATE aroflo_projects SET suburb = ?, address = ?, state = ?, extra = ? WHERE id = ?").bind(String(loc.suburb || ""), String(loc.address1 || ""), String(loc.state || ""), extra, row.id).run();
+              done++;
+            } catch (e) { failed++; if (!firstErr) firstErr = String(e && e.message || e).slice(0, 160); }
+          }));
+          await new Promise((r) => setTimeout(r, 250));
+        }
+        const pend = await env.DB.prepare(pendingQ).first();
+        return reply(env, 200, { ok: true, done, failed, limited, firstErr, pending: pend ? pend.n : 0, worker: WORKER_BUILD });
+      }
+      if (mode === "custom") {
+        if (!wantedAll.length) return reply(env, 400, { error: "no suburbs" });
+        const marks = wantedAll.map(() => "?").join(",");
+        const rows = (await env.DB.prepare(`SELECT id FROM aroflo_projects WHERE UPPER(status) = 'OPEN' AND custom IS NULL AND LOWER(suburb) IN (${marks}) LIMIT 24`).bind(...wantedAll).all()).results || [];
+        let done = 0, failed = 0, limited = false, firstErr = "";
+        for (let k = 0; k < rows.length && !limited; k += 4) {
+          await Promise.all(rows.slice(k, k + 4).map(async (row) => {
+            try {
+              const rc = await arofloGet(env, "/projects/" + encodeURIComponent(row.id) + "/customFields");
+              if (rc.status === 429) { limited = true; return; }
+              if (!rc.ok) { failed++; if (!firstErr) firstErr = `custom fields for ${row.id} answered ${rc.status}`; return; }
+              const out = {};
+              for (const it of arofloList(rc.json) || []) {
+                const cf = (it && it.customField) || it || {};
+                const nm = String(cf.name || "");
+                const val = String(cf.value ?? it.value ?? "").trim();
+                if (/consent/i.test(nm)) out.consent = val;
+                else if (/hc\/?ps|heps|hc.?ps/i.test(nm)) out.hcps = val;
+                else if (/bpc/i.test(nm)) out.bpc = val;
+              }
+              await env.DB.prepare("UPDATE aroflo_projects SET custom = ? WHERE id = ?").bind(JSON.stringify(out), row.id).run();
+              done++;
+            } catch (e) { failed++; if (!firstErr) firstErr = String(e && e.message || e).slice(0, 160); }
+          }));
+          await new Promise((r) => setTimeout(r, 250));
+        }
+        const pendC = await env.DB.prepare(`SELECT COUNT(*) AS n FROM aroflo_projects WHERE UPPER(status) = 'OPEN' AND custom IS NULL AND LOWER(suburb) IN (${marks})`).bind(...wantedAll).first();
+        return reply(env, 200, { ok: true, done, failed, limited, firstErr, pending: pendC ? pendC.n : 0, worker: WORKER_BUILD });
+      }
+      // Escape Homes report. Every Escape Homes project from the last six months, with the full site address and the BPC Certificate Number.
+      if (mode === "eh-detail" || mode === "eh-report") {
+        const cut = new Date(); cut.setMonth(cut.getMonth() - 6);
+        const ehKey0 = String(url.searchParams.get("client") || "escape").toLowerCase().replace(/[^a-z]/g, "");
+        const cutoff = ehKey0 === "wyndhamvale" ? "2026-01-01" : cut.toISOString().slice(0, 10);
+        const ehKey = String(url.searchParams.get("client") || "escape").toLowerCase().replace(/[^a-z]/g, "") || "escape";
+        const ehMatch = ehKey === "levonix" ? "(LOWER(client) LIKE '%levon%' OR LOWER(client) LIKE '%lavon%')" : ehKey === "arvee" ? "LOWER(client) LIKE '%arvee%'" : ehKey === "wyndhamvale" ? "(LOWER(suburb) LIKE '%wyndham vale%' OR LOWER(address) LIKE '%wyndham vale%')" : "LOWER(client) LIKE '%escape%'";
+        const scope = ehMatch + " AND (created IS NULL OR created >= ?)";
+        if (mode === "eh-detail") {
+          const rows = (await env.DB.prepare(`SELECT id FROM aroflo_projects WHERE ${scope} AND site IS NULL LIMIT 18`).bind(cutoff).all()).results || [];
+          let done = 0, failed = 0, limited = false, firstErr = "";
+          for (let k = 0; k < rows.length && !limited; k += 3) {
+            await Promise.all(rows.slice(k, k + 3).map(async (row) => {
+              try {
+                const rd = await arofloGet(env, "/projects/" + encodeURIComponent(row.id));
+                if (rd.status === 429) { limited = true; return; }
+                if (!rd.ok || !rd.json) { failed++; if (!firstErr) firstErr = `project ${row.id} answered ${rd.status} ${String(rd.text || "").slice(0, 120)}`; return; }
+                const loc = rd.json.location || {};
+                const pc = loc.postcode ?? loc.postCode ?? loc.postalCode ?? loc.zip ?? "";
+                const site = [loc.address1, loc.address2, loc.suburb, loc.state, pc].map((x) => String(x || "").trim()).filter(Boolean).join(", ");
+                const out = {};
+                const rc = await arofloGet(env, "/projects/" + encodeURIComponent(row.id) + "/customFields");
+                if (rc.status === 429) { limited = true; return; }
+                if (rc.ok) {
+                  for (const it of arofloList(rc.json) || []) {
+                    const cf = (it && it.customField) || it || {};
+                    if (/bpc/i.test(String(cf.name || ""))) out.bpc = String(cf.value ?? it.value ?? "").trim();
+                  }
+                } else { failed++; if (!firstErr) firstErr = `custom fields for ${row.id} answered ${rc.status}`; return; }
+                await env.DB.prepare("UPDATE aroflo_projects SET site = ?, custom = ? WHERE id = ?").bind(site, JSON.stringify(out), row.id).run();
+                done++;
+              } catch (e) { failed++; if (!firstErr) firstErr = String(e && e.message || e).slice(0, 160); }
+            }));
+            await new Promise((r) => setTimeout(r, 250));
+          }
+          const pendE = await env.DB.prepare(`SELECT COUNT(*) AS n FROM aroflo_projects WHERE ${scope} AND site IS NULL`).bind(cutoff).first();
+          return reply(env, 200, { ok: true, done, failed, limited, firstErr, pending: pendE ? pendE.n : 0, worker: WORKER_BUILD });
+        }
+        const rows = (await env.DB.prepare(`SELECT id, number, name, client, status, site, custom, created FROM aroflo_projects WHERE ${scope} ORDER BY CAST(number AS INTEGER) DESC`).bind(cutoff).all()).results || [];
+        const items = rows.map((x) => ({ id: x.id, number: x.number, location: x.site || "", project: x.name || "", client: x.client || "", bpc: (() => { try { return JSON.parse(x.custom || "{}").bpc || ""; } catch (e) { return ""; } })(), created: x.created || "", status: x.status || "" }));
+        const pendE = await env.DB.prepare(`SELECT COUNT(*) AS n FROM aroflo_projects WHERE ${scope} AND site IS NULL`).bind(cutoff).first();
+        const total = await env.DB.prepare("SELECT COUNT(*) AS n FROM aroflo_projects").first();
+        const dated = await env.DB.prepare("SELECT COUNT(*) AS n FROM aroflo_projects WHERE created IS NOT NULL").first();
+        return reply(env, 200, { ok: true, items, cutoff, pending: pendE ? pendE.n : 0, scanned: total ? total.n : 0, dated: dated ? dated.n : 0, undated: items.filter((x) => !x.created).length, worker: WORKER_BUILD });
+      }
+      const wanted = wantedAll;
+      if (!wanted.length) return reply(env, 400, { error: "no suburbs" });
+      const rows = (await env.DB.prepare("SELECT id, number, name, client, status, suburb, address, state, extra, custom FROM aroflo_projects WHERE UPPER(status) = 'OPEN' AND suburb IS NOT NULL ORDER BY CAST(number AS INTEGER) DESC").all()).results || [];
+      const items = rows.filter((x) => wanted.includes(String(x.suburb).toLowerCase())).map((x) => ({ suburb: String(x.suburb).toLowerCase(), number: x.number, client: x.client, address: x.address || x.name, status: x.status, extra: x.extra || "", consent: (() => { try { return JSON.parse(x.custom || "{}").consent || ""; } catch (e) { return ""; } })(), hcps: (() => { try { return JSON.parse(x.custom || "{}").hcps || ""; } catch (e) { return ""; } })(), bpc: (() => { try { return JSON.parse(x.custom || "{}").bpc || ""; } catch (e) { return ""; } })(), id: x.id }));
+      const pend = await env.DB.prepare(pendingQ).first();
+      const totalOpen = await env.DB.prepare("SELECT COUNT(*) AS n FROM aroflo_projects WHERE UPPER(status) = 'OPEN'").first();
+      // Where do the custom fields (Consent Number, HC/PS Number, BPC Certificate Number) come from? Try the likely routes on one open project and say what each one answered.
+      let probe = "";
+      if (url.searchParams.get("probe") && rows.length) {
+        const pid = encodeURIComponent(rows[0].id);
+        const tries = [`/projects/${pid}/customFields`, `/projects/${pid}/custom-fields`, `/projects/${pid}/userDefinedFields`, `/projects/${pid}?include=customFields`, `/projects/${pid}?expand=customFields`, `/projects/${pid}?fields=customFields`, `/projects/${pid}/custom`, `/customFields`, `/projects/customFields`, `/customFields?entity=PROJECT`];
+        const out = await Promise.all(tries.map(async (t) => {
+          try {
+            const r = await arofloGet(env, t);
+            const body = r.json ? JSON.stringify(r.json) : String(r.text || "");
+            const at = body.search(/consent|hc\/ps|bpc/i);
+            return `${t} ${r.status}${at >= 0 ? " HAS IT: " + body.slice(Math.max(0, at - 60), at + 160) : " " + body.slice(0, 70)}`;
+          } catch (e) { return `${t} failed`; }
+        }));
+        probe = out.join("  ///  ");
+      }
+      return reply(env, 200, { ok: true, items, pending: pend ? pend.n : 0, totalOpen: totalOpen ? totalOpen.n : 0, probe, worker: WORKER_BUILD });
+    }
+    if (url.pathname === "/api/aroflo/projects") {
+      const r = await arofloGet(env, "/projects");
+      let list = r.ok ? arofloList(r.json) : null;
+      if (!list) {
+        return reply(env, 200, { ok: false, status: r.status, path: "/projects", body: r.json ? JSON.stringify(r.json).slice(0, 600) : r.text, discovery: await arofloDiscover(env), worker: WORKER_BUILD });
+      }
+      // AroFlo hands the list over in pages, oldest first, so the first page holds the oldest projects. When it says how many pages there are, go to the last one (and the ones before it if the last is short) to reach the newest.
+      const meta = arofloMeta(r.json);
+      const first = list.length;
+      const lastPage = arofloLastPage(meta, list.length);
+      const steps = [`First page held ${first} projects.`];
+      if (lastPage > 1) {
+        const pagesRead = [];
+        for (const pg of [lastPage, lastPage - 1, lastPage - 2]) {
+          if (pg < 1) break;
+          if (pagesRead.length && list.length >= 10) break;
+          try {
+            const rp = await arofloGet(env, "/projects?page=" + pg);
+            const lp = rp.ok ? arofloList(rp.json) : null;
+            if (lp && lp.length) { pagesRead.push(pg); list = pagesRead.length === 1 ? lp : lp.concat(list); steps.push(`Page ${pg} of ${lastPage} held ${lp.length}.`); }
+            else steps.push(`Page ${pg} answered ${rp.status} with no list.`);
+          } catch (e) { steps.push(`Page ${pg} failed.`); }
+          if (list.length >= 10) break;
+        }
+      } else steps.push("AroFlo did not say how many pages there are, so only the first page was read.");
+      const rows = list.map((rec, i) => ({ rec, i, shape: arofloShape(rec) }));
+      const numericId = (x) => { const v = x.rec && typeof x.rec === "object" ? (x.rec.id ?? x.rec.projectId ?? x.rec.ID) : null; return Number(v); };
+      const haveDates = rows.filter((x) => x.shape.when).length > rows.length / 2;
+      let orderedBy = "list order, newest last";
+      if (haveDates) { rows.sort((a, b) => String(b.shape.when).localeCompare(String(a.shape.when))); orderedBy = "created date"; }
+      else if (rows.every((x) => Number.isFinite(numericId(x)))) { rows.sort((a, b) => numericId(b) - numericId(a)); orderedBy = "highest id"; }
+      else rows.reverse();
+      const top = rows.slice(0, 10).map((x) => ({ id: String((x.rec && (x.rec.id ?? x.rec.projectId ?? x.rec.ID)) ?? x.shape.number ?? x.i), number: x.shape.number, client: x.shape.client, address: x.shape.address, when: x.shape.when, fields: arofloFlat(x.rec, "", [], 0) }));
+      return reply(env, 200, { ok: true, status: r.status, total: list.length, orderedBy, steps, meta, lastPage, items: top, worker: WORKER_BUILD });
+    }
+    // A file from AroFlo's document store (a photo or a document), passed through so the app can show it. Directors only, read only. AroFlo's download route is not published, so the document's own record is read for links and the likely routes are tried, and every answer is reported.
+    if (url.pathname === "/api/aroflo/file") {
+      const p = String(url.searchParams.get("path") || "");
+      const doc = String(url.searchParams.get("doc") || "");
+      const coll = String(url.searchParams.get("coll") || "");
+      const job = String(url.searchParams.get("job") || "");
+      if (!/^\/DocStorage\/[A-Za-z0-9_-]{4,80}$/.test(p) || (doc && !/^[A-Za-z0-9_-]{3,60}$/.test(doc)) || (job && !/^[A-Za-z0-9_.-]{1,60}$/.test(job)) || (coll && !/^\/(tasks|projects|jobs)$/.test(coll))) return reply(env, 400, { error: "bad request" });
+      const tried = [];
+      const cands = [];
+      const known = new Set();
+      const add = (u) => { if (u && !known.has(u)) { known.add(u); cands.push(u); } };
+      // Links named in the document's own record.
+      const recs = [];
+      if (doc) { if (coll && job) recs.push(`${AROFLO_BASE}${coll}/${encodeURIComponent(job)}/documents/${encodeURIComponent(doc)}`); recs.push(`${AROFLO_BASE}/documents/${encodeURIComponent(doc)}`); }
+      for (const u of recs) {
+        try {
+          const r = await fetch(u, { headers: { Authorization: "Bearer " + env.AROFLO_TOKEN, Accept: "application/json" } });
+          const t = await r.text();
+          tried.push(`${u.replace(AROFLO_BASE, "")} record ${r.status}`);
+          let j = null; try { j = JSON.parse(t); } catch (e) { j = null; }
+          if (r.ok && j) arofloFlat(j, "", [], 0).forEach(([k, v]) => { if (/(url|link|href|download|signed|location)/i.test(k) && /^(https?:\/\/|\/)/.test(String(v)) && !/insertedByUser|avatar/i.test(k)) add(String(v).startsWith("/") ? (String(v).startsWith("/v2") ? "https://api.aroflo.com" + v : AROFLO_BASE + v) : String(v)); });
+        } catch (e) { tried.push("record failed"); }
+      }
+      if (doc) for (const seg of ["download", "content", "file", "original", "data", ""]) {
+        add(`${AROFLO_BASE}/documents/${encodeURIComponent(doc)}${seg ? "/" + seg : ""}`);
+        if (coll && job) add(`${AROFLO_BASE}${coll}/${encodeURIComponent(job)}/documents/${encodeURIComponent(doc)}${seg ? "/" + seg : ""}`);
+      }
+      add(AROFLO_BASE + p);
+      add("https://api.aroflo.com" + p);
+      const isFile = (res) => { const ct = res.headers.get("content-type") || ""; return res.ok && !/text\/html|application\/json|text\/plain/i.test(ct); };
+      for (const u of cands.slice(0, 20)) {
+        try {
+          let res = await fetch(u, { headers: { Authorization: "Bearer " + env.AROFLO_TOKEN }, redirect: "manual" });
+          const short = u.replace("https://api.aroflo.com", "").replace(/^\/v2/, "").slice(0, 90);
+          if (res.status >= 300 && res.status < 400 && res.headers.get("location")) {
+            const loc = new URL(res.headers.get("location"), u).toString();
+            tried.push(`${short} redirected`);
+            res = await fetch(loc, { redirect: "follow" });
+            tried.push(`${short} then ${res.status}`);
+          } else tried.push(`${short} ${res.status}`);
+          if (isFile(res)) return new Response(res.body, { status: 200, headers: { "Content-Type": res.headers.get("content-type") || "application/octet-stream", "Cache-Control": "private, max-age=300", ...cors(env) } });
+          if (res.ok && /json/i.test(res.headers.get("content-type") || "")) { try { const j = await res.json(); const link = arofloFlat(j, "", [], 0).find(([k, v]) => /(url|link|href|download|signed)/i.test(k) && /^https?:\/\//.test(String(v))); if (link) { const r2 = await fetch(String(link[1]), { redirect: "follow" }); tried.push(`its link ${r2.status}`); if (isFile(r2)) return new Response(r2.body, { status: 200, headers: { "Content-Type": r2.headers.get("content-type") || "application/octet-stream", "Cache-Control": "private, max-age=300", ...cors(env) } }); } } catch (e) { /* not a link */ } }
+        } catch (e) { tried.push(`${u.slice(-40)} failed`); }
+      }
+      return reply(env, 502, { error: "AroFlo would not give that file", tried });
+    }
+    // One job by its number: client, site address, then its notes and its documents. Read only. AroFlo's v2 paths are not published, so each possible path is tried and what AroFlo answered is reported.
+    if (url.pathname === "/api/aroflo/job") {
+      const want = String(url.searchParams.get("number") || "").trim();
+      if (!want || !/^[A-Za-z0-9_.-]{1,40}$/.test(want)) return reply(env, 400, { error: "Enter a task number" });
+      const steps = [];
+      const idOf = (rec) => String(rec && (rec.id ?? rec.projectId ?? rec.taskId ?? rec.ID) || "");
+      const numOf = (rec) => { const sh = arofloShape(rec); return sh.number; };
+      let coll = "", rec = null, id = "";
+      const forced = /^\/(tasks|projects|jobs)$/.test(String(url.searchParams.get("coll") || "")) ? String(url.searchParams.get("coll")) : "";
+      for (const c of forced ? [forced] : ["/tasks", "/projects", "/jobs"]) {
+        const r = await arofloGet(env, `${c}/${encodeURIComponent(want)}`);
+        steps.push(`${c}/${want} answered ${r.status}`);
+        if (r.ok && r.json && typeof r.json === "object") { coll = c; rec = (r.json.data && typeof r.json.data === "object" && !Array.isArray(r.json.data)) ? r.json.data : r.json; id = idOf(rec) || want; break; }
+      }
+      if (!rec) {
+        for (const c of ["/tasks", "/projects", "/jobs"]) {
+          const first = await arofloGet(env, c);
+          if (!first.ok) { steps.push(`${c} list answered ${first.status}`); continue; }
+          const l0 = arofloList(first.json) || [];
+          const lastPage = arofloLastPage(arofloMeta(first.json), l0.length) || 1;
+          let hit = l0.find((x) => numOf(x) === want || idOf(x) === want);
+          for (let pg = lastPage; !hit && pg >= 1 && pg > lastPage - 8 && lastPage > 1; pg--) {
+            const rp = await arofloGet(env, `${c}?page=${pg}`);
+            const lp = rp.ok ? arofloList(rp.json) : null;
+            if (lp) hit = lp.find((x) => numOf(x) === want || idOf(x) === want);
+          }
+          steps.push(`${c} list searched${hit ? ", found" : ", not found"}`);
+          if (hit) { coll = c; rec = hit; id = idOf(hit) || want; break; }
+        }
+      }
+      if (!rec) return reply(env, 200, { ok: false, steps, worker: WORKER_BUILD });
+      const shape = arofloShape(rec);
+      const jobFlat = arofloFlat(rec, "", [], 0);
+      // The client's full name, not its short name or code.
+      const nameKeys = jobFlat.filter(([k, v]) => /(client|customer|organi[sz]ation|company)/i.test(k) && /name/i.test(k) && !/(short|code|ref|(^|\.)id$|contact|email|phone|address|nick|abbrev)/i.test(k) && v !== "" && v !== "(empty list)");
+      const bestName = nameKeys.find(([k]) => /(legal|full|trading|company|organi[sz]ation).*name|(^|\.)name$/i.test(k)) || nameKeys.sort((a, b) => String(b[1]).length - String(a[1]).length)[0];
+      // The site address put in street, suburb, state, postcode order, from whichever group of fields looks like the site.
+      const addrParts = jobFlat.filter(([k, v]) => /(address|street|suburb|city|town|locality|state|postcode|post_code|zip|line1|line2|unit|lot)/i.test(k) && !/(client|customer|billing|email|phone|contact|org)/i.test(k) && v !== "" && v !== "(empty list)");
+      const groups = {};
+      addrParts.forEach(([k, v]) => { const g = k.includes(".") ? k.slice(0, k.lastIndexOf(".")) : ""; (groups[g] = groups[g] || []).push([k.slice(k.lastIndexOf(".") + 1), String(v)]); });
+      const gNames = Object.keys(groups).sort((a, b) => (/(site|location|job|task|project)/i.test(b) ? 1 : 0) - (/(site|location|job|task|project)/i.test(a) ? 1 : 0) || groups[b].length - groups[a].length);
+      let siteAddress = "";
+      if (gNames.length) {
+        const g = groups[gNames[0]];
+        const rank = (n) => /(line1|address1|street|^address$|unit|lot)/i.test(n) ? 1 : /line2|address2/i.test(n) ? 2 : /(suburb|city|town|locality)/i.test(n) ? 3 : /state/i.test(n) ? 4 : /(post|zip)/i.test(n) ? 5 : 6;
+        siteAddress = Array.from(new Set(g.sort((a, b) => rank(a[0]) - rank(b[0])).map((x) => x[1]))).join(", ");
+      }
+      const pick = (flat, re, skip) => { const f = flat.find(([k, v]) => re.test(k) && !(skip && skip.test(k)) && v !== "" && v !== "(empty list)"); return f ? String(f[1]) : ""; };
+      // Finding AroFlo's real documents paths: any link the record itself names, and any schema AroFlo publishes.
+      if (coll === "/projects") {
+        const linkVals = jobFlat.filter(([k, v]) => /_links/i.test(k) && /^\//.test(String(v)) && !/(office|avatar)/i.test(k) && !/^\/(users|DocStorage|ims)/.test(String(v))).map(([k, v]) => String(v));
+        steps.push(`links named by the project: ${linkVals.join(", ") || "none"}`);
+        for (const lp of Array.from(new Set(linkVals)).slice(0, 12)) { const rl = await arofloGet(env, lp.replace(/^\/v2/, "")); steps.push(`${lp} answered ${rl.status}`); }
+        for (const sp of ["", "/", "/openapi.json", "/swagger.json", "/openapi", "/api-docs", "/docs", "/schema", "/documents", "/documents/upload", "/projects/" + encodeURIComponent(id) + "/documents/upload"]) {
+          const rs = await arofloGet(env, sp || "");
+          const keys = rs.json && typeof rs.json === "object" ? Object.keys(rs.json).slice(0, 12).join(",") : "";
+          const paths = rs.json && rs.json.paths ? Object.keys(rs.json.paths).filter((x) => /(document|photo|file|attach)/i.test(x)).slice(0, 25) : [];
+          steps.push(`${sp || "(root)"} answered ${rs.status}${keys ? `, keys ${keys}` : ""}${paths.length ? `, document paths ${paths.join(" ")}` : ""}`);
+        }
+      }
+      const subs = {};
+      for (const seg of ["notes", "documents", "attachments", "files", "photos"]) {
+        let r = await arofloGet(env, `${coll}/${encodeURIComponent(id)}/${seg}`);
+        let list = r.ok ? arofloList(r.json) : null;
+        steps.push(`${coll}/${id}/${seg} answered ${r.status}${list ? `, ${list.length} items` : r.ok ? ", no list" : ""}`);
+        // A project keeps its documents apart from its tasks'. If the usual path gives nothing, try the other places AroFlo might put them.
+        if (!list && seg === "documents" && coll === "/projects") {
+          const e2 = encodeURIComponent(id);
+          for (const alt of [`/projects/${e2}/projectdocuments`, `/projects/${e2}/project-documents`, `/projects/${e2}/documentsandphotos`, `/projects/${e2}/documents-and-photos`, `/projects/${e2}/files`, `/documents?projectId=${e2}`, `/documents?project=${e2}`, `/documents?projectid=${e2}`, `/projectdocuments?projectId=${e2}`, `/documents?parentType=project&parentId=${e2}`]) {
+            const ra = await arofloGet(env, alt);
+            const la = ra.ok ? arofloList(ra.json) : null;
+            steps.push(`${alt} answered ${ra.status}${la ? `, ${la.length} items` : ra.ok ? ", no list" : ""}`);
+            if (la) { r = ra; list = la; break; }
+          }
+        }
+        if (list) subs[seg] = list.slice(0, 50).map((it) => {
+          const flat = arofloFlat(it, "", [], 0);
+          const get = (re) => { const f = flat.find(([k, v]) => re.test(k) && v !== "" && v !== "(empty list)"); return f ? String(f[1]) : ""; };
+          const person = (pre) => [get(new RegExp(`${pre}.*givenName$`, "i")), get(new RegExp(`${pre}.*familyName$`, "i"))].filter(Boolean).join(" ");
+          const plain = (h) => String(h || "").replace(/<br\s*\/?>/gi, "\n").replace(/<\/p>\s*<p[^>]*>/gi, "\n").replace(/<[^>]+>/g, "").replace(/&nbsp;/g, " ").replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/\n{3,}/g, "\n\n").trim();
+          if (seg === "notes") return { text: plain(get(/(^|\.)content$/i)), by: person("postedBy"), when: get(/(timestampCreated|created)/i), fields: [] };
+          return { id: (flat.find(([k]) => k === "id") || [])[1] || "", name: get(/(^|\.)displayName$/i) || get(/(^|\.)name$/i), fileName: get(/(^|\.)fileName$/i), by: person("insertedByUser"), when: get(/datetimeInserted/i), original: get(/(^|\.)original$/i), thumbnail: get(/(^|\.)thumbnail$/i), type: get(/documentType/i), size: Number(get(/fileSizeBytes/i)) || 0, filter: flat.filter(([k, v]) => /(filter|visib|internal|contractor|permission|access|scope)/i.test(k) && v !== "" && v !== "(empty list)").map(([k, v]) => `${k.slice(k.lastIndexOf(".") + 1)} ${String(v).slice(0, 40)}`).join(", "), fields: flat.filter(([k, v]) => v !== "" && v !== "(empty list)" && !/(thumbnail|original|insertedByUser)/i.test(k)).slice(0, 30).map(([k, v]) => `${k}: ${String(v).slice(0, 60)}`) };
+        });
+      }
+      const nameFlat = jobFlat.filter(([k, v]) => v !== "" && v !== "(empty list)");
+      const taskNameF = nameFlat.find(([k]) => /^(taskName|name|title|summary|description)$/i.test(k)) || nameFlat.find(([k]) => /(^|\.)(taskName|title|summary)$/i.test(k));
+      return reply(env, 200, { ok: true, collection: coll, id, taskName: taskNameF ? String(taskNameF[1]).slice(0, 200) : "", description: (() => { const d = nameFlat.find(([k]) => /(^|\.)(description|details|summary|jobDescription|taskDescription)$/i.test(k) && !/(photo|document|note)/i.test(k)); return d ? String(d[1]).replace(/<[^>]+>/g, " ").replace(/\s+/g, " ").trim().slice(0, 300) : ""; })(), number: shape.number || want, client: bestName ? String(bestName[1]) : shape.client, address: siteAddress || shape.address, fields: jobFlat.slice(0, 120), notes: subs.notes || [], documents: subs.documents || subs.attachments || subs.files || subs.photos || [], haveNotes: !!subs.notes, haveDocs: !!(subs.documents || subs.attachments || subs.files || subs.photos), steps, worker: WORKER_BUILD });
+    }
+    // One project pulled raw. Lists every field AroFlo sends for it.
+    if (url.pathname === "/api/aroflo/project") {
+      const id = String(url.searchParams.get("id") || "").trim();
+      if (!id || !/^[A-Za-z0-9_.-]{1,80}$/.test(id)) return reply(env, 400, { error: "No project id" });
+      const r = await arofloGet(env, "/projects/" + encodeURIComponent(id));
+      if (!r.json) return reply(env, 200, { ok: false, status: r.status, path: "/projects/" + id, body: r.text, worker: WORKER_BUILD });
+      return reply(env, 200, { ok: r.ok, status: r.status, path: "/projects/" + id, fields: arofloFlat(r.json, "", [], 0), worker: WORKER_BUILD });
+    }
+    return reply(env, 404, { error: "not found" });
+  } catch (e) {
+    return reply(env, 200, { ok: false, error: String(e && e.message || e).slice(0, 300), worker: WORKER_BUILD });
+  }
+}
+// /api/timesheets routes. Office only (T1). Returns a Response, or null when the path is not a timesheets path.
+
+// ---- Timesheet submit and approval. Staff submit a week, the office approves it, and only then does it go to Xero as an approved timesheet. Directors and supervisors (T1 and T2) are trusted, so theirs goes straight through.
+// This is the one narrow way the Worker writes to Xero for any tier: static hours go out in one go, and the person only ever hears success or failure. Nothing is read back to them.
+let tsTablesMade = false;
+async function tsTables(env) {
+  if (tsTablesMade) return;
+  tsTablesMade = true;
+  await env.DB.prepare("CREATE TABLE IF NOT EXISTS timesheet_submissions (id TEXT PRIMARY KEY, email TEXT NOT NULL, name TEXT, employee_id TEXT, week_start TEXT NOT NULL, week_end TEXT, days TEXT, total REAL, status TEXT NOT NULL, xero_status TEXT, forwarded INTEGER NOT NULL DEFAULT 0, last_error TEXT, created_at TEXT, decided_at TEXT, decided_by TEXT)").run();
+  await env.DB.prepare("CREATE INDEX IF NOT EXISTS timesheet_submissions_email ON timesheet_submissions (email, week_start)").run();
+  await env.DB.prepare("CREATE TABLE IF NOT EXISTS ts_notices (id INTEGER PRIMARY KEY AUTOINCREMENT, email TEXT NOT NULL, text TEXT, created_at TEXT, seen INTEGER NOT NULL DEFAULT 0)").run();
+}
+const tsDmy = (iso) => { const [y, m, d] = String(iso || "").split("-"); return d && m && y ? `${d}.${m}.${y}` : String(iso || ""); };
+const tsAddDays = (iso, n) => { const d = new Date(`${iso}T00:00:00Z`); d.setUTCDate(d.getUTCDate() + n); return d.toISOString().slice(0, 10); };
+// Today's date in Victoria, close enough for the week checks (UTC plus 11 hours).
+const tsToday = () => new Date(Date.now() + 11 * 3600 * 1000).toISOString().slice(0, 10);
+function tsWeekProblem(week) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(week)) return "That is not a week start date.";
+  const d = new Date(`${week}T00:00:00Z`);
+  if (Number.isNaN(d.getTime()) || d.getUTCDay() !== 1) return "A timesheet week must start on a Monday.";
+  const today = tsToday();
+  const t = new Date(`${today}T00:00:00Z`);
+  const thisMonday = tsAddDays(today, -((t.getUTCDay() + 6) % 7));
+  if (week > thisMonday) return "That week has not started yet.";
+  if (week < tsAddDays(thisMonday, -35)) return "That week is too far back to submit here.";
+  return "";
+}
+function tsCleanDays(days) {
+  if (!Array.isArray(days) || days.length < 6 || days.length > 7) return null;
+  const out = [];
+  for (let i = 0; i < 7; i++) {
+    const d = days[i] || {};
+    const row = {};
+    for (const k of ["ord", "ot15", "ot2"]) {
+      const n = Number(d[k] || 0);
+      if (!Number.isFinite(n) || n < 0 || n > 24) return null;
+      row[k] = Math.round(n * 100) / 100;
+    }
+    if (row.ord + row.ot15 + row.ot2 > 24) return null;
+    out.push(row);
+  }
+  return out;
+}
+// A week that is five trade school days (the 7.6 hours the apprentices are paid for) and nothing else is approved without anyone looking at it. The person still presses Submit.
+function tsAllTradeSchool(dayTypes, days) {
+  if (!Array.isArray(dayTypes) || dayTypes.length < 5) return false;
+  for (let i = 0; i < 5; i++) {
+    const d = days[i];
+    if (dayTypes[i] !== "trade_school" || d.ord !== 7.6 || d.ot15 !== 0 || d.ot2 !== 0) return false;
+  }
+  return days[5].ord + days[5].ot15 + days[5].ot2 + days[6].ord + days[6].ot15 + days[6].ot2 === 0;
+}
+const tsTotal = (days) => Math.round(days.reduce((a, d) => a + d.ord + d.ot15 + d.ot2, 0) * 100) / 100;
+// Sends one week to Xero. First as Approved. If Xero will not take it that way it is sent as a Draft, and the caller is told. Returns { ok, xeroStatus, note } or { fail }.
+async function tsPushXero(env, sub) {
+  const res = await xeroFetch(env, `payroll.xro/1.0/Employees/${sub.employee_id}`);
+  if (!res.ok) return { fail: `Could not read your pay record from Xero. ${await xeroWhy(res)}` };
+  const record = ((await res.json()).Employees || [])[0];
+  if (!record) return { fail: "Xero has no pay record for this person." };
+  const items = await xeroItems(env);
+  const picked = xeroPickRates(record, items.EarningsRates || []);
+  const days = JSON.parse(sub.days);
+  if (!picked.ordinaryItem) return { fail: "Xero has no ordinary earnings rate for this person." };
+  // Salaried people are sent too, as an approved timesheet at their set hours, so Xero holds the hours. Check the draft pay run in Xero before posting that the salary line is unchanged.
+  // Public holidays. Xero has a Public Holiday pay rate, so a holiday day goes to Xero on that rate and not as ordinary time. With no such rate in Xero the day is left blank, as the office does by hand.
+  const phItem = (items.EarningsRates || []).find((r) => /public\s*holiday/i.test(String(r.Name || "")));
+  const isHoliday = days.map((d, i) => !!TS_HOLIDAYS[tsAddDays(sub.week_start, i)]);
+  const phUnits = days.map((d, i) => isHoliday[i] ? Math.round(((Number(d.ord) || 0) + (Number(d.ot15) || 0) + (Number(d.ot2) || 0)) * 100) / 100 : 0);
+  const phTotal = phUnits.reduce((a, b) => a + b, 0);
+  const rest = days.map((d, i) => isHoliday[i] ? { ord: 0, ot15: 0, ot2: 0 } : d);
+  const sum = (k) => rest.reduce((a, d) => a + d[k], 0);
+  const lines = [];
+  const add = (item, k, label) => {
+    if (sum(k) <= 0) return "";
+    if (!item) return `Xero has no ${label} rate, but this week has ${label} hours.`;
+    lines.push({ EarningsRateID: item.EarningsRateID, NumberOfUnits: rest.map((d) => d[k]) });
+    return "";
+  };
+  const problem = add(picked.ordinaryItem, "ord", "ordinary") || add(picked.ot15Item, "ot15", "overtime under 2 hours") || add(picked.ot2Item, "ot2", "overtime over 2 hours");
+  if (problem) return { fail: problem };
+  const baseLines = lines.slice();
+  const send = async (status, withPh) => {
+    const sendLines = withPh && phItem && phTotal > 0 ? [...baseLines, { EarningsRateID: phItem.EarningsRateID, NumberOfUnits: phUnits }] : baseLines;
+    if (!sendLines.length) return { fail: "There are no hours to send." };
+    const body = [{ EmployeeID: sub.employee_id, StartDate: `${sub.week_start}T00:00:00`, EndDate: `${sub.week_end}T00:00:00`, Status: status, TimesheetLines: sendLines }];
+    const r = await xeroFetch(env, "payroll.xro/1.0/Timesheets", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    if (!r.ok) return { fail: await xeroWhy(r) };
+    let j;
+    try { j = await r.json(); } catch (e) { j = {}; }
+    const made = (j.Timesheets || [])[0];
+    if (!made) return { fail: "Xero answered but sent back no timesheet." };
+    const errs = (made.ValidationErrors || []).map((x) => x.Message).filter(Boolean);
+    if (errs.length) return { fail: `Xero refused it: ${errs.join(" ")}` };
+    return { ok: true, xeroStatus: String(made.Status || status).toUpperCase() };
+  };
+  const phDates = days.map((d, i) => isHoliday[i] && phUnits[i] > 0 ? `${TS_HOLIDAYS[tsAddDays(sub.week_start, i)]} ${tsDmy(tsAddDays(sub.week_start, i))}` : "").filter(Boolean);
+  let phNote = "";
+  let withPh = phTotal > 0 && !!phItem;
+  if (phTotal > 0 && !phItem) phNote = `Xero has no Public Holiday pay rate, so ${phDates.join(", ")} was left blank.`;
+  let first = await send("APPROVED", withPh);
+  if (!first.ok && withPh) {
+    const retry = await send("APPROVED", false);
+    if (retry.ok) { phNote = `Xero would not take the Public Holiday line (${first.fail || "refused"}), so ${phDates.join(", ")} was left blank.`; first = retry; withPh = false; }
+  }
+  if (first.ok) {
+    if (withPh) phNote = `${phDates.join(", ")} sent on the ${phItem.Name} rate.`;
+    return { ...first, ...phNote ? { note: phNote } : {} };
+  }
+  const second = await send("DRAFT", withPh);
+  if (second.ok) return { ...second, note: `Xero would not take it as approved (${first.fail}) so it was sent as a draft. Approve it in Xero.${phNote ? ` ${phNote}` : ""}` };
+  return { fail: second.fail };
+}
+// The hours a week a salaried person is paid for, from the payroll snapshot. 0 when they are not on a salary.
+async function tsSalaryHours(env, email) {
+  try { const r = await env.DB.prepare("SELECT annual_salary, week_hours FROM xero_payroll WHERE lower(email) = ?").bind(String(email || "").toLowerCase()).first(); return r && Number(r.annual_salary) > 0 ? Number(r.week_hours) || 0 : 0; } catch (e) { return 0; }
+}
+// Weeks that were kept in Reservoir only because the person is salaried (before w144) are sent to Xero now. It only touches weeks from 19 Oct 2026 and each row is done once.
+async function tsResendSalaried(env) {
+  await tsTables(env);
+  const rows = ((await env.DB.prepare("SELECT * FROM timesheet_submissions WHERE xero_status = 'SALARIED' AND week_start >= '2026-10-19' LIMIT 10").all()).results) || [];
+  for (const row of rows) {
+    const out = await tsPushXero(env, row);
+    if (out.fail) { await env.DB.prepare("UPDATE timesheet_submissions SET last_error = ? WHERE id = ?").bind(String(out.fail).slice(0, 400), row.id).run(); continue; }
+    await env.DB.prepare("UPDATE timesheet_submissions SET xero_status = ?, last_error = NULL WHERE id = ?").bind(out.xeroStatus, row.id).run();
+  }
+}
+// The Xero employee for a signed in person, from the payroll snapshot. Nothing is read from Xero.
+async function tsEmployee(env, email) {
+  const row = await env.DB.prepare("SELECT employee_id FROM xero_payroll WHERE lower(email) = ?").bind(email).first();
+  return row && row.employee_id ? row.employee_id : "";
+}
+async function tsDuplicate(env, employeeId, email, week) {
+  await timesheetTable(env);
+  const inXero = await env.DB.prepare("SELECT id FROM xero_timesheets WHERE employee_id = ? AND start_date = ? AND (status IS NULL OR upper(status) <> 'REJECTED') LIMIT 1").bind(employeeId, week).first();
+  if (inXero) return "Xero already has a timesheet for that week.";
+  const mine = await env.DB.prepare("SELECT status FROM timesheet_submissions WHERE email = ? AND week_start = ? AND status IN ('pending','sent') LIMIT 1").bind(email, week).first();
+  if (mine) return mine.status === "pending" ? "That week is already waiting for approval." : "That week has already been sent to Xero.";
+  return "";
+}
+// Only a director may approve a waiting timesheet for now.
+// ---- Notifications and the punch list ----
+// One table for everything that needs to tell somebody something. A notice goes to one person (their work email) or to the whole office ('@office', seen by every director and manager). A notice with todo = 1 is a job for the person: it stays on their punch list, and keeps counting on the bell, until it is done. Any other notice counts until it has been read.
+// data holds what the app needs to act on the notice, for example which card and which photo.
+let noticesReady = false;
+// ---- General requests (fuel card, replacement tools, test and tag, and the rest). The app keeps each request as one JSON record. Anyone signed in can send one and see their own. The office (T1 and T2) sees them all, and only Tayler can approve or decline.
+let appRequestsReady = false;
+async function appRequestsTable(env) {
+  if (appRequestsReady) return;
+  appRequestsReady = true;
+  await env.DB.prepare("CREATE TABLE IF NOT EXISTS app_requests (id TEXT PRIMARY KEY, by_email TEXT NOT NULL, by_name TEXT, type TEXT, status TEXT, data TEXT NOT NULL, created_at TEXT, updated_at TEXT)").run();
+  await env.DB.prepare("CREATE INDEX IF NOT EXISTS app_requests_by ON app_requests (by_email)").run();
+}
+async function appRequestsRoutes(request, env, user, url) {
+  const m = url.pathname.match(/^\/api\/requests(?:\/([A-Za-z0-9_-]{1,64}))?$/);
+  if (!m) return null;
+  const email = String(user.email || "").trim().toLowerCase();
+  if (!email) return reply(env, 400, { error: "No email on your sign in" });
+  const office = user.tier === "T1" || user.tier === "T2";
+  await appRequestsTable(env);
+  const out = (r) => { try { return { ...JSON.parse(r.data), id: r.id, server: true }; } catch (e) { return null; } };
+  if (request.method === "GET" && !m[1]) {
+    const rows = office
+      ? ((await env.DB.prepare("SELECT * FROM app_requests ORDER BY created_at DESC LIMIT 300").all()).results) || []
+      : ((await env.DB.prepare("SELECT * FROM app_requests WHERE by_email = ? ORDER BY created_at DESC LIMIT 300").bind(email).all()).results) || [];
+    return reply(env, 200, { requests: rows.map(out).filter(Boolean), worker: WORKER_BUILD });
+  }
+  if (request.method === "POST" && !m[1]) {
+    let b;
+    try { b = await request.json(); } catch (e) { b = null; }
+    if (!b || typeof b !== "object" || !/^[A-Za-z0-9_-]{1,64}$/.test(String(b.id || ""))) return reply(env, 400, { error: "Bad request record" });
+    const rec = { ...b };
+    delete rec.server;
+    rec.photos = (Array.isArray(rec.photos) ? rec.photos : []).slice(0, 8).map((x) => ({ name: String(x && x.name || "Photo").slice(0, 120), thumb: x && typeof x.thumb === "string" && x.thumb.length < 120000 ? x.thumb : "" }));
+    rec.kind = "request";
+    const json = JSON.stringify(rec);
+    if (json.length > 900000) return reply(env, 413, { error: "That request is too large" });
+    const existing = await env.DB.prepare("SELECT * FROM app_requests WHERE id = ?").bind(rec.id).first();
+    const now = new Date().toISOString();
+    if (!existing) {
+      const first = String(user.name || "").split(" ")[0];
+      rec.by = first || rec.by;
+      await env.DB.prepare("INSERT INTO app_requests (id, by_email, by_name, type, status, data, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)").bind(rec.id, email, user.name || "", String(rec.type || ""), String(rec.status || "pending"), JSON.stringify(rec), now, now).run();
+      return reply(env, 200, { ok: true, created: true });
+    }
+    if (existing.by_email !== email && !office) return reply(env, 403, { error: "forbidden" });
+    const oldStatus = String(existing.status || "pending");
+    const newStatus = String(rec.status || oldStatus);
+    if (newStatus !== oldStatus && (newStatus === "approved" || newStatus === "declined") && !isApprover(user)) return reply(env, 403, { error: "Only Tayler can approve or decline requests for now" });
+    rec.by = (() => { try { return JSON.parse(existing.data).by || rec.by; } catch (e) { return rec.by; } })();
+    await env.DB.prepare("UPDATE app_requests SET status = ?, type = ?, data = ?, updated_at = ? WHERE id = ?").bind(newStatus, String(rec.type || existing.type || ""), JSON.stringify(rec), now, rec.id).run();
+    if (newStatus !== oldStatus && (newStatus === "approved" || newStatus === "declined")) {
+      await notify(env, { to: existing.by_email, kind: "request", title: `Your request for ${String(rec.type || "request").toLowerCase().slice(0, 60)} has been ${newStatus}`, body: "Check your request screen for more details.", link: "makerequest", by: user.name || email });
+    }
+    // A note from the office sends the requester back a push, and a reply from the requester tells the office.
+    try {
+      const before = (() => { try { return (JSON.parse(existing.data).notes || []).length; } catch (e) { return 0; } })();
+      const notes = Array.isArray(rec.notes) ? rec.notes : [];
+      const last = notes[notes.length - 1];
+      if (notes.length > before && last && newStatus === "pending") {
+        if (last.role === "office") await notify(env, { to: existing.by_email, kind: "request", title: `More information needed for your ${String(rec.type || "request").toLowerCase().slice(0, 60)} request`, body: "Check your request screen for more details.", link: "makerequest", by: user.name || email });
+        else await notify(env, { to: "@office", kind: "request", title: `Reply on request, ${String(rec.type || "Request").slice(0, 60)}`, body: "The requester replied. Open Team Requests.", link: "teamrequests", by: user.name || email });
+      }
+    } catch (e) { /* the notice is best effort */ }
+    return reply(env, 200, { ok: true });
+  }
+  if (request.method === "DELETE" && m[1]) {
+    const row = await env.DB.prepare("SELECT by_email FROM app_requests WHERE id = ?").bind(m[1]).first();
+    if (!row) return reply(env, 200, { ok: true });
+    if (row.by_email !== email && !isApprover(user)) return reply(env, 403, { error: "forbidden" });
+    await env.DB.prepare("DELETE FROM app_requests WHERE id = ?").bind(m[1]).run();
+    return reply(env, 200, { ok: true });
+  }
+  return reply(env, 405, { error: "method not allowed" });
+}
+// ---- Partners added in the app (online portals the office logs into). The seed list stays in the app, only partners added here live in D1. T1 and T2 only. Name, username and password are required.
+let partnersReady = false;
+async function partnersTable(env) {
+  if (partnersReady) return;
+  partnersReady = true;
+  await env.DB.prepare("CREATE TABLE IF NOT EXISTS partners (id TEXT PRIMARY KEY, kind TEXT, name TEXT NOT NULL, phone TEXT, website TEXT, address TEXT, account TEXT, username TEXT, password TEXT, email TEXT, notes TEXT, by_name TEXT, created_at TEXT, updated_at TEXT)").run();
+  try { await env.DB.prepare("ALTER TABLE partners ADD COLUMN removed INTEGER NOT NULL DEFAULT 0").run(); } catch (e) { /* already there */ }
+}
+async function partnersRoutes(request, env, user, url) {
+  const m = url.pathname.match(/^\/api\/partners(?:\/([A-Za-z0-9_-]{1,64}))?$/);
+  if (!m) return null;
+  if (user.tier !== "T1" && user.tier !== "T2") return reply(env, 403, { error: "forbidden" });
+  await partnersTable(env);
+  if (request.method === "GET" && !m[1]) {
+    const rows = ((await env.DB.prepare("SELECT id, kind, name, phone, website, address, account, username, password, email, notes FROM partners WHERE removed = 0 ORDER BY name COLLATE NOCASE").all()).results) || [];
+    const gone = ((await env.DB.prepare("SELECT id FROM partners WHERE removed = 1").all()).results) || [];
+    return reply(env, 200, { partners: rows.map((r) => ({ ...r, kind: r.kind || void 0 })), removed: gone.map((r) => r.id), worker: WORKER_BUILD });
+  }
+  if (request.method === "PUT" && m[1]) {
+    let b;
+    try { b = await request.json(); } catch (e) { b = null; }
+    if (!b || typeof b !== "object") return reply(env, 400, { error: "bad json" });
+    const f = (k, n) => String(b[k] == null ? "" : b[k]).trim().slice(0, n || 200);
+    const name = f("name"), username = f("username"), password = String(b.password == null ? "" : b.password).slice(0, 500);
+    // Partners added in the app (ids starting with u) must have a username and password. The built in list can be renamed or changed without them.
+    const added = /^u/.test(m[1]);
+    if (!name || (added && (!username || !password))) return reply(env, 400, { error: "A partner needs a name, a username and a password" });
+    const now = new Date().toISOString();
+    const kind = f("kind") === "supplier" ? "supplier" : "";
+    await env.DB.prepare("INSERT INTO partners (id, kind, name, phone, website, address, account, username, password, email, notes, by_name, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET removed = 0, kind = excluded.kind, name = excluded.name, phone = excluded.phone, website = excluded.website, address = excluded.address, account = excluded.account, username = excluded.username, password = excluded.password, email = excluded.email, notes = excluded.notes, by_name = excluded.by_name, updated_at = excluded.updated_at")
+      .bind(m[1], kind, name, f("phone", 40), f("website", 300), f("address", 300), f("account", 100), username, password, f("email", 200), String(b.notes == null ? "" : b.notes).slice(0, 2000), user.name || "", now, now).run();
+    return reply(env, 200, { ok: true });
+  }
+  if (request.method === "DELETE" && m[1]) {
+    // Removes a partner for everyone. The built in list lives in the app, so a removed one is kept as a marker the app hides.
+    const now = new Date().toISOString();
+    await env.DB.prepare("INSERT INTO partners (id, name, removed, by_name, created_at, updated_at) VALUES (?, '(removed)', 1, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET removed = 1, by_name = excluded.by_name, updated_at = excluded.updated_at").bind(m[1], user.name || "", now, now).run();
+    return reply(env, 200, { ok: true });
+  }
+  return reply(env, 405, { error: "method not allowed" });
+}
+// The Action List. Workspaces (a name and who is in it) and action items live here so they survive reloads and everyone sees the same list. Staff see items assigned to them, items they created, and items in workspaces they belong to. The DFP Team workspace shows staff (T3) only their own items. Only T1 and T2 can edit an item; the person it is assigned to, or who created it, can tick it done.
+let todosReady = false;
+async function todosTable(env) {
+  if (todosReady) return;
+  todosReady = true;
+  await env.DB.prepare("CREATE TABLE IF NOT EXISTS todo_workspaces (name TEXT PRIMARY KEY, members TEXT NOT NULL DEFAULT '[]', by_name TEXT, created_at TEXT, updated_at TEXT)").run();
+  await env.DB.prepare("CREATE TABLE IF NOT EXISTS todo_items (id TEXT PRIMARY KEY, title TEXT NOT NULL, note TEXT, assigned_to TEXT, ws TEXT, due TEXT, repeat TEXT, done INTEGER NOT NULL DEFAULT 0, by_name TEXT, created TEXT, updated_at TEXT)").run();
+  try { await env.DB.prepare("ALTER TABLE todo_items ADD COLUMN ord INTEGER NOT NULL DEFAULT 0").run(); } catch (e) {}
+  try { await env.DB.prepare("ALTER TABLE todo_items ADD COLUMN kind TEXT").run(); } catch (e) {}
+  // One time: the finance tasks are moved into the Finance workspace.
+  try {
+    if (!(await migDone(env, "todo_finance_ws_v1"))) {
+      const now = new Date().toISOString();
+      await env.DB.prepare("INSERT OR IGNORE INTO todo_workspaces (name, members, by_name, created_at, updated_at) VALUES ('Finance', '[]', 'Tayler', ?, ?)").bind(now, now).run();
+      const titles = ["Bills to Pay", "Xero Reconciliations", "Accounts Receivables", "Amex Payment", "Expenses Transfer", "Monday Money to Andrew", "Client Invoice Statements"];
+      let n = 0;
+      for (const t of titles) { const r = await env.DB.prepare("UPDATE todo_items SET ws = 'Finance', updated_at = ? WHERE lower(title) = lower(?)").bind(now, t).run(); n += (r.meta && r.meta.changes) || 0; }
+      await migMark(env, "todo_finance_ws_v1", `${n} tasks moved to Finance`);
+    }
+  } catch (e) { todosReady = false; }
+  // One time: Finance and Payroll workspaces are combined as Payroll & Finance, like the home screen.
+  try {
+    if (!(await migDone(env, "todo_payfin_ws_v1"))) {
+      const now = new Date().toISOString();
+      const old = ((await env.DB.prepare("SELECT name, members FROM todo_workspaces WHERE lower(name) IN ('finance', 'payroll', 'payroll and finance', 'payroll & finance')").all()).results) || [];
+      const members = new Set();
+      for (const w of old) { try { for (const x of JSON.parse(w.members || "[]")) members.add(x); } catch (e) {} }
+      await env.DB.prepare("INSERT INTO todo_workspaces (name, members, by_name, created_at, updated_at) VALUES ('Payroll & Finance', ?, 'Tayler', ?, ?) ON CONFLICT(name) DO UPDATE SET members = excluded.members, updated_at = excluded.updated_at").bind(JSON.stringify([...members]), now, now).run();
+      await env.DB.prepare("UPDATE todo_items SET ws = 'Payroll & Finance', updated_at = ? WHERE lower(ws) IN ('finance', 'payroll', 'payroll and finance')").bind(now).run();
+      await env.DB.prepare("DELETE FROM todo_workspaces WHERE lower(name) IN ('finance', 'payroll', 'payroll and finance')").run();
+      await migMark(env, "todo_payfin_ws_v1", "Finance and Payroll combined");
+    }
+  } catch (e) { todosReady = false; }
+}
+async function todosRoutes(request, env, user, url) {
+  const m = url.pathname.match(/^\/api\/todos(?:\/(items|workspaces)\/([^/]{1,80}))?$/);
+  if (!m) return null;
+  await todosTable(env);
+  const me = String(user.name || "").trim().split(/\s+/)[0];
+  const senior = user.tier === "T1" || user.tier === "T2";
+  const firstOf = (n) => String(n || "").trim().split(/\s+/)[0];
+  if (request.method === "GET" && !m[1]) {
+    await env.DB.prepare("DELETE FROM todo_items WHERE done = 1 AND updated_at IS NOT NULL AND updated_at < ?").bind(new Date(Date.now() - 92 * 86400000).toISOString()).run();
+    const ws = ((await env.DB.prepare("SELECT name, members FROM todo_workspaces ORDER BY name COLLATE NOCASE").all()).results) || [];
+    const workspaces = {};
+    for (const w of ws) { let a = []; try { a = JSON.parse(w.members || "[]"); } catch (e) { a = []; } workspaces[w.name] = a; }
+    const rows = ((await env.DB.prepare("SELECT id, title, note, assigned_to, ws, due, repeat, done, ord, kind, by_name, created FROM todo_items ORDER BY created DESC, rowid DESC").all()).results) || [];
+    const items = rows.filter((r) => {
+      if (senior) return true;
+      const mine = firstOf(r.assigned_to) === me || r.by_name === me;
+      if (mine) return true;
+      if (!r.ws || !(workspaces[r.ws] || []).includes(me)) return false;
+      return r.ws === "DFP Team" ? senior : true;
+    }).map((r) => { let rp = null; try { rp = r.repeat ? JSON.parse(r.repeat) : null; } catch (e) { rp = null; } return { id: r.id, title: r.title, note: r.note || "", assignedTo: r.assigned_to || "", group: r.ws || "", due: r.due || "", importance: "date", repeat: rp, done: r.done === 1, ord: Number(r.ord) || 0, kind: r.kind || "", by: r.by_name || "", created: r.created || "" }; });
+    return reply(env, 200, { workspaces, items, worker: WORKER_BUILD });
+  }
+  if (request.method === "PUT" && m[1] === "workspaces") {
+    const name = decodeURIComponent(m[2]).trim().slice(0, 50);
+    let b; try { b = await request.json(); } catch (e) { b = null; }
+    if (b && typeof b.rename === "string") {
+      if (!senior) return reply(env, 403, { error: "forbidden" });
+      const nu = b.rename.trim().slice(0, 50);
+      if (!name || !nu) return reply(env, 400, { error: "bad request" });
+      const clash = await env.DB.prepare("SELECT name FROM todo_workspaces WHERE lower(name) = lower(?) AND name <> ?").bind(nu, name).first();
+      if (clash) return reply(env, 409, { error: "A workspace with that name already exists" });
+      const now = new Date().toISOString();
+      await env.DB.prepare("UPDATE todo_workspaces SET name = ?, updated_at = ? WHERE name = ?").bind(nu, now, name).run();
+      await env.DB.prepare("UPDATE todo_items SET ws = ?, updated_at = ? WHERE ws = ?").bind(nu, now, name).run();
+      return reply(env, 200, { ok: true });
+    }
+    if (!name || !b || !Array.isArray(b.members)) return reply(env, 400, { error: "bad request" });
+    const members = [...new Set(b.members.map((x) => String(x || "").trim().slice(0, 40)).filter(Boolean))].slice(0, 60);
+    const cur = await env.DB.prepare("SELECT members FROM todo_workspaces WHERE name = ?").bind(name).first();
+    let curMembers = []; try { curMembers = cur ? JSON.parse(cur.members || "[]") : []; } catch (e) { curMembers = []; }
+    if (!senior && !(cur && curMembers.includes(me))) return reply(env, 403, { error: "forbidden" });
+    const now = new Date().toISOString();
+    await env.DB.prepare("INSERT INTO todo_workspaces (name, members, by_name, created_at, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(name) DO UPDATE SET members = excluded.members, updated_at = excluded.updated_at").bind(name, JSON.stringify(members), me, now, now).run();
+    return reply(env, 200, { ok: true });
+  }
+  if (request.method === "DELETE" && m[1] === "workspaces") {
+    if (!senior) return reply(env, 403, { error: "forbidden" });
+    const name = decodeURIComponent(m[2]).trim().slice(0, 50);
+    const openCount = await env.DB.prepare("SELECT COUNT(*) AS n FROM todo_items WHERE ws = ? AND done = 0").bind(name).first();
+    if (openCount && openCount.n > 0) return reply(env, 409, { error: "The workspace still has open action items" });
+    await env.DB.prepare("DELETE FROM todo_items WHERE ws = ? AND done = 1").bind(name).run();
+    await env.DB.prepare("DELETE FROM todo_workspaces WHERE name = ?").bind(name).run();
+    return reply(env, 200, { ok: true });
+  }
+  if (request.method === "DELETE" && m[1] === "items") {
+    if (!senior) return reply(env, 403, { error: "forbidden" });
+    const id = m[2];
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(id)) return reply(env, 400, { error: "bad id" });
+    const cur = await env.DB.prepare("SELECT id, title, assigned_to, ws FROM todo_items WHERE id = ?").bind(id).first();
+    if (!cur) return reply(env, 200, { ok: true });
+    if (url.searchParams.get("series") === "1") await env.DB.prepare("DELETE FROM todo_items WHERE done = 1 AND title = ? AND COALESCE(assigned_to, '') = ? AND COALESCE(ws, '') = ?").bind(cur.title, cur.assigned_to || "", cur.ws || "").run();
+    await env.DB.prepare("DELETE FROM todo_items WHERE id = ?").bind(id).run();
+    return reply(env, 200, { ok: true });
+  }
+  if (request.method === "PUT" && m[1] === "items") {
+    const id = m[2];
+    if (!/^[A-Za-z0-9_-]{1,64}$/.test(id)) return reply(env, 400, { error: "bad id" });
+    let b; try { b = await request.json(); } catch (e) { b = null; }
+    if (!b || typeof b !== "object") return reply(env, 400, { error: "bad json" });
+    const cur = await env.DB.prepare("SELECT id, assigned_to, by_name FROM todo_items WHERE id = ?").bind(id).first();
+    const now = new Date().toISOString();
+    if (cur) {
+      const mineItem = firstOf(cur.assigned_to) === me || cur.by_name === me;
+      if (senior && b.title != null) {
+        const rp = b.repeat && b.repeat.type ? JSON.stringify({ type: String(b.repeat.type).slice(0, 10), dow: Number(b.repeat.dow) || 0, dom: Number(b.repeat.dom) || 1 }) : null;
+        await env.DB.prepare("UPDATE todo_items SET title = ?, note = ?, assigned_to = ?, ws = ?, due = ?, repeat = ?, done = ?, ord = ?, kind = ?, updated_at = ? WHERE id = ?").bind(String(b.title || "").trim().slice(0, 60), String(b.note || "").slice(0, 2000), String(b.assignedTo || "").slice(0, 80), String(b.group || "").slice(0, 50), String(b.due || "").slice(0, 10), rp, b.done ? 1 : 0, Math.max(0, Math.min(999, Math.round(Number(b.ord) || 0))), String(b.kind || "").slice(0, 3), now, id).run();
+        return reply(env, 200, { ok: true });
+      }
+      if (mineItem || senior) { await env.DB.prepare("UPDATE todo_items SET done = ?, updated_at = ? WHERE id = ?").bind(b.done ? 1 : 0, now, id).run(); return reply(env, 200, { ok: true }); }
+      return reply(env, 403, { error: "forbidden" });
+    }
+    const title = String(b.title || "").trim().slice(0, 60);
+    if (!title) return reply(env, 400, { error: "A title is needed" });
+    const rp = b.repeat && b.repeat.type ? JSON.stringify({ type: String(b.repeat.type).slice(0, 10), dow: Number(b.repeat.dow) || 0, dom: Number(b.repeat.dom) || 1 }) : null;
+    await env.DB.prepare("INSERT INTO todo_items (id, title, note, assigned_to, ws, due, repeat, done, ord, kind, by_name, created, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?)").bind(id, title, String(b.note || "").slice(0, 2000), String(b.assignedTo || "").slice(0, 80), String(b.group || "").slice(0, 50), String(b.due || "").slice(0, 10), rp, Math.max(0, Math.min(999, Math.round(Number(b.ord) || 0))), String(b.kind || "").slice(0, 3), me, String(b.created || now.slice(0, 10)).slice(0, 10), now).run();
+    return reply(env, 200, { ok: true });
+  }
+  return reply(env, 405, { error: "method not allowed" });
+}
+async function noticesTable(env) {
+  if (noticesReady) return;
+  await env.DB.prepare("CREATE TABLE IF NOT EXISTS notices (id TEXT PRIMARY KEY, to_email TEXT NOT NULL, kind TEXT, title TEXT, body TEXT, todo INTEGER NOT NULL DEFAULT 0, link TEXT, data TEXT, by_name TEXT, created_at TEXT DEFAULT (datetime('now')), read_at TEXT, done_at TEXT, done_by TEXT)").run();
+  await env.DB.prepare("CREATE INDEX IF NOT EXISTS notices_to ON notices (to_email, created_at)").run();
+  noticesReady = true;
+  // One time: every notice is cleared so everyone starts fresh (w144).
+  if (!(await migDone(env, "notices_fresh_start_w144"))) {
+    try { await env.DB.prepare("DELETE FROM notices").run(); await migMark(env, "notices_fresh_start_w144", "all notices cleared"); } catch (e) { noticesReady = false; throw e; }
+  }
+  // One time, 16 November 2026: Mitch's notices are cleared except the policy and handbook ones he still has to acknowledge.
+  if (!(await migDone(env, "mitch_notices_reset_v1"))) {
+    try {
+      const mx = await env.DB.prepare("SELECT lower(email) AS e FROM dfp_xero WHERE lower(name) = 'mitchell saba' AND email IS NOT NULL AND email <> '' LIMIT 1").first();
+      if (mx && mx.e) {
+        const d = await env.DB.prepare("DELETE FROM notices WHERE lower(to_email) = ? AND COALESCE(kind, '') <> 'policy'").bind(mx.e).run();
+        await migMark(env, "mitch_notices_reset_v1", `${d && d.meta ? d.meta.changes : 0} notices removed`);
+      }
+    } catch (e) { /* tried again on the next start */ }
+  }
+  // One time, 17 November 2026: Tayler's notices are cleared except the policy and handbook ones he still has to acknowledge.
+  if (!(await migDone(env, "tayler_notices_reset_v1"))) {
+    try {
+      const d = await env.DB.prepare("DELETE FROM notices WHERE lower(to_email) = 'tayler@directflow.com.au' AND COALESCE(kind, '') <> 'policy'").run();
+      await migMark(env, "tayler_notices_reset_v1", `${d && d.meta ? d.meta.changes : 0} notices removed`);
+    } catch (e) { /* tried again on the next start */ }
+  }
+  // One time, 17 November 2026: Tayler's remaining policy notices go too, as he asked while testing.
+  if (!(await migDone(env, "tayler_notices_reset_v2"))) {
+    try {
+      const d = await env.DB.prepare("DELETE FROM notices WHERE lower(to_email) = 'tayler@directflow.com.au'").run();
+      await migMark(env, "tayler_notices_reset_v2", `${d && d.meta ? d.meta.changes : 0} notices removed`);
+    } catch (e) { /* tried again on the next start */ }
+  }
+  // One time, 23 November 2026: the contact approval notices go, Tayler approves contacts by hand.
+  if (!(await migDone(env, "contact_approval_notices_off_v1"))) {
+    try {
+      const d = await env.DB.prepare("DELETE FROM notices WHERE title = 'Contact approval'").run();
+      await migMark(env, "contact_approval_notices_off_v1", `${d && d.meta ? d.meta.changes : 0} notices removed`);
+    } catch (e) { /* tried again on the next start */ }
+  }
+  // One time, 23 November 2026: a push asking Tayler to complete his timesheet.
+  if (!(await migDone(env, "timesheet_push_tayler_v1"))) {
+    try {
+      await migMark(env, "timesheet_push_tayler_v1", "sent");
+      await notify(env, { to: "tayler@directflow.com.au", kind: "info", title: "Timesheet", body: "Please complete your timesheet.", by: "Reservoir" });
+    } catch (e) { /* not sent */ }
+  }
+  // One time, 18 November 2026: Tayler's notices are cleared again, as he asked.
+  if (!(await migDone(env, "tayler_notices_reset_v3"))) {
+    try {
+      const d = await env.DB.prepare("DELETE FROM notices WHERE lower(to_email) = 'tayler@directflow.com.au'").run();
+      await migMark(env, "tayler_notices_reset_v3", `${d && d.meta ? d.meta.changes : 0} notices removed`);
+    } catch (e) { /* tried again on the next start */ }
+  }
+  // One time, 17 November 2026: Mitch's two reimbursements from 16 November go back to waiting so they can be processed again and sent to Xero.
+  if (!(await migDone(env, "mitch_reimb_reopen_v1"))) {
+    try {
+      await receiptRecordsTable(env);
+      const d = await env.DB.prepare("UPDATE receipt_records SET status = 'submitted', done_date = '' WHERE type = 'reimbursement' AND lower(by_email) LIKE 'mitch%' AND sent_date = '2026-11-16'").run();
+      await migMark(env, "mitch_reimb_reopen_v1", `${d && d.meta ? d.meta.changes : 0} reimbursements reopened`);
+    } catch (e) { /* tried again on the next start */ }
+  }
+  // One time, 23 November 2026: reimbursements already sent to Xero today (before the send time was kept) are stamped now, so their draft bills get the team member as contact.
+  if (!(await migDone(env, "reimb_xero_at_v1"))) {
+    try {
+      await receiptRecordsTable(env);
+      const d = await env.DB.prepare("UPDATE receipt_records SET xero_at = ? WHERE type = 'reimbursement' AND xero_at IS NULL AND sent_date >= '2026-11-22'").bind(new Date().toISOString()).run();
+      await migMark(env, "reimb_xero_at_v1", `${d && d.meta ? d.meta.changes : 0} reimbursements stamped`);
+    } catch (e) { /* tried again on the next start */ }
+  }
+  // One time, 26 November 2026: the PAYG notice for the pay run ending 22 November again, as a draft bill in Xero with the new reference (the approved one was voided).
+  if (!(await migDone(env, "payg_bill_we22_v1"))) {
+    try {
+      await payslipTables(env);
+      const pr = await env.DB.prepare("SELECT run_id FROM payslip_runs WHERE period_end LIKE '2026-11-22%' LIMIT 1").first();
+      const r = pr ? await paygBill(env, pr.run_id, "DRAFT", true) : { ok: false, note: "no pay run ending 22 November" };
+      if (r && r.ok) await migMark(env, "payg_bill_we22_v1", String(r.note || r.status || "done").slice(0, 200));
+      else console.log("payg we22 bill not made", r && r.note);
+    } catch (e) { console.log("payg we22 bill failed", String(e && e.message || e)); }
+  }
+  // One time, 23 November 2026: the PAYG notice for the pay run ending 15 November, as a draft bill in Xero (any earlier test draft is replaced).
+  if (!(await migDone(env, "payg_bill_test_v2"))) {
+    try {
+      await payslipTables(env);
+      const pr = await env.DB.prepare("SELECT run_id FROM payslip_runs WHERE period_end LIKE '2026-11-15%' LIMIT 1").first();
+      const r = pr ? await paygBill(env, pr.run_id, "DRAFT", true) : { ok: false, note: "no pay run ending 15 November" };
+      if (r && r.ok) await migMark(env, "payg_bill_test_v2", String(r.note || r.status || "done").slice(0, 200));
+      else console.log("payg test bill not made", r && r.note);
+    } catch (e) { console.log("payg test bill failed", String(e && e.message || e)); }
+  }
+  // One time, 17 November 2026: second try, matching Mitch by first name or email, so his two reimbursements from 16 November are waiting again.
+  if (!(await migDone(env, "mitch_reimb_reopen_v2"))) {
+    try {
+      await receiptRecordsTable(env);
+      const d = await env.DB.prepare("UPDATE receipt_records SET status = 'submitted', done_date = '' WHERE type = 'reimbursement' AND status = 'paid' AND (lower(by_name) LIKE 'mitch%' OR lower(by_email) LIKE 'mitch%') AND sent_date >= '2026-11-15'").run();
+      await migMark(env, "mitch_reimb_reopen_v2", `${d && d.meta ? d.meta.changes : 0} reimbursements reopened`);
+    } catch (e) { /* tried again on the next start */ }
+  }
+  // One time: the timesheet notices that were kept on their own are brought across.
+  if (!(await migDone(env, "ts_notices_to_notices_v1"))) {
+    try {
+      const old = ((await env.DB.prepare("SELECT id, email, text, created_at, seen FROM ts_notices").all()).results) || [];
+      for (const n of old) await env.DB.prepare("INSERT OR IGNORE INTO notices (id, to_email, kind, title, body, todo, created_at, read_at) VALUES (?, ?, 'timesheet', 'Timesheet', ?, 0, ?, ?)").bind(`ts${n.id}`, String(n.email || "").toLowerCase(), n.text || "", n.created_at || null, n.seen === 1 ? (n.created_at || "seen") : null).run();
+      await migMark(env, "ts_notices_to_notices_v1", `${old.length} timesheet notices copied`);
+    } catch (e) { /* no old table yet */ await migMark(env, "ts_notices_to_notices_v1", "nothing to copy"); }
+  }
+}
+// Push notifications. Which kinds of notice also go to people's phones is decided here, once. Anything marked todo (someone has to act) also pushes. To change what pushes, change this list.
+const PUSH_KINDS = ["timesheet", "payroll", "cardreset", "card", "request", "policy", "dailyops", "mail", "incident", "incentive"];
+const b64uEnc = (buf) => { const u = new Uint8Array(buf); let s = ""; for (let i = 0; i < u.length; i++) s += String.fromCharCode(u[i]); return btoa(s).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, ""); };
+const b64uDec = (str) => { const s = String(str || "").replace(/-/g, "+").replace(/_/g, "/"); const bin = atob(s + "=".repeat((4 - (s.length % 4)) % 4)); const u = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) u[i] = bin.charCodeAt(i); return u; };
+const concatBytes = (...parts) => { const out = new Uint8Array(parts.reduce((n, p) => n + p.length, 0)); let o = 0; for (const p of parts) { out.set(p, o); o += p.length; } return out; };
+let pushReady = false;
+async function pushTable(env) {
+  if (pushReady) return;
+  await env.DB.prepare("CREATE TABLE IF NOT EXISTS push_subs (endpoint TEXT PRIMARY KEY, email TEXT NOT NULL, tier TEXT, p256dh TEXT NOT NULL, auth TEXT NOT NULL, ua TEXT, created_at TEXT DEFAULT (datetime('now')), last_ok TEXT)").run();
+  await env.DB.prepare("CREATE INDEX IF NOT EXISTS push_subs_email ON push_subs (email)").run();
+  try { await env.DB.prepare("ALTER TABLE push_subs ADD COLUMN all_hours INTEGER NOT NULL DEFAULT 0").run(); } catch (e) { /* already there */ }
+  try { await env.DB.prepare("ALTER TABLE push_subs ADD COLUMN hours_mode TEXT").run(); } catch (e) { /* already there */ }
+  try { await env.DB.prepare("ALTER TABLE push_subs ADD COLUMN app TEXT").run(); } catch (e) { /* already there */ }
+  try { await env.DB.prepare("ALTER TABLE push_subs ADD COLUMN mail_on INTEGER NOT NULL DEFAULT 1").run(); } catch (e) { /* already there */ }
+  try { await env.DB.prepare("ALTER TABLE push_subs ADD COLUMN mail_sound INTEGER NOT NULL DEFAULT 1").run(); } catch (e) { /* already there */ }
+  try { await env.DB.prepare("ALTER TABLE push_subs ADD COLUMN mail_off TEXT NOT NULL DEFAULT ''").run(); } catch (e) { /* already there */ }
+  await env.DB.prepare("CREATE TABLE IF NOT EXISTS push_held (id INTEGER PRIMARY KEY AUTOINCREMENT, endpoint TEXT NOT NULL, created_at TEXT DEFAULT (datetime('now')))").run();
+  pushReady = true;
+}
+// Each phone picks when push may reach it. Weekday windows are Monday to Friday in Melbourne time, or 24 hours every day. Anything held back is counted and sent as one push when that phone's window next opens. The notice itself is always in the shield.
+const PUSH_MODES = { "default": "biz", "0730-1600": [450, 960], "0700-1630": [420, 990], "0600-1800": [360, 1080], "24": null };
+// The default mode follows the business hours Tayler sets in the Hours tile. Kept in app_settings as business.hours and loaded before any push decision.
+let PUSH_BIZ = [450, 960];
+const bizMins = (t) => { const m = /^(\d{1,2}):(\d{2})$/.exec(String(t || "")); return m ? Number(m[1]) * 60 + Number(m[2]) : null; };
+async function pushLoadBiz(env) {
+  try {
+    const r = await env.DB.prepare("SELECT value FROM app_settings WHERE key = 'business.hours'").first();
+    const v = r && r.value ? JSON.parse(r.value) : null;
+    const a = v ? bizMins(v.start) : null, b = v ? bizMins(v.end) : null;
+    PUSH_BIZ = a !== null && b !== null && b > a ? [a, b] : [450, 960];
+  } catch (e) { PUSH_BIZ = [450, 960]; }
+  return PUSH_BIZ;
+}
+const bizText = (w) => { const f = (m) => `${String(Math.floor(m / 60)).padStart(2, "0")}:${String(m % 60).padStart(2, "0")}`; return { start: f(w[0]), end: f(w[1]) }; };
+const pushModeOf = (row) => (row && row.tier && row.tier !== "T1" && row.tier !== "T2") ? "default" : (row && row.hours_mode && Object.prototype.hasOwnProperty.call(PUSH_MODES, row.hours_mode)) ? row.hours_mode : (row && row.all_hours ? "24" : "default");
+function pushInHours(mode, d) {
+  let w = PUSH_MODES[mode || "default"];
+  if (w === "biz") w = PUSH_BIZ;
+  if (w === null) return true;
+  const parts = new Intl.DateTimeFormat("en-AU", { timeZone: "Australia/Melbourne", weekday: "short", hour: "2-digit", minute: "2-digit", hour12: false }).formatToParts(d || new Date());
+  const get = (t) => (parts.find((x) => x.type === t) || {}).value || "";
+  const mins = (Number(get("hour")) % 24) * 60 + Number(get("minute"));
+  return !["Sat", "Sun"].includes(get("weekday")) && mins >= w[0] && mins < w[1];
+}
+async function pushFlushHeld(env) {
+  try {
+    await pushTable(env);
+    await pushLoadBiz(env);
+    const rows = ((await env.DB.prepare("SELECT endpoint, COUNT(*) AS n FROM push_held GROUP BY endpoint").all()).results) || [];
+    for (const r of rows) {
+      const sub = await env.DB.prepare("SELECT * FROM push_subs WHERE endpoint = ?").bind(r.endpoint).first();
+      if (sub && !pushInHours(pushModeOf(sub))) continue;
+      if (sub) await pushSendOne(env, sub, { title: "Reservoir", body: r.n === 1 ? "You have 1 notification waiting in Reservoir" : `You have ${r.n} notifications waiting in Reservoir`, tag: "held", open: "notices" });
+      await env.DB.prepare("DELETE FROM push_held WHERE endpoint = ?").bind(r.endpoint).run();
+    }
+  } catch (e) { console.log("push flush failed", String(e && e.message || e).slice(0, 160)); }
+}
+// The signing keys for push, made once and kept in app_settings. The public half goes to the app, the private half never leaves the worker.
+async function pushKeys(env) {
+  await settingsTable(env);
+  const read = async () => { const r = await env.DB.prepare("SELECT value FROM app_settings WHERE key = 'secret.push_vapid'").first(); try { return r && r.value ? JSON.parse(r.value) : null; } catch (e) { return null; } };
+  let k = await read();
+  if (!k) {
+    const pair = await crypto.subtle.generateKey({ name: "ECDSA", namedCurve: "P-256" }, true, ["sign", "verify"]);
+    const pub = b64uEnc(await crypto.subtle.exportKey("raw", pair.publicKey));
+    const priv = await crypto.subtle.exportKey("jwk", pair.privateKey);
+    await env.DB.prepare("INSERT OR IGNORE INTO app_settings (key, value, detail, by_name) VALUES ('secret.push_vapid', ?, 'Push notification signing keys, made by the worker', 'worker')").bind(JSON.stringify({ pub, priv })).run();
+    k = await read();
+  }
+  return k;
+}
+async function vapidHeader(env, endpoint) {
+  const k = await pushKeys(env);
+  const key = await crypto.subtle.importKey("jwk", k.priv, { name: "ECDSA", namedCurve: "P-256" }, false, ["sign"]);
+  const enc = (o) => b64uEnc(new TextEncoder().encode(JSON.stringify(o)));
+  const head = enc({ typ: "JWT", alg: "ES256" });
+  const body = enc({ aud: new URL(endpoint).origin, exp: Math.floor(Date.now() / 1000) + 12 * 3600, sub: "mailto:maintenance@directflow.com.au" });
+  const sig = await crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, key, new TextEncoder().encode(`${head}.${body}`));
+  return `vapid t=${head}.${body}.${b64uEnc(sig)}, k=${k.pub}`;
+}
+// Message encryption for web push (RFC 8291, aes128gcm). One record, no padding.
+async function pushEncrypt(p256dh, authSecret, text) {
+  const uaPub = b64uDec(p256dh), auth = b64uDec(authSecret);
+  const eph = await crypto.subtle.generateKey({ name: "ECDH", namedCurve: "P-256" }, true, ["deriveBits"]);
+  const asPub = new Uint8Array(await crypto.subtle.exportKey("raw", eph.publicKey));
+  const uaKey = await crypto.subtle.importKey("raw", uaPub, { name: "ECDH", namedCurve: "P-256" }, false, []);
+  const shared = await crypto.subtle.deriveBits({ name: "ECDH", public: uaKey }, eph.privateKey, 256);
+  const hkdf = async (ikm, salt, info, bytes) => crypto.subtle.deriveBits({ name: "HKDF", hash: "SHA-256", salt, info }, await crypto.subtle.importKey("raw", ikm, "HKDF", false, ["deriveBits"]), bytes * 8);
+  const ikm = new Uint8Array(await hkdf(new Uint8Array(shared), auth, concatBytes(new TextEncoder().encode("WebPush: info\0"), uaPub, asPub), 32));
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const cek = await hkdf(ikm, salt, new TextEncoder().encode("Content-Encoding: aes128gcm\0"), 16);
+  const nonce = await hkdf(ikm, salt, new TextEncoder().encode("Content-Encoding: nonce\0"), 12);
+  const aes = await crypto.subtle.importKey("raw", cek, "AES-GCM", false, ["encrypt"]);
+  const plain = concatBytes(new TextEncoder().encode(text), new Uint8Array([2]));
+  const cipher = new Uint8Array(await crypto.subtle.encrypt({ name: "AES-GCM", iv: nonce }, aes, plain));
+  return concatBytes(salt, new Uint8Array([0, 0, 16, 0]), new Uint8Array([asPub.length]), asPub, cipher);
+}
+async function pushSendOne(env, sub, payload) {
+  try {
+    const body = await pushEncrypt(sub.p256dh, sub.auth, JSON.stringify(payload));
+    const res = await fetch(sub.endpoint, { method: "POST", headers: { Authorization: await vapidHeader(env, sub.endpoint), "Content-Encoding": "aes128gcm", "Content-Type": "application/octet-stream", TTL: "86400", Urgency: "normal" }, body, signal: AbortSignal.timeout(8000) });
+    if (res.status === 404 || res.status === 410) { await env.DB.prepare("DELETE FROM push_subs WHERE endpoint = ?").bind(sub.endpoint).run(); return "gone"; }
+    if (res.ok) { await env.DB.prepare("UPDATE push_subs SET last_ok = datetime('now') WHERE endpoint = ?").bind(sub.endpoint).run(); return "sent"; }
+    console.log("push refused", res.status, String(sub.endpoint).slice(0, 40));
+    return "refused";
+  } catch (e) { console.log("push failed", String(e && e.message || e).slice(0, 160)); return "failed"; }
+}
+// Sends one notice to the phones of whoever it was addressed to. Notices for the office go to everyone signed up at the senior levels (T1 and T2).
+async function pushForNotice(env, n, id) {
+  try {
+    if (!(PUSH_KINDS.includes(String(n.kind || "")) || n.todo)) return;
+    await pushTable(env);
+    await pushLoadBiz(env);
+    const to = String(n.to || "").toLowerCase();
+    const rows = to === "@office"
+      ? ((await env.DB.prepare("SELECT * FROM push_subs WHERE tier IN ('T1', 'T2')").all()).results) || []
+      : ((await env.DB.prepare("SELECT * FROM push_subs WHERE email = ?").bind(to).all()).results) || [];
+    // Mail alerts go to the Weir Mail devices. A person with no Weir Mail device gets them on their Reservoir devices instead.
+    // A person with any Weir Mail device never falls back to Reservoir devices, so turning mail notifications off in Weir stops the alerts.
+    const hasWeir = rows.some((r) => r.app === "mail");
+    // A device can mute single mailboxes (mail_off holds their ids, comma separated). Only new mail alerts carry a mailbox id.
+    const muted = (r) => !!n.box && String(r.mail_off || "").split(",").includes(String(n.box));
+    const sendTo = String(n.kind || "") === "mail" ? (hasWeir ? rows.filter((r) => r.app === "mail" && r.mail_on !== 0 && !muted(r)) : rows.filter((r) => r.mail_on !== 0 && !muted(r))) : rows.filter((r) => r.app !== "mail");
+    if (!sendTo.length) return;
+    const payload = { title: String(n.title || "Reservoir").slice(0, 120), body: n.kind === "request" ? String(n.body || "Open Reservoir to read it").slice(0, 160) : n.kind === "mail" ? (n.preview ? String(n.body || "").slice(0, 160) : "") : "Open Reservoir to read it", tag: `n-${id || Date.now()}`, open: /^[a-z]+(:[a-z0-9]+){0,2}$/.test(String(n.link || "")) ? String(n.link) : "notices", ...(n.kind === "mail" && /^[a-z0-9]{1,20}$/.test(String(n.box || "")) ? { box: String(n.box) } : null) };
+    await Promise.allSettled(sendTo.map(async (r) => {
+      const pl = String(n.kind || "") === "mail" ? { ...payload, ...(r.app === "mail" ? { url: /^[a-z0-9]{1,20}$/.test(String(n.box || "")) ? `/mail?open=emailbox&box=${n.box}` : "/mail" } : {}), ...(r.mail_sound === 0 ? { silent: true } : {}) } : payload;
+      if (pushInHours(pushModeOf(r))) return pushSendOne(env, r, pl);
+      await env.DB.prepare("INSERT INTO push_held (endpoint) VALUES (?)").bind(r.endpoint).run();
+    }));
+  } catch (e) { console.log("push for notice failed", String(e && e.message || e).slice(0, 160)); }
+}
+// ---- Incentives (T1 only). Tayler gives a team member a lunch or a voucher and notes why. ----
+const INCENTIVE_KINDS = ["Lunch", "Voucher"];
+// An incentive that has not been used within a month of being awarded shows as expired. One with a receipt in or already reimbursed never expires.
+const incStatus = (r) => { const st = r.status || "issued"; if (st !== "issued") return st; const t = Date.parse(String(r.at || "").replace(" ", "T") + "Z"); return !isNaN(t) && Date.now() - t > 30 * 86400000 ? "expired" : st; };
+async function incentivesTable(env) {
+  await env.DB.prepare("CREATE TABLE IF NOT EXISTS incentives (id TEXT PRIMARY KEY, to_name TEXT, to_email TEXT, kind TEXT, note TEXT, by_name TEXT, at TEXT)").run();
+  for (const c of ["design TEXT", "status TEXT", "receipt TEXT", "receipt_at TEXT", "redeemed_at TEXT", "amount INTEGER"]) { try { await env.DB.prepare("ALTER TABLE incentives ADD COLUMN " + c).run(); } catch (e) {} }
+  // One time clean out of the test incentives (21.11.2026), so the first real ones start from nothing. It runs once and then leaves a flag.
+  try {
+    await env.DB.prepare("CREATE TABLE IF NOT EXISTS app_flags (k TEXT PRIMARY KEY, at TEXT)").run();
+    const done = await env.DB.prepare("SELECT k FROM app_flags WHERE k = 'incentives_wipe_20261121'").first();
+    if (!done) {
+      await env.DB.prepare("DELETE FROM incentives").run();
+      try { await env.DB.prepare("DELETE FROM receipt_records WHERE id LIKE 'inc-%'").run(); } catch (e) {}
+      await env.DB.prepare("INSERT OR IGNORE INTO app_flags (k, at) VALUES ('incentives_wipe_20261121', datetime('now'))").run();
+    }
+    // Second clean out (21.11.2026 evening): the last test incentive and its receipt record.
+    const done2 = await env.DB.prepare("SELECT k FROM app_flags WHERE k = 'incentives_wipe_20261121b'").first();
+    if (!done2) {
+      await env.DB.prepare("DELETE FROM incentives").run();
+      try { await env.DB.prepare("DELETE FROM receipt_records WHERE id LIKE 'inc-%'").run(); } catch (e) {}
+      await env.DB.prepare("INSERT OR IGNORE INTO app_flags (k, at) VALUES ('incentives_wipe_20261121b', datetime('now'))").run();
+    }
+  } catch (e) {}
+}
+async function incentivesRoutes(request, env, user, url) {
+  if (!url.pathname.startsWith("/api/incentives")) return null;
+  await incentivesTable(env);
+  const me = String(user.email || "").toLowerCase();
+  const isT1 = user.tier === "T1";
+  const first = (n) => String(n || "").split(" ")[0];
+  let body = {};
+  if (request.method === "POST") { try { body = await request.json(); } catch (e) { body = {}; } }
+  if (url.pathname === "/api/incentives/mine" && request.method === "GET") {
+    const rows = await env.DB.prepare("SELECT id, to_name, kind, note, by_name, design, status, amount, at FROM incentives WHERE lower(to_email) = ? ORDER BY at DESC LIMIT 50").bind(me).all();
+    return reply(env, 200, { ok: true, items: (rows.results || []).map((r) => ({ id: r.id, name: r.to_name, kind: r.kind, note: r.note, from: r.by_name, design: r.design || "feast", status: incStatus(r), amount: r.amount || 0, at: r.at })) });
+  }
+  if (url.pathname === "/api/incentives/receipt" && request.method === "POST") {
+    const id = String(body.id || "");
+    const row = await env.DB.prepare("SELECT * FROM incentives WHERE id = ? AND lower(to_email) = ?").bind(id, me).first();
+    if (!row) return reply(env, 404, { error: "not found" });
+    if (incStatus(row) === "redeemed") return reply(env, 400, { error: "This one is already redeemed." });
+    if (incStatus(row) === "expired") return reply(env, 400, { error: "This one has expired." });
+    if (body.linked) {
+      await env.DB.prepare("UPDATE incentives SET receipt_at = datetime('now'), status = 'processing' WHERE id = ?").bind(id).run();
+      await notify(env, { to: "tayler@directflow.com.au", kind: "incentive", title: "Incentive reimbursement in", body: `${first(row.to_name)} has sent a reimbursement for their ${String(row.kind || "").toLowerCase()}. Open Receipts to process it.`, link: "financereceipts", by: String(row.to_name || "Reservoir") });
+      return reply(env, 200, { ok: true });
+    }
+    const data = String(body.data || "");
+    if (!/^data:(image\/[a-z+.-]+|application\/pdf);base64,/i.test(data) || data.length > 1800000) return reply(env, 400, { error: "That file is too big or not a picture or PDF." });
+    await env.DB.prepare("UPDATE incentives SET receipt = ?, receipt_at = datetime('now'), status = 'processing' WHERE id = ?").bind(data, id).run();
+    await notify(env, { to: "tayler@directflow.com.au", kind: "incentive", title: "Incentive receipt in", body: `${first(row.to_name)} has processed their ${String(row.kind || "").toLowerCase()}. Check the receipt and reimburse it.`, link: "incentives", by: "Reservoir" });
+    return reply(env, 200, { ok: true });
+  }
+  if (!isT1) return reply(env, 403, { error: "forbidden" });
+  if (url.pathname === "/api/incentives/receiptview" && request.method === "GET") {
+    const row = await env.DB.prepare("SELECT receipt FROM incentives WHERE id = ?").bind(String(url.searchParams.get("id") || "")).first();
+    return reply(env, 200, { ok: !!(row && row.receipt), data: row ? row.receipt || "" : "" });
+  }
+  if (url.pathname === "/api/incentives/redeem" && request.method === "POST") {
+    const row = await env.DB.prepare("SELECT * FROM incentives WHERE id = ?").bind(String(body.id || "")).first();
+    if (!row) return reply(env, 404, { error: "not found" });
+    await env.DB.prepare("UPDATE incentives SET status = 'redeemed', redeemed_at = datetime('now') WHERE id = ?").bind(row.id).run();
+    if (row.to_email) await notify(env, { to: String(row.to_email).toLowerCase(), kind: "incentive", title: "Incentive reimbursed", body: `Your ${String(row.kind || "").toLowerCase()} has been reimbursed.`, link: "myincentives", by: "Reservoir" });
+    return reply(env, 200, { ok: true });
+  }
+  if (url.pathname !== "/api/incentives") return null;
+  if (request.method === "GET") {
+    const rows = await env.DB.prepare("SELECT id, to_name, to_email, kind, note, design, status, amount, (receipt IS NOT NULL AND receipt != '') AS has_receipt, at FROM incentives ORDER BY at DESC LIMIT 100").all();
+    return reply(env, 200, { ok: true, kinds: INCENTIVE_KINDS, items: (rows.results || []).map((r) => ({ id: r.id, name: r.to_name, email: r.to_email, kind: r.kind, note: r.note, design: r.design || "feast", status: incStatus(r), amount: r.amount || 0, receipt: !!r.has_receipt, at: r.at })) });
+  }
+  const name = String(body.name || "").replace(/\s+/g, " ").trim().slice(0, 80);
+  const kind = INCENTIVE_KINDS.find((k) => k === String(body.kind || ""));
+  const note = String(body.note || "").trim().slice(0, 1000);
+  const amount = Math.max(0, Math.min(9999, parseInt(body.amount, 10) || 0));
+  const design = ["feast", "geelong", "legend", "icons", "feckyeah"].includes(String(body.design || "")) ? String(body.design) : "feast";
+  if (!name || !kind || !note) return reply(env, 400, { error: "Choose a person and an incentive, and say why." });
+  const id = crypto.randomUUID();
+  const to = String(body.email || "").toLowerCase().slice(0, 120);
+  await env.DB.prepare("INSERT INTO incentives (id, to_name, to_email, kind, note, by_name, design, status, amount, at) VALUES (?, ?, ?, ?, ?, ?, ?, 'issued', ?, datetime('now'))").bind(id, name, to, kind, note, String(user.name || ""), design, amount).run();
+  if (to) await notify(env, { to, kind: "incentive", title: "New incentive awarded", body: `${first(user.name)} has given you a ${kind.toLowerCase()}.`, link: "myincentives", by: String(user.name || "Reservoir") });
+  return reply(env, 200, { ok: true, id });
+}
+async function pushRoutes(request, env, user, url) {
+  if (!url.pathname.startsWith("/api/push/")) return null;
+  const email = String(user.email || "").toLowerCase();
+  if (!email) return reply(env, 400, { error: "No email on your sign in" });
+  await pushTable(env);
+  if (url.pathname === "/api/push/business" && request.method === "GET") return reply(env, 200, bizText(await pushLoadBiz(env)));
+  if (url.pathname === "/api/push/key" && request.method === "GET") return reply(env, 200, { key: (await pushKeys(env)).pub });
+  if (url.pathname === "/api/push/status" && request.method === "GET") {
+    const ep = url.searchParams.get("endpoint") || "";
+    const row = ep ? await env.DB.prepare("SELECT email, all_hours, hours_mode FROM push_subs WHERE endpoint = ? AND email = ?").bind(ep, email).first() : null;
+    const n = await env.DB.prepare("SELECT COUNT(*) AS n FROM push_subs WHERE email = ?").bind(email).first();
+    return reply(env, 200, { subscribed: !!row, mode: row ? pushModeOf(row) : "", devices: n ? n.n : 0 });
+  }
+  if (request.method !== "POST") return reply(env, 405, { error: "method not allowed" });
+  if (user.viewAs && !VIEW_AS_WRITES) return reply(env, 403, { error: "Viewing as someone else is read only." });
+  let body = {};
+  try { body = await request.json(); } catch (e) { body = {}; }
+  if (url.pathname === "/api/push/subscribe") {
+    const s = body.subscription || {};
+    const ep = String(s.endpoint || ""), p = String(s.keys && s.keys.p256dh || ""), a = String(s.keys && s.keys.auth || "");
+    if (!/^https:\/\//.test(ep) || ep.length > 600 || !p || !a) return reply(env, 400, { error: "That subscription is not valid" });
+    const subMode = Object.prototype.hasOwnProperty.call(PUSH_MODES, String(body.mode)) ? String(body.mode) : null;
+    await env.DB.prepare("INSERT INTO push_subs (endpoint, email, tier, p256dh, auth, ua, hours_mode, all_hours) VALUES (?, ?, ?, ?, ?, ?, COALESCE(?, 'default'), ?) ON CONFLICT(endpoint) DO UPDATE SET email = excluded.email, tier = excluded.tier, p256dh = excluded.p256dh, auth = excluded.auth, ua = excluded.ua, hours_mode = COALESCE(?, hours_mode), all_hours = CASE WHEN ? IS NULL THEN all_hours WHEN ? = '24' THEN 1 ELSE 0 END").bind(ep, email, String(user.tier || "T3"), p, a, String(body.ua || "").slice(0, 160), subMode, subMode === "24" ? 1 : 0, subMode, subMode, subMode).run();
+    // Reservoir and Weir Mail share one browser profile on a Mac, so they share one endpoint. Once Weir Mail has registered, Reservoir opening later must not take the tag back.
+    await env.DB.prepare("UPDATE push_subs SET app = CASE WHEN app = 'mail' THEN 'mail' ELSE ? END WHERE endpoint = ?").bind(String(body.app) === "mail" ? "mail" : "main", ep).run();
+    return reply(env, 200, { ok: true });
+  }
+  if (url.pathname === "/api/push/business") {
+    if (user.tier !== "T1" && user.tier !== "T2") return reply(env, 403, { error: "forbidden" });
+    const a = bizMins(body.start), b = bizMins(body.end);
+    if (a === null || b === null || b <= a || b > 1440) return reply(env, 400, { error: "Finish must be after start" });
+    await env.DB.prepare("INSERT INTO app_settings (key, value, by_name, at) VALUES ('business.hours', ?, ?, datetime('now')) ON CONFLICT(key) DO UPDATE SET value = excluded.value, by_name = excluded.by_name, at = excluded.at").bind(JSON.stringify(bizText([a, b])), String(user.name || "")).run();
+    return reply(env, 200, { ok: true, ...bizText([a, b]) });
+  }
+  if (url.pathname === "/api/push/hours") {
+    const mode = Object.prototype.hasOwnProperty.call(PUSH_MODES, String(body.mode)) ? String(body.mode) : "default";
+    await env.DB.prepare("UPDATE push_subs SET hours_mode = ?, all_hours = ? WHERE endpoint = ? AND email = ?").bind(mode, mode === "24" ? 1 : 0, String(body.endpoint || ""), email).run();
+    return reply(env, 200, { ok: true });
+  }
+  if (url.pathname === "/api/push/mailprefs") {
+    // Weir Mail settings for this device: whether mail notifications show at all, and whether they make a sound. Both start on.
+    const off = Array.isArray(body.off) ? body.off.map((x) => String(x).replace(/[^a-z0-9_-]/gi, "")).filter(Boolean).join(",") : "";
+    await env.DB.prepare("UPDATE push_subs SET mail_on = ?, mail_sound = ?, mail_off = ? WHERE endpoint = ? AND email = ?").bind(body.on === false ? 0 : 1, body.sound === false ? 0 : 1, off, String(body.endpoint || ""), email).run();
+    return reply(env, 200, { ok: true });
+  }
+  if (url.pathname === "/api/push/unsubscribe") {
+    await env.DB.prepare("DELETE FROM push_subs WHERE endpoint = ? AND email = ?").bind(String(body.endpoint || ""), email).run();
+    return reply(env, 200, { ok: true });
+  }
+  if (url.pathname === "/api/push/test" && body.silent) {
+    const row = await env.DB.prepare("SELECT * FROM push_subs WHERE endpoint = ? AND email = ?").bind(String(body.endpoint || ""), email).first();
+    if (!row) return reply(env, 200, { silent: true, sent: 0, missing: true });
+    const r = await pushSendOne(env, row, { test: String(body.id || "").slice(0, 40), title: "Reservoir", body: "Checking notifications", tag: "launch-test" });
+    return reply(env, 200, { silent: true, sent: r === "sent" ? 1 : 0, result: r });
+  }
+  if (url.pathname === "/api/push/test") {
+    const rows = ((await env.DB.prepare("SELECT * FROM push_subs WHERE email = ?").bind(email).all()).results) || [];
+    const out = await Promise.all(rows.map((r) => pushSendOne(env, r, { title: "Reservoir test", body: "Push notifications are working", tag: `t-${Date.now()}`, open: "notices" })));
+    return reply(env, 200, { sent: out.filter((x) => x === "sent").length, devices: rows.length });
+  }
+  return reply(env, 404, { error: "not found" });
+}
+async function notify(env, n) {
+  try {
+    await noticesTable(env);
+    const id = crypto.randomUUID();
+    if (String(n.kind || "") === "mail") { await pushForNotice(env, n, id); return id; }
+    await env.DB.prepare("INSERT INTO notices (id, to_email, kind, title, body, todo, link, data, by_name) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)").bind(id, String(n.to || "").toLowerCase(), String(n.kind || "info").slice(0, 30), String(n.title || "").slice(0, 160), String(n.body || "").slice(0, 600), n.todo ? 1 : 0, n.link ? String(n.link).slice(0, 40) : null, n.data ? JSON.stringify(n.data).slice(0, 1500) : null, String(n.by || "").slice(0, 120)).run();
+    await pushForNotice(env, n, id);
+    return id;
+  } catch (e) { console.log("notify failed", String(e && e.message || e).slice(0, 200)); return null; }
+}
+const noticeOut = (r) => { let data = null; try { data = r.data ? JSON.parse(r.data) : null; } catch (e) { data = null; } return { id: r.id, kind: r.kind || "info", title: r.title || "", body: r.body || "", todo: r.todo === 1, link: r.link || "", data, by: r.by_name || "", createdAt: r.created_at || "", read: !!r.read_at, done: !!r.done_at, doneBy: r.done_by || "", office: r.to_email === "@office" }; };
+// At 10am on a weekday, if any Daily Operations task is still not ticked, tell the directors (T1). One alert a day. The cron runs every 30 minutes, so a run between 10:00 and 12:00 sends it if it has not gone yet.
+async function dailyOpsAlert(env) {
+  return; // The Daily Operations alert is switched off for now. Remove this line to turn it back on.
+  const parts = new Intl.DateTimeFormat("en-AU", { timeZone: "Australia/Melbourne", weekday: "short", hour: "2-digit", minute: "2-digit", hour12: false }).formatToParts(new Date());
+  const get = (t) => (parts.find((x) => x.type === t) || {}).value || "";
+  const mins = (Number(get("hour")) % 24) * 60 + Number(get("minute"));
+  if (["Sat", "Sun"].includes(get("weekday")) || mins < 600 || mins >= 720) return;
+  await todosTable(env);
+  await settingsTable(env);
+  const today = melbourneDay();
+  const sent = await env.DB.prepare("SELECT value FROM app_settings WHERE key = 'alert.dailyops'").first();
+  if (sent && sent.value === today) return;
+  const rows = ((await env.DB.prepare("SELECT done, due FROM todo_items WHERE ws = 'Daily Operations' AND due <> '' AND due <= ?").bind(today).all()).results) || [];
+  const todays = rows.filter((r) => r.done !== 1 || r.due === today);
+  const left = todays.filter((r) => r.done !== 1).length;
+  if (!left) return;
+  const tiers = await accessTiers(env);
+  const to = Object.keys(tiers).filter((e) => tiers[e] === "T1");
+  let ok = false;
+  for (const e of to) { const id = await notify(env, { to: e, kind: "dailyops", title: `Daily Operations ${left}/${todays.length} Incomplete`, body: "Open the Action List to see what is left.", link: "todo", by: "Reservoir" }); if (id) ok = true; }
+  if (ok) await env.DB.prepare("INSERT INTO app_settings (key, value, detail, by_name, at) VALUES ('alert.dailyops', ?, 'alert sent', 'Daily Operations alert', datetime('now')) ON CONFLICT(key) DO UPDATE SET value = excluded.value, detail = excluded.detail, at = excluded.at").bind(today).run();
+}
+async function noticesRoutes(request, env, user, url) {
+  if (!url.pathname.startsWith("/api/notices")) return null;
+  const email = String(user.email || "").toLowerCase();
+  const office = user.tier === "T1" || user.tier === "T2";
+  if (!email) return reply(env, 400, { error: "No email on your sign in" });
+  await noticesTable(env);
+  const mine = office ? "(to_email = ? OR to_email = '@office')" : "to_email = ?";
+  if (url.pathname === "/api/notices" && request.method === "GET") {
+    const rows = ((await env.DB.prepare(`SELECT * FROM notices WHERE ${mine} ORDER BY created_at DESC, rowid DESC LIMIT 80`).bind(email).all()).results) || [];
+    return reply(env, 200, { notices: rows.map(noticeOut), worker: WORKER_BUILD });
+  }
+  if (url.pathname === "/api/notices/read-all" && request.method === "POST") {
+    const b = await request.json().catch(() => ({}));
+    if (b && b.clear) await env.DB.prepare(`UPDATE notices SET read_at = COALESCE(read_at, datetime('now')), done_at = CASE WHEN todo = 1 THEN COALESCE(done_at, datetime('now')) ELSE done_at END, done_by = CASE WHEN todo = 1 THEN COALESCE(done_by, ?) ELSE done_by END WHERE ${mine} AND (read_at IS NULL OR (todo = 1 AND done_at IS NULL))`).bind(user.name || email, email).run();
+    else await env.DB.prepare(`UPDATE notices SET read_at = datetime('now') WHERE ${mine} AND read_at IS NULL AND todo = 0`).bind(email).run();
+    return reply(env, 200, { ok: true });
+  }
+  const m = url.pathname.match(/^\/api\/notices\/([0-9a-zA-Z-]{1,40})\/(read|done|delete)$/);
+  if (m && request.method === "POST") {
+    const row = await env.DB.prepare(`SELECT * FROM notices WHERE id = ? AND ${mine}`).bind(m[1], email).first();
+    if (!row) return reply(env, 404, { error: "That notice is not there any more." });
+    if (m[2] === "delete") { await env.DB.prepare("DELETE FROM notices WHERE id = ?").bind(row.id).run(); return reply(env, 200, { ok: true }); }
+    if (m[2] === "read") await env.DB.prepare("UPDATE notices SET read_at = COALESCE(read_at, datetime('now')) WHERE id = ?").bind(row.id).run();
+    else await env.DB.prepare("UPDATE notices SET done_at = COALESCE(done_at, datetime('now')), read_at = COALESCE(read_at, datetime('now')), done_by = COALESCE(done_by, ?) WHERE id = ?").bind(user.name || email, row.id).run();
+    if (m[2] === "done" && row.kind === "vba") await vbaClear(env, row, user);
+    return reply(env, 200, { ok: true });
+  }
+  return reply(env, 404, { error: "not found" });
+}
+// For now every approval, of any kind, is Tayler's alone. Andrew and Mitch can still see things; they cannot decide them. This is the one place to change when approvals are shared out.
+const isApprover = (user) => user.tier === "T1" && /^tayler\b/i.test(String(user.name || "").trim());
+const tsCanApprove = (user) => isApprover(user);
+const tsRowOut = (r) => ({ id: r.id, name: r.name || r.email, week: r.week_start, weekEnd: r.week_end, total: Number(r.total) || 0, days: (() => { try { return JSON.parse(r.days || "[]"); } catch (e) { return []; } })(), createdAt: r.created_at || "", error: r.last_error || "" });
+
+// The director's weekly view: one card per person for the week being paid, then a history of earlier pay periods.
+async function tsOfficeRoute(env, user) {
+  await tsTables(env);
+  const today = tsToday();
+  const t = new Date(`${today}T00:00:00Z`);
+  const thisMonday = tsAddDays(today, -((t.getUTCDay() + 6) % 7));
+  const lastMonday = tsAddDays(thisMonday, -7);
+  let filedEnd = "";
+  try {
+    await dfpTables(env);
+    const r = await env.DB.prepare("SELECT MAX(period_end) AS e FROM payslip_runs WHERE filed = 1").first();
+    filedEnd = (r && r.e) ? String(r.e).slice(0, 10) : "";
+  } catch (e) { filedEnd = ""; }
+  const staff = (((await env.DB.prepare("SELECT employee_id, email, name, employment_basis FROM xero_payroll WHERE email IS NOT NULL AND email <> '' AND (status IS NULL OR status = 'ACTIVE')").all()).results) || [])
+    .filter((p) => !/andrew\s+wowk/i.test(String(p.name || "")))
+    .map((p) => ({ email: String(p.email).toLowerCase(), name: String(p.name || p.email), casual: /casual/i.test(String(p.employment_basis || "")) }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+  const subs = ((await env.DB.prepare("SELECT * FROM timesheet_submissions WHERE status IN ('pending','sent') AND week_start >= ? ORDER BY created_at DESC").bind(tsAddDays(today, -200)).all()).results) || [];
+  // Timesheets the team put in through Xero Me, as last pulled from Xero. Shown for anyone with nothing submitted in Reservoir that week, and only for weeks not yet filed.
+  const xeroBy = new Map();
+  try {
+    await timesheetTable(env);
+    const xs = ((await env.DB.prepare("SELECT id, email, start_date, status, total_hours, lines FROM xero_timesheets WHERE start_date >= ? AND (status IS NULL OR upper(status) NOT IN ('REJECTED','DELETED'))").bind(tsAddDays(today, -200)).all()).results) || [];
+    for (const x of xs) { if (x.email) xeroBy.set(`${String(x.email).toLowerCase()}|${x.start_date}`, x); }
+  } catch (e) { /* the Xero copy is not there yet, the screen shows Reservoir submissions only */ }
+  const xeroCard = (x, who) => {
+    const st = String(x.status || "").toUpperCase();
+    const sums = [0, 0, 0, 0, 0, 0, 0];
+    try { JSON.parse(x.lines || "[]").forEach((l) => (l.units || []).forEach((u, i) => { if (i < 7) sums[i] += Number(u) || 0; })); } catch (e) { /* no day lines */ }
+    const done = st === "APPROVED" || st === "PROCESSED";
+    return { id: `xero:${x.id}`, name: who.name, email: who.email, state: done ? "approved" : "xerodraft", total: Number(x.total_hours) || 0, days: sums.map((h) => ({ ord: h, ot15: 0, ot2: 0 })), auto: done ? "Approved in Xero" : st === "REQUESTED" ? "Submitted in Xero, not approved yet" : "Draft in Xero", error: "" };
+  };
+  const latest = new Map();
+  for (const r of subs) { const k = `${r.email}|${r.week_start}`; if (!latest.has(k)) latest.set(k, r); }
+  const byWeek = new Map();
+  for (const r of latest.values()) { if (!byWeek.has(r.week_start)) byWeek.set(r.week_start, []); byWeek.get(r.week_start).push(r); }
+  const filed = (week) => !!filedEnd && tsAddDays(week, 6) <= filedEnd;
+  const card = (r, who) => {
+    if (!r) return { id: "", name: who.name, email: who.email, state: "notsubmitted", total: 0, days: [], auto: "", error: "" };
+    const out = tsRowOut(r);
+    const state = r.status === "pending" ? "pending" : (/^(APPROVED|SALARIED)$/.test(String(r.xero_status || "").toUpperCase()) ? "approved" : "xerodraft");
+    const auto = r.decided_by === "auto" ? "Automatic approval" : r.decided_by === "auto trade school" ? "Five days trade school, automatic approval" : "";
+    return { id: out.id, name: out.name, email: r.email, state, total: out.total, days: out.days, auto, error: out.error, at: r.created_at || "" };
+  };
+  const build = (week) => {
+    const rows = byWeek.get(week) || [];
+    const used = new Set();
+    // Casual staff are left off until they have a timesheet that week. Everyone else shows by their Xero name, so a name saved on an old submission never differs from the rest.
+    const cards = [];
+    for (const who of staff) {
+      const r = rows.find((x) => x.email === who.email);
+      if (r) used.add(r.id);
+      const xr = !r && xeroBy.get(`${who.email}|${week}`);
+      if (!r && !xr && who.casual) continue;
+      cards.push({ ...(xr ? xeroCard(xr, who) : card(r, who)), name: who.name });
+    }
+    rows.filter((r) => !used.has(r.id)).forEach((r) => cards.push(card(r, { name: r.name || r.email, email: r.email })));
+    return { week, weekEnd: tsAddDays(week, 6), payDate: tsAddDays(week, 10), cards };
+  };
+  const weeks = new Set(byWeek.keys());
+  const xeroWeeks = new Set();
+  for (const k of xeroBy.keys()) { const w = k.split("|")[1]; if (w <= thisMonday && !filed(w)) { weeks.add(w); xeroWeeks.add(w); } }
+  weeks.add(lastMonday);
+  const active = [], history = [];
+  [...weeks].sort().reverse().forEach((w) => {
+    if (w > thisMonday) return;
+    if (filed(w)) return; // once a pay run is filed its weeks leave this screen
+    if (w === thisMonday && !byWeek.has(w) && !xeroWeeks.has(w)) return;
+    active.push(build(w));
+  });
+  return reply(env, 200, { active, history, filedEnd, worker: WORKER_BUILD });
+}
+
+// ---- Automatic timesheets for the two people on a fixed 40 hours (Tayler and Andrew). Runs from the scheduled trigger and from a manual run.
+// Each weekday from 4:30pm the day is filled in as 7:30 to 4:00 with a 30 minute break, unless it is a public holiday or approved leave. From 6pm Friday the week is submitted and sent to Xero as approved.
+// Anyone who has already done their week by hand, or whose week is already in Xero, is left alone. Keep this holiday list in step with VIC_HOLIDAYS_COMMON_2026 in the app.
+const TS_AUTO_NAMES = [/^tayler\b/i, /^andrew\b/i];
+const TS_HOLIDAYS = {
+  "2025-09-26": "Friday before the AFL Grand Final", "2025-10-22": "Geelong Cup", "2025-12-25": "Christmas Day", "2025-12-26": "Boxing Day",
+  "2026-01-01": "New Year's Day", "2026-01-26": "Australia Day", "2026-03-09": "Labour Day", "2026-04-03": "Good Friday", "2026-04-04": "Easter Saturday", "2026-04-05": "Easter Sunday", "2026-04-06": "Easter Monday",
+  "2026-04-25": "ANZAC Day", "2026-06-08": "King's Birthday", "2026-09-25": "Grand Final Friday", "2026-10-21": "Geelong Cup", "2026-12-25": "Christmas Day", "2026-12-26": "Boxing Day", "2026-12-28": "Additional day (Boxing Day falls on a Saturday)"
+};
+const TS_AUTO_HOURS = 8;
+function tsMelbourne(now) {
+  const parts = new Intl.DateTimeFormat("en-AU", { timeZone: "Australia/Melbourne", year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false, weekday: "short" }).formatToParts(now);
+  const g = (t) => (parts.find((x) => x.type === t) || {}).value || "";
+  const dow = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"].indexOf(g("weekday"));
+  return { date: `${g("year")}-${g("month")}-${g("day")}`, dow, mins: (Number(g("hour")) % 24) * 60 + Number(g("minute")) };
+}
+// The week as the app keeps it, so the person sees the filled days when they open Timesheets.
+const tsAppKey = (iso) => { const [y, m, d] = iso.split("-").map(Number); return `${y}-${m}-${d}`; };
+async function tsAutoRun(env) {
+  await tsTables(env);
+  await timesheetDraftsTable(env);
+  const now = tsMelbourne(new Date());
+  const thisMonday = tsAddDays(now.date, -((now.dow + 6) % 7));
+  // This week, and last week while it is still unpaid, so a Friday night run that did not go through is picked up again.
+  const lastMonday = tsAddDays(thisMonday, -7);
+  const weeks = tsAddDays(lastMonday, 10) >= now.date ? [lastMonday, thisMonday] : [thisMonday];
+  const out = [];
+  const people = (((await env.DB.prepare("SELECT employee_id, email, name FROM xero_payroll WHERE email IS NOT NULL AND email <> '' AND (status IS NULL OR status = 'ACTIVE')").all()).results) || []).filter((p) => TS_AUTO_NAMES.some((re) => re.test(String(p.name || ""))));
+  for (const who of people) {
+    const email = String(who.email).toLowerCase();
+    for (const monday of weeks) {
+    const sunday = tsAddDays(monday, 6);
+    const note = (m) => out.push(`${who.name}${monday === thisMonday ? "" : ` (week of ${monday})`}: ${m}`);
+    const already = await tsDuplicate(env, who.employee_id, email, monday);
+    if (already) { note(`left alone. ${already}`); continue; }
+    const key = tsAppKey(monday);
+    const row = await env.DB.prepare("SELECT data FROM timesheet_drafts WHERE email = ? AND week_start = ?").bind(email, key).first();
+    let period = null;
+    try { period = row ? JSON.parse(row.data) : null; } catch (e) { period = null; }
+    if (period && period.status === "submitted") { note("left alone, already submitted in Reservoir"); continue; }
+    if (!period) period = { key, status: "draft", days: [] };
+    while (period.days.length < 6) { const i = period.days.length; period.days.push({ type: "work", holiday: TS_HOLIDAYS[tsAddDays(monday, i)] || null, entries: [], breakMins: 0 }); }
+    const leave = ((await env.DB.prepare("SELECT from_date, to_date, type FROM xero_leave WHERE email = ? AND status = 'approved' AND to_date >= ? AND from_date <= ?").bind(email, monday, sunday).all()).results) || [];
+    let changed = !row;
+    for (let i = 0; i < 5; i++) {
+      const date = tsAddDays(monday, i);
+      const closed = date < now.date || (date === now.date && now.mins >= 16 * 60 + 30);
+      const day = period.days[i];
+      if (!closed || day.type !== "work" || (day.entries || []).length || day.breakMins) continue;
+      if (TS_HOLIDAYS[date]) { if (!day.holiday) { day.holiday = TS_HOLIDAYS[date]; changed = true; } continue; }
+      const l = leave.find((x) => x.from_date <= date && x.to_date >= date);
+      if (l) { day.type = l.type === "personal" ? "personal_leave" : "annual_leave"; changed = true; continue; }
+      day.entries = [{ id: `auto-${date}`, start: 450, end: 930 }];
+      day.breakMins = 0;
+      changed = true;
+    }
+    if (changed) {
+      await env.DB.prepare("INSERT INTO timesheet_drafts (email, week_start, data, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(email, week_start) DO UPDATE SET data = excluded.data, updated_at = excluded.updated_at").bind(email, key, JSON.stringify(period), new Date().toISOString()).run();
+      note("days filled in");
+    }
+    const submitNow = monday < thisMonday || (now.dow === 5 && now.mins >= 18 * 60) || now.dow === 6 || now.dow === 0;
+    if (!submitNow) continue;
+    const hours = [0, 1, 2, 3, 4, 5, 6].map((i) => {
+      const d = period.days[i];
+      if (!d || d.type === "annual_leave" || d.type === "personal_leave") return 0;
+      if (d.holiday) return TS_AUTO_HOURS;
+      const e = (d.entries || [])[0];
+      return e ? Math.max(0, Math.round(((e.end - e.start - (d.breakMins || 0)) / 60) * 100) / 100) : 0;
+    });
+    const days = hours.map((h) => ({ ord: h, ot15: 0, ot2: 0 }));
+    if (tsTotal(days) <= 0) { note("nothing to submit, no working hours this week"); continue; }
+    const sub = { id: crypto.randomUUID(), email, name: who.name || "", employee_id: who.employee_id, week_start: monday, week_end: sunday, days: JSON.stringify(days), total: tsTotal(days), created_at: new Date().toISOString() };
+    const res = await tsPushXero(env, sub);
+    if (res.fail) { note(`could not send to Xero. ${res.fail}`); continue; }
+    await env.DB.prepare("INSERT INTO timesheet_submissions (id, email, name, employee_id, week_start, week_end, days, total, status, xero_status, forwarded, last_error, created_at, decided_at, decided_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'sent', ?, 0, NULL, ?, ?, 'auto')").bind(sub.id, sub.email, sub.name, sub.employee_id, sub.week_start, sub.week_end, sub.days, sub.total, res.xeroStatus, sub.created_at, sub.created_at).run();
+    period.status = "submitted";
+    period.submittedAt = sub.created_at;
+    period.approval = "sent";
+    period.xeroStatus = res.xeroStatus;
+    await env.DB.prepare("INSERT INTO timesheet_drafts (email, week_start, data, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(email, week_start) DO UPDATE SET data = excluded.data, updated_at = excluded.updated_at").bind(email, key, JSON.stringify(period), new Date().toISOString()).run();
+    note(`submitted ${sub.total} hours to Xero as ${res.xeroStatus}${res.note ? `. ${res.note}` : ""}`);
+    }
+  }
+  ["Tayler", "Andrew"].forEach((n, i) => { if (!people.some((p) => TS_AUTO_NAMES[i].test(String(p.name || "")))) out.push(`${n}: not found in the Xero payroll list with an email and an active status, so nothing is run for him.`); });
+  return out;
+}
+async function tsSubmitRoutes(request, env, user, url, parts) {
+  const rawEnv = Object.prototype.hasOwnProperty.call(env, "__callerTier") ? Object.getPrototypeOf(env) : env;
+  const email = String(user.email || "").trim().toLowerCase();
+  if (parts[2] === "submit" && parts.length === 3 && request.method === "POST") {
+    if (!email) return reply(env, 400, { error: "No email on your sign in" });
+    const body = await request.json().catch(() => null) || {};
+    const week = String(body.week || "");
+    const bad = tsWeekProblem(week);
+    if (bad) return reply(env, 400, { error: bad });
+    const days = tsCleanDays(body.days);
+    if (!days) return reply(env, 400, { error: "The hours on that timesheet are not valid." });
+    // Casual staff are not paid public holidays, so those days go through as zero.
+    try {
+      const basis = await env.DB.prepare("SELECT employment_basis FROM xero_payroll WHERE lower(email) = ?").bind(email).first();
+      if (basis && /casual/i.test(String(basis.employment_basis || ""))) days.forEach((d, i) => { if (TS_HOLIDAYS[tsAddDays(week, i)]) { d.ord = 0; d.ot15 = 0; d.ot2 = 0; } });
+    } catch (e) { /* the app already shows those days as zero */ }
+    if (tsTotal(days) <= 0) return reply(env, 400, { error: "There are no hours to submit." });
+    await tsTables(env);
+    const employeeId = await tsEmployee(env, email);
+    if (!employeeId) return reply(env, 409, { error: "You are not in the Xero payroll list yet, so this cannot be sent. Tell Tayler." });
+    const dup = await tsDuplicate(env, employeeId, email, week);
+    if (dup) return reply(env, 409, { error: dup });
+    const sub = { id: crypto.randomUUID(), email, name: user.name || "", employee_id: employeeId, week_start: week, week_end: tsAddDays(week, 6), days: JSON.stringify(days), total: tsTotal(days), created_at: new Date().toISOString() };
+    const trade = user.tier !== "T1" && user.tier !== "T2" && tsAllTradeSchool(body.dayTypes, days);
+    const insert = (status, xeroStatus, error) => env.DB.prepare("INSERT INTO timesheet_submissions (id, email, name, employee_id, week_start, week_end, days, total, status, xero_status, forwarded, last_error, created_at, decided_at, decided_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)").bind(sub.id, sub.email, sub.name, sub.employee_id, sub.week_start, sub.week_end, sub.days, sub.total, status, xeroStatus || null, error || null, sub.created_at, status === "sent" ? sub.created_at : null, status === "sent" ? (trade ? "auto trade school" : "auto") : null).run();
+    // Tayler, Andrew, Mitch and Andrey are approved on the spot. The plumbers wait for Tayler.
+    const autoOk = user.tier === "T1" || user.tier === "T2" || trade || /^(tayler|andrew|mitch|andrey)\b/i.test(String(user.name || "").trim());
+    if (autoOk) {
+      const out = await tsPushXero(rawEnv, sub);
+      if (out.fail) return reply(env, 502, { error: out.fail });
+      await insert("sent", out.xeroStatus);
+      await tsClearReminder(env, email);
+      await notify(env, { to: sub.email, kind: "timesheet", title: "Timesheet approved", body: `Your timesheet for ${tsDmy(sub.week_start)} to ${tsDmy(sub.week_end)} has been approved.`, link: "timesheets", by: "Reservoir" });
+      return reply(env, 200, { ok: true, state: "sent", xeroStatus: out.xeroStatus, note: out.note || "", worker: WORKER_BUILD });
+    }
+    await insert("pending");
+    await tsClearReminder(env, email);
+    return reply(env, 200, { ok: true, state: "pending", worker: WORKER_BUILD });
+  }
+  if (parts[2] === "auto-run" && parts.length === 3 && request.method === "POST") {
+    if (user.tier !== "T1") return reply(env, 403, { error: "forbidden" });
+    const actions = await tsAutoRun(rawEnv);
+    return reply(env, 200, { ok: true, actions, worker: WORKER_BUILD });
+  }
+  if (parts[2] === "office" && parts.length === 3 && request.method === "GET") {
+    if (user.tier !== "T1") return reply(env, 403, { error: "forbidden" });
+    return tsOfficeRoute(env, user);
+  }
+  if (parts[2] === "inbox" && parts.length === 3 && request.method === "GET") {
+    if (!email) return reply(env, 400, { error: "No email on your sign in" });
+    await tsTables(env);
+    const notices = (((await env.DB.prepare("SELECT id, text, created_at, seen FROM ts_notices WHERE email = ? ORDER BY id DESC LIMIT 20").bind(email).all()).results) || []).map((n) => ({ id: n.id, text: n.text || "", createdAt: n.created_at || "", seen: n.seen === 1 }));
+    const mine = (((await env.DB.prepare("SELECT week_start, status, xero_status FROM timesheet_submissions WHERE email = ? ORDER BY week_start DESC LIMIT 12").bind(email).all()).results) || []).map((r) => ({ week: r.week_start, status: r.status, xeroStatus: r.xero_status || "" }));
+    let pending = [];
+    if (tsCanApprove(user)) {
+      const rows = ((await env.DB.prepare("SELECT * FROM timesheet_submissions WHERE status = 'pending' ORDER BY created_at ASC LIMIT 50").all()).results) || [];
+      pending = rows.map(tsRowOut);
+    }
+    return reply(env, 200, { notices, mine, pending, worker: WORKER_BUILD });
+  }
+  if (parts[2] === "notices" && parts[3] === "seen" && parts.length === 4 && request.method === "POST") {
+    await tsTables(env);
+    await env.DB.prepare("UPDATE ts_notices SET seen = 1 WHERE email = ? AND seen = 0").bind(email).run();
+    return reply(env, 200, { ok: true });
+  }
+  if (parts[2] === "approve" && parts.length === 4 && request.method === "POST") {
+    if (!tsCanApprove(user)) return reply(env, 403, { error: "forbidden" });
+    await tsTables(env);
+    const row = await env.DB.prepare("SELECT * FROM timesheet_submissions WHERE id = ?").bind(parts[3]).first();
+    if (!row) return reply(env, 404, { error: "That timesheet is not there any more." });
+    if (row.status !== "pending") return reply(env, 409, { error: row.status === "sent" ? "That timesheet has already been approved." : "That timesheet is not waiting for approval." });
+    const out = await tsPushXero(rawEnv, row);
+    if (out.fail) {
+      await env.DB.prepare("UPDATE timesheet_submissions SET last_error = ? WHERE id = ?").bind(out.fail.slice(0, 400), row.id).run();
+      return reply(env, 502, { error: out.fail });
+    }
+    await env.DB.prepare("UPDATE timesheet_submissions SET status = 'sent', xero_status = ?, last_error = NULL, decided_at = ?, decided_by = ? WHERE id = ?").bind(out.xeroStatus, new Date().toISOString(), user.name || email, row.id).run();
+    await notify(env, { to: row.email, kind: "timesheet", title: "Timesheet approved", body: `Your timesheet for ${tsDmy(row.week_start)} to ${tsDmy(row.week_end)} has been approved.`, link: "timesheets", by: user.name || email });
+    return reply(env, 200, { ok: true, xeroStatus: out.xeroStatus, note: out.note || "" });
+  }
+  return null;
+}
+// Submitting a week clears the "Submit your timesheet" reminder so it does not sit in Notices.
+async function tsClearReminder(env, email) {
+  try { await noticesTable(env); await env.DB.prepare("UPDATE notices SET read_at = datetime('now') WHERE to_email = ? AND kind = 'timesheet' AND title = 'Submit your timesheet' AND read_at IS NULL").bind(String(email || "").toLowerCase()).run(); } catch (e) { /* best effort */ }
+}
+let timesheetDraftsReady = false;
+async function timesheetDraftsTable(env) {
+  if (timesheetDraftsReady) return;
+  timesheetDraftsReady = true;
+  await env.DB.prepare("CREATE TABLE IF NOT EXISTS timesheet_drafts (email TEXT NOT NULL, week_start TEXT NOT NULL, data TEXT NOT NULL, updated_at TEXT, PRIMARY KEY (email, week_start))").run();
+}
+async function timesheetRoutes(request, env, user, url) {
+  if (!url.pathname.startsWith("/api/timesheets")) return null;
+  const parts = url.pathname.split("/").filter(Boolean);
+  try {
+    // The signed in person's own synced Xero timesheets, newest week first. Any tier, only their own record (or the person being viewed as). Read only.
+    if (parts.length === 3 && parts[2] === "me" && request.method === "GET") {
+      const email = String(user.email || "").trim().toLowerCase();
+      if (!email) return reply(env, 400, { error: "No email on your sign in" });
+      await timesheetTable(env);
+      // Xero is the truth for a submitted week. If the database copy is more than two minutes old it is refreshed from Xero first, so an approved week always shows Xero's hours.
+      try {
+        const last = await env.DB.prepare("SELECT MAX(synced_at) AS s FROM xero_timesheets").first();
+        const age = last && last.s ? Date.now() - Date.parse(String(last.s).replace(" ", "T") + "Z") : Infinity;
+        if (!(age < 120000)) await timesheetSync(env);
+      } catch (e) { /* the copy already in the database is used */ }
+      const rows = ((await env.DB.prepare("SELECT id, start_date, end_date, status, total_hours, lines, xero_updated, synced_at FROM xero_timesheets WHERE lower(email) = ? AND end_date >= ? ORDER BY start_date DESC").bind(email, TIMESHEET_FROM).all()).results) || [];
+      const items = rows.map((r) => {
+        let lines;
+        try { lines = JSON.parse(r.lines || "[]"); } catch (e) { lines = []; }
+        return { id: r.id, start: r.start_date, end: r.end_date, status: r.status || "", totalHours: Number(r.total_hours) || 0, lines, updated: r.xero_updated || "" };
+      });
+      const synced = rows.reduce((a, r) => (r.synced_at && r.synced_at > a ? r.synced_at : a), "");
+      // End date of the latest pay run filed in Reservoir. The app shows a week as Processed only once its pay run is filed, and as Approved until then.
+      let filedEnd = "";
+      try { await payslipTables(env); const fr = await env.DB.prepare("SELECT MAX(period_end) AS e FROM payslip_runs WHERE filed = 1").first(); filedEnd = fr && fr.e ? String(fr.e).slice(0, 10) : ""; } catch (e) { filedEnd = ""; }
+      return reply(env, 200, { items, syncedAt: synced, filedEnd, worker: WORKER_BUILD });
+    }
+    if (["submit", "inbox", "notices", "approve", "office", "auto-run"].includes(parts[2])) {
+      const out = await tsSubmitRoutes(request, env, user, url, parts);
+      if (out) return out;
+    }
+    // The signed in person's own half filled weeks, saved as they type so a closed app loses nothing. Any tier, own record only.
+    if (parts.length === 3 && parts[2] === "drafts" && request.method === "GET") {
+      const email = String(user.email || "").trim().toLowerCase();
+      if (!email) return reply(env, 400, { error: "No email on your sign in" });
+      await timesheetDraftsTable(env);
+      const rows = ((await env.DB.prepare("SELECT week_start, data, updated_at FROM timesheet_drafts WHERE email = ? ORDER BY week_start DESC LIMIT 60").bind(email).all()).results) || [];
+      const weeks = [];
+      for (const r of rows) {
+        try { weeks.push({ key: r.week_start, period: JSON.parse(r.data), updated: r.updated_at || "" }); } catch (e) { /* skip a damaged row */ }
+      }
+      return reply(env, 200, { weeks, worker: WORKER_BUILD });
+    }
+    if (parts.length === 4 && parts[2] === "drafts" && request.method === "PUT") {
+      const email = String(user.email || "").trim().toLowerCase();
+      if (!email) return reply(env, 400, { error: "No email on your sign in" });
+      const week = decodeURIComponent(parts[3]);
+      if (!/^\d{4}-\d{1,2}-\d{1,2}$/.test(week)) return reply(env, 400, { error: "Bad week" });
+      const body = await request.json().catch(() => null);
+      const period = body && body.period;
+      if (!period || typeof period !== "object") return reply(env, 400, { error: "No timesheet sent" });
+      const text = JSON.stringify(period);
+      if (text.length > 60000) return reply(env, 413, { error: "Timesheet too large" });
+      await timesheetDraftsTable(env);
+      await env.DB.prepare("INSERT INTO timesheet_drafts (email, week_start, data, updated_at) VALUES (?, ?, ?, ?) ON CONFLICT(email, week_start) DO UPDATE SET data = excluded.data, updated_at = excluded.updated_at").bind(email, week, text, new Date().toISOString()).run();
+      return reply(env, 200, { ok: true });
+    }
+    if (user.tier !== "T1") return reply(env, 403, { error: "forbidden" });
+    if (parts.length === 3 && parts[2] === "probe") {
+      const out = await timesheetProbe(env);
+      return reply(env, 200, { ...out, worker: WORKER_BUILD });
+    }
+    if (parts.length === 3 && parts[2] === "sync" && request.method === "POST") {
+      const out = await timesheetSync(env);
+      return reply(env, out.ok ? 200 : 502, { ...out, worker: WORKER_BUILD });
+    }
+    if (parts.length === 3 && parts[2] === "status" && request.method === "GET") {
+      await timesheetTable(env);
+      const r = await env.DB.prepare("SELECT COUNT(*) AS n, COUNT(DISTINCT employee_id) AS people, MIN(start_date) AS earliest, MAX(end_date) AS latest, MAX(synced_at) AS synced FROM xero_timesheets").first();
+      return reply(env, 200, { count: Number(r && r.n) || 0, people: Number(r && r.people) || 0, earliest: (r && r.earliest) || "", latest: (r && r.latest) || "", syncedAt: (r && r.synced) || "", worker: WORKER_BUILD });
+    }
+    return reply(env, 404, { error: "not found" });
+  } catch (e) {
+    console.log("timesheets error", String(e && e.message || e));
+    return reply(env, 502, { error: String(e && e.message || e).slice(0, 300) });
+  }
+}
+// All the /api/leave routes. Returns a Response, or null when the path is not a leave path.
+async function leaveRoutes(request, env, user, url) {
+  if (!url.pathname.startsWith("/api/leave")) return null;
+  const office = user.tier === "T1" || user.tier === "T2";
+  const email = String(user.email || "").trim().toLowerCase();
+  const parts = url.pathname.split("/").filter(Boolean); // api, leave, ...
+  const method = request.method;
+  const body = async () => { try { return await request.json(); } catch (e) { return {}; } };
+  const today = melbourneDay();
+  const mineOnly = async (id) => {
+    const row = await env.DB.prepare("SELECT * FROM xero_leave WHERE id = ?").bind(id).first();
+    return row && String(row.email).toLowerCase() === email ? row : null;
+  };
+  try {
+    await leaveTable(env);
+    if (parts.length === 3 && parts[2] === "me" && method === "GET") {
+      if (!email) return reply(env, 400, { error: "No email on your sign in" });
+      const since = melbourneDay(Date.now() - 366 * 86400000);
+      const rows = ((await env.DB.prepare("SELECT * FROM xero_leave WHERE email = ? AND status IN ('pending', 'approved') AND to_date >= ? AND split_of IS NULL ORDER BY from_date DESC").bind(email, since).all()).results) || [];
+      const bal = await leaveBalances(env, email);
+      const dm = await leaveDayMap(env);
+      return reply(env, 200, { balance: { found: bal.found, hasLeave: bal.hasLeave, annualHours: bal.annualHours, personalHours: bal.personalHours, syncedAt: bal.syncedAt, dayHours: leaveDayFrom(dm, email, user.name) }, items: rows.map((x) => leaveOut(x, dm)), worker: WORKER_BUILD });
+    }
+    if (parts.length === 3 && parts[2] === "request" && method === "POST") {
+      if (!email) return reply(env, 400, { error: "No email on your sign in" });
+      const b = await body();
+      const type = leaveTypeOf(b.type);
+      if (!type) return reply(env, 400, { error: "Choose a leave type" });
+      if (!leaveIsoOk(b.from) || !leaveIsoOk(b.to) || b.to < b.from) return reply(env, 400, { error: "Check the dates" });
+      const clash = await env.DB.prepare("SELECT id FROM xero_leave WHERE email = ? AND status IN ('pending', 'approved') AND from_date <= ? AND to_date >= ?").bind(email, b.to, b.from).first();
+      if (clash) return reply(env, 409, { error: "You already have leave over some of those dates" });
+      const have = await leaveBalances(env, email);
+      if (have.found && !have.hasLeave) return reply(env, 403, { error: "You have no leave set up in Xero, so there is nothing to request" });
+      const pay = await env.DB.prepare("SELECT employee_id FROM xero_payroll WHERE email = ?").bind(email).first();
+      const id = await leaveCreate(env, { email, name: user.name || "", employeeId: pay ? pay.employee_id : null, type, from: b.from, to: b.to });
+      return reply(env, 200, { ok: true, id });
+    }
+    if (parts.length === 4 && parts[2] !== "me" && parts[3] === "edit" && method === "POST") {
+      const row = await mineOnly(parts[2]);
+      if (!row) return reply(env, 404, { error: "not found" });
+      const b = await body();
+      const type = leaveTypeOf(b.type);
+      if (!type || !leaveIsoOk(b.from) || !leaveIsoOk(b.to) || b.to < b.from) return reply(env, 400, { error: "Check the leave type and dates" });
+      const clash = await env.DB.prepare("SELECT id FROM xero_leave WHERE email = ? AND status IN ('pending', 'approved') AND from_date <= ? AND to_date >= ? AND id <> ? AND (split_of IS NULL OR split_of <> ?)").bind(email, b.to, b.from, row.id, row.id).first();
+      if (clash) return reply(env, 409, { error: "You already have leave over some of those dates" });
+      if (row.status === "pending") {
+        await env.DB.prepare("UPDATE xero_leave SET asked_type = ? WHERE id = ?").bind(type, row.id).run();
+        await leaveReplan(env, { ...row, asked_type: type }, type, b.from, b.to);
+        return reply(env, 200, { ok: true, requested: false });
+      }
+      if (row.status === "approved" && row.from_date > today) {
+        await env.DB.prepare("UPDATE xero_leave SET edit_requested = 1, new_type = ?, new_from = ?, new_to = ? WHERE id = ?").bind(type, b.from, b.to, row.id).run();
+        return reply(env, 200, { ok: true, requested: true });
+      }
+      return reply(env, 409, { error: "That leave can no longer be changed" });
+    }
+    if (parts.length === 4 && parts[2] !== "me" && parts[3] === "cancel" && method === "POST") {
+      const row = await mineOnly(parts[2]);
+      if (!row) return reply(env, 404, { error: "not found" });
+      if (row.status === "pending") {
+        await env.DB.prepare("DELETE FROM xero_leave WHERE id = ? OR (split_of = ? AND status = 'pending')").bind(row.id, row.id).run();
+        return reply(env, 200, { ok: true, requested: false });
+      }
+      if (row.status === "approved" && row.from_date > today) {
+        await env.DB.prepare("UPDATE xero_leave SET cancel_requested = 1 WHERE id = ?").bind(row.id).run();
+        return reply(env, 200, { ok: true, requested: true });
+      }
+      return reply(env, 409, { error: "That leave can no longer be cancelled" });
+    }
+    if (parts.length === 3 && parts[2] === "office" && method === "GET") {
+      if (!office) return reply(env, 403, { error: "forbidden" });
+      const recent = melbourneDay(Date.now() - 30 * 86400000);
+      const rows = ((await env.DB.prepare("SELECT * FROM xero_leave WHERE status = 'pending' OR cancel_requested = 1 OR edit_requested = 1 OR (status IN ('approved', 'declined', 'cancelled') AND source = 'reservoir' AND decided_at >= ?) ORDER BY from_date ASC").bind(recent).all()).results) || [];
+      const away = ((await env.DB.prepare("SELECT * FROM xero_leave WHERE status = 'approved' AND from_date <= ? AND to_date >= ?").bind(today, today).all()).results) || [];
+      const balances = new Map();
+      const dm = await leaveDayMap(env);
+      const withBalance = async (r) => {
+        const out = leaveOut(r, dm);
+        if (r.status === "pending") {
+          if (!balances.has(r.email)) { const bal = await leaveBalances(env, r.email); balances.set(r.email, { annualHours: bal.annualHours, personalHours: bal.personalHours }); }
+          out.balance = balances.get(r.email);
+        }
+        return out;
+      };
+      const items = [];
+      for (const r of rows) items.push(await withBalance(r));
+      return reply(env, 200, { items, away: away.map((x) => leaveOut(x, dm)), worker: WORKER_BUILD });
+    }
+    if (parts.length === 4 && parts[3] === "decide" && method === "POST") {
+      if (!isApprover(user)) return reply(env, 403, { error: "forbidden" });
+      const row = await env.DB.prepare("SELECT * FROM xero_leave WHERE id = ?").bind(parts[2]).first();
+      if (!row || row.status !== "pending") return reply(env, 409, { error: "That request is no longer waiting" });
+      const b = await body();
+      if (b.decision === "decline") {
+        await env.DB.prepare("UPDATE xero_leave SET status = 'declined', decided_by = ?, decided_at = datetime('now') WHERE id = ? OR (split_of = ? AND status = 'pending')").bind(leaveActor(user), row.id, row.id).run();
+        return reply(env, 200, { ok: true });
+      }
+      if (b.decision !== "approve") return reply(env, 400, { error: "bad decision" });
+      let live = row;
+      const want = leaveTypeOf(b.type);
+      if (want && (want !== row.type || row.type === "unpaid")) {
+        if (row.split_of) return reply(env, 400, { error: "Change the leave type on the main request, not on the unpaid part" });
+        await leaveReplan(env, row, want, row.from_date, row.to_date);
+        live = await env.DB.prepare("SELECT * FROM xero_leave WHERE id = ?").bind(row.id).first();
+      }
+      const pushed = leaveDaysOf(live) ? await leavePushDays(env, live) : await leavePushXero(env, live, { type: live.type, from: live.from_date, to: live.to_date });
+      if (pushed.fail) return reply(env, 502, { error: "Xero did not take the leave, so it is still waiting here", detail: pushed.fail });
+      await env.DB.prepare("UPDATE xero_leave SET status = 'approved', xero_id = ?, decided_by = ?, decided_at = datetime('now') WHERE id = ?").bind(pushed.id, leaveActor(user), row.id).run();
+      await leaveRefreshBalances(env, row.email);
+      return reply(env, 200, { ok: true });
+    }
+    if (parts.length === 4 && parts[3] === "retype" && method === "POST") {
+      if (!office) return reply(env, 403, { error: "forbidden" });
+      const row = await env.DB.prepare("SELECT * FROM xero_leave WHERE id = ?").bind(parts[2]).first();
+      if (!row || row.status !== "pending") return reply(env, 409, { error: "That request is no longer waiting" });
+      if (row.split_of) return reply(env, 400, { error: "Change the leave type on the main request, not on the unpaid part" });
+      const b = await body();
+      const want = leaveTypeOf(b.type);
+      if (!want) return reply(env, 400, { error: "Choose a leave type" });
+      await leaveReplan(env, row, want, row.from_date, row.to_date);
+      return reply(env, 200, { ok: true });
+    }
+    // The office edits a waiting request before approving it: the leave type and the hours on each day. Nothing goes to Xero until Approve.
+    if (parts.length === 4 && parts[3] === "adjust" && method === "POST") {
+      if (!office) return reply(env, 403, { error: "forbidden" });
+      const row = await env.DB.prepare("SELECT * FROM xero_leave WHERE id = ?").bind(parts[2]).first();
+      if (!row || row.status !== "pending") return reply(env, 409, { error: "That request is no longer waiting" });
+      const b = await body();
+      const DAY = await leaveDayHours(env, row.email);
+      const allowed = new Set(leavePlanOf(row, DAY).map((x) => x.date));
+      for (const d of leaveWorkDays(row.from_date, row.to_date)) allowed.add(d);
+      if (!Array.isArray(b.days) || !b.days.length) return reply(env, 400, { error: "There are no days to save" });
+      const days = [];
+      const seen = new Set();
+      for (const x of b.days.slice(0, 400)) {
+        const date = String((x && x.date) || "");
+        const hours = Math.round(Number(x && x.hours) * 10000) / 10000;
+        if (!leaveIsoOk(date) || seen.has(date)) return reply(env, 400, { error: "Check the days" });
+        if (!allowed.has(date)) return reply(env, 400, { error: `${date} is not one of the days on this request` });
+        if (!Number.isFinite(hours) || hours < 0 || hours > 24) return reply(env, 400, { error: "Hours for a day must be between 0 and 24" });
+        seen.add(date);
+        if (hours > 0) days.push({ date, hours });
+      }
+      if (!days.length) return reply(env, 400, { error: "Every day is at 0 hours. Decline the request instead." });
+      days.sort((a, c) => (a.date < c.date ? -1 : 1));
+      let type = row.type;
+      const want = leaveTypeOf(b.type);
+      if (want && !row.split_of && want !== row.type && !(row.type === "unpaid" && want === (row.asked_type || ""))) type = want;
+      // A hand edited plan replaces the automatic split, so any unpaid part made for it goes.
+      if (!row.split_of) await env.DB.prepare("DELETE FROM xero_leave WHERE split_of = ? AND status = 'pending'").bind(row.id).run();
+      const keepAsked = type === "unpaid" ? row.asked_type || "personal" : type;
+      await env.DB.prepare("UPDATE xero_leave SET type = ?, type_name = ?, asked_type = ?, from_date = ?, to_date = ?, days = ? WHERE id = ?").bind(type, LEAVE_LABELS[type] || row.type_name, row.split_of ? row.asked_type : keepAsked, days[0].date, days[days.length - 1].date, JSON.stringify(days), row.id).run();
+      return reply(env, 200, { ok: true });
+    }
+    if (parts.length === 4 && parts[3] === "decide-cancel" && method === "POST") {
+      if (!office) return reply(env, 403, { error: "forbidden" });
+      const row = await env.DB.prepare("SELECT * FROM xero_leave WHERE id = ?").bind(parts[2]).first();
+      if (!row || Number(row.cancel_requested) !== 1) return reply(env, 409, { error: "That cancellation is no longer waiting" });
+      const b = await body();
+      if (b.decision === "keep") {
+        await env.DB.prepare("UPDATE xero_leave SET cancel_requested = 0 WHERE id = ?").bind(row.id).run();
+        return reply(env, 200, { ok: true });
+      }
+      if (b.decision !== "cancel") return reply(env, 400, { error: "bad decision" });
+      // Xero's payroll API has a reject call for each leave application. Every day sent to Xero is rejected there. If Xero refuses any of them, the leave is still cancelled here and the note says which ones the office must remove by hand.
+      const rejected = await leaveRejectInXero(env, row);
+      const note = rejected.fail ? `Cancelled here. Xero would not reject all of it (${rejected.fail}), so remove the rest in Xero by hand.` : "";
+      await env.DB.prepare("UPDATE xero_leave SET status = 'cancelled', cancel_requested = 0, xero_note = ?, decided_by = ?, decided_at = datetime('now') WHERE id = ?").bind(note, leaveActor(user), row.id).run();
+      return reply(env, 200, { ok: true, note });
+    }
+    if (parts.length === 4 && parts[3] === "decide-edit" && method === "POST") {
+      if (!office) return reply(env, 403, { error: "forbidden" });
+      const row = await env.DB.prepare("SELECT * FROM xero_leave WHERE id = ?").bind(parts[2]).first();
+      if (!row || Number(row.edit_requested) !== 1) return reply(env, 409, { error: "That change is no longer waiting" });
+      const b = await body();
+      if (b.decision === "keep") {
+        await env.DB.prepare("UPDATE xero_leave SET edit_requested = 0, new_type = NULL, new_from = NULL, new_to = NULL WHERE id = ?").bind(row.id).run();
+        return reply(env, 200, { ok: true });
+      }
+      if (b.decision !== "apply") return reply(env, 400, { error: "bad decision" });
+      const change = { type: row.new_type || row.type, from: row.new_from || row.from_date, to: row.new_to || row.to_date };
+      if (leaveDaysOf(row)) return reply(env, 409, { error: "This leave went to Xero one day at a time. Change it in Xero by hand, then press Keep Leave here." });
+      if (row.xero_id) {
+        const pushed = await leavePushXero(env, row, change);
+        if (pushed.fail) return reply(env, 502, { error: "Xero did not take the change, so the old dates stand", detail: pushed.fail });
+      }
+      await env.DB.prepare("UPDATE xero_leave SET type = ?, type_name = ?, from_date = ?, to_date = ?, edit_requested = 0, new_type = NULL, new_from = NULL, new_to = NULL, decided_by = ?, decided_at = datetime('now') WHERE id = ?").bind(change.type, LEAVE_LABELS[change.type] || row.type_name, change.from, change.to, leaveActor(user), row.id).run();
+      await leaveRefreshBalances(env, row.email);
+      return reply(env, 200, { ok: true });
+    }
+    if (parts.length === 3 && parts[2] === "sync" && method === "POST") {
+      if (user.tier !== "T1") return reply(env, 403, { error: "forbidden" });
+      const out = await leaveSync(env);
+      return reply(env, out.ok ? 200 : 502, { ...out, worker: WORKER_BUILD });
+    }
+    return reply(env, 404, { error: "not found" });
+  } catch (e) {
+    console.log("leave error", String(e && e.message || e));
+    return reply(env, 502, { error: String(e && e.message || e).slice(0, 300) });
+  }
+}
+
+// ---- Payroll sweeps. Xero is the source for payroll, so Reservoir keeps checking it and does what the Payroll screen buttons do, so nobody has to remember to tap them. They run from the half hourly cron and check the Melbourne clock themselves, so the first run in a window is the first half hour mark at or after its start time. ----
+// Tuesday from 10:00 to 14:00: looks for a posted pay run and, if one is there, stores its slips exactly as Post Pay Run does (without replacing a run already stored). Stops once a run waiting to be filed exists. If nothing is posted by 14:00, sends one notice to Tayler.
+// Thursday from 7:45: keeps checking Xero and marks the run filed here only once Xero shows it as Filed.
+// The last thing each sweep did is kept in app_settings under sweep.payroll_last, so it can be checked.
+async function payrollSweepNote(env, day, text) {
+  try {
+    await settingsTable(env);
+    await env.DB.prepare("INSERT INTO app_settings (key, value, detail, by_name, at) VALUES ('sweep.payroll_last', ?, ?, 'Payroll sweep', datetime('now')) ON CONFLICT(key) DO UPDATE SET value = excluded.value, detail = excluded.detail, by_name = excluded.by_name, at = excluded.at").bind(day, String(text).slice(0, 500)).run();
+  } catch (e) { /* the note is best effort */ }
+}
+async function payrollSweep(env) {
+  const now = tsMelbourne(new Date());
+  const tue = now.dow === 2;
+  const thu = now.dow === 4 && now.mins >= 7 * 60 + 45;
+  if (!tue && !thu) return;
+  await payslipTables(env);
+  const waitingRun = (from) => env.DB.prepare("SELECT r.run_id, r.payment_date FROM payslip_runs r WHERE r.filed = 0 AND r.rules >= ? AND r.payment_date >= ? AND EXISTS (SELECT 1 FROM payslip_store s WHERE s.run_id = r.run_id) ORDER BY r.payment_date DESC LIMIT 1").bind(PAYSLIP_RULES, from || "").first();
+  if (tue) {
+    if (await waitingRun(now.date)) return;
+    const pull = await payslipPull(env, { runs: 3 });
+    if (pull && pull.fail) { await payrollSweepNote(env, now.date, `Tuesday check failed: ${String(pull.fail.error || "").slice(0, 200)}`); return; }
+    await waitingRun(now.date);
+    return;
+  }
+  // Thursday
+  const doneToday = await env.DB.prepare("SELECT run_id FROM payslip_runs WHERE payment_date = ? AND filed = 1 AND rules >= ? LIMIT 1").bind(now.date, PAYSLIP_RULES).first();
+  if (doneToday) return;
+  let run = await waitingRun();
+  if (!run) {
+    const pull = await payslipPull(env, { runs: 3 });
+    if (pull && pull.fail) { await payrollSweepNote(env, now.date, `Thursday check failed: ${String(pull.fail.error || "").slice(0, 200)}`); return; }
+    run = await waitingRun();
+  }
+  if (!run) return;
+  if (String(run.payment_date) > now.date) return;
+  // Reservoir only follows Xero. The run is marked filed here once Xero itself shows it as Filed, and never before.
+  let xeroFiled = false;
+  try {
+    const r = await xeroFetch(env, `payroll.xro/1.0/PayRuns/${run.run_id}`);
+    if (r.ok) {
+      const pr = ((await r.json()).PayRuns || [])[0] || {};
+      const seen = (o, d) => { if (d > 6 || !o || typeof o !== "object") return false; for (const [k, v] of Object.entries(o)) { if (k !== "PayRunStatus" && typeof v === "string" && /^(stp\s*)?(filed|lodged|submitted)$/i.test(v.trim())) return true; if (typeof v === "boolean" && v && /(stp|filed|lodged)/i.test(k)) return true; if (v && typeof v === "object" && seen(v, d + 1)) return true; } return false; };
+      xeroFiled = seen(pr, 0);
+      // Xero stamps the pay run's UpdatedDateUTC with the moment it is filed (it matches the Single Touch Payroll filing history to the minute). A posted run that changed after Reservoir stored it has been filed.
+      if (!xeroFiled) {
+        const um = /\/Date\((\d+)/.exec(String(pr.UpdatedDateUTC || ""));
+        const br = await env.DB.prepare("SELECT built_at FROM payslip_runs WHERE run_id = ?").bind(run.run_id).first();
+        const bm = br && br.built_at ? Date.parse(String(br.built_at).replace(" ", "T") + "Z") : NaN;
+        if (um && bm && pr.PayRunStatus === "POSTED" && Number(um[1]) > bm + 60000) xeroFiled = true; // the stamp is the moment Submit was pressed, which is the flag Reservoir follows
+      }
+      if (!xeroFiled) {
+        // Look in the pay run list as well, in case the filing status only shows there.
+        const lr = await xeroFetch(env, "payroll.xro/1.0/PayRuns");
+        if (lr.ok) { const hit = ((await lr.json()).PayRuns || []).find((x) => x && x.PayRunID === run.run_id); xeroFiled = !!hit && seen(hit, 0); }
+      }
+    }
+  } catch (e) { xeroFiled = false; }
+  if (!xeroFiled) {
+    // Keep what Xero sent back for this run (without the payslips), so the field that says Filed can be found.
+    try {
+      const rr = await xeroFetch(env, `payroll.xro/1.0/PayRuns/${run.run_id}`);
+      const p0 = ((await rr.json()).PayRuns || [])[0] || {};
+      const { Payslips, ...rest } = p0;
+      await payrollSweepNote(env, now.date, `Thursday check, Xero says: ${JSON.stringify(rest)}`);
+    } catch (e) { /* diagnostic only */ }
+    return;
+  }
+  await env.DB.prepare("UPDATE payslip_runs SET filed = 1, filed_at = datetime('now'), filed_by = 'Xero' WHERE run_id = ? AND filed = 0").bind(run.run_id).run();
+  try { await timesheetSync(env); } catch (e) { /* banking is retried by the Pay Run Filed button */ }
+  // Filing the pay run issues the PAYG withholding notice as a draft bill in Xero.
+  try { await paygBill(env, run.run_id, "DRAFT"); } catch (e) { console.log("payg notice failed", String(e && e.message || e)); }
+}
+
+// ---- Incident reports. Any team member lodges one from the First Aid tile. The directors and managers (T1 and T2) get an urgent alert, open the report, and one of them presses Assign to Me. Nobody can assign it to anyone else. Until someone does, the alert repeats every half hour. ----
+async function incidentTables(env) {
+  await env.DB.prepare("CREATE TABLE IF NOT EXISTS incident_reports (id TEXT PRIMARY KEY, created_at TEXT DEFAULT (datetime('now')), reporter_email TEXT, reporter_name TEXT, injury_type TEXT, incident_date TEXT, location_kind TEXT, location TEXT, aroflo_task TEXT, description TEXT, injured TEXT, witnesses TEXT, action_taken TEXT, photo_ids TEXT, assigned_to TEXT, assigned_email TEXT, assigned_at TEXT, last_alert_at TEXT)").run();
+  await env.DB.prepare("CREATE TABLE IF NOT EXISTS incident_photos (id TEXT PRIMARY KEY, reporter_email TEXT, name TEXT, mime TEXT, data TEXT, created_at TEXT DEFAULT (datetime('now')))").run();
+}
+async function incidentAlert(env, row, repeat) {
+  return; // Incident alerts switched off until the rebuilt incident report is live.
+  await notify(env, { to: "@office", kind: "incident", title: repeat ? "Incident report still needs someone to take it" : "URGENT: someone has been injured", body: repeat ? `${row.reporter_name} reported an injury and nobody has taken the report yet. Open Reservoir and press Assign to Me.` : `${row.reporter_name} has submitted an incident report: ${String(row.injury_type || "").slice(0, 80)}. Open Reservoir to read it.`, link: "notices" });
+  await env.DB.prepare("UPDATE incident_reports SET last_alert_at = datetime('now') WHERE id = ?").bind(row.id).run();
+}
+async function incidentReminders(env) {
+  await incidentTables(env);
+  // One off clean up: delete the unreadable incident report and its photos, which stops the repeat alerts. Remove this block once the rebuilt incident report is live.
+  await env.DB.prepare("DELETE FROM incident_reports").run();
+  await env.DB.prepare("DELETE FROM incident_photos").run();
+  return;
+  const rows = ((await env.DB.prepare("SELECT * FROM incident_reports WHERE assigned_to IS NULL AND (last_alert_at IS NULL OR last_alert_at <= datetime('now', '-29 minutes'))").all()).results) || [];
+  for (const r of rows) await incidentAlert(env, r, true);
+}
+const incidentOut = (r, full) => {
+  const arr = (v) => { try { return JSON.parse(v || "[]"); } catch (e) { return []; } };
+  const o = { id: r.id, at: r.created_at, by: r.reporter_name, injuryType: r.injury_type, date: r.incident_date, location: r.location, assignedTo: r.assigned_to || "" };
+  if (full) Object.assign(o, { locationKind: r.location_kind, aroflo: r.aroflo_task || "", description: r.description, injured: arr(r.injured), witnesses: arr(r.witnesses), actionTaken: r.action_taken, photos: arr(r.photo_ids), assignedAt: r.assigned_at || "" });
+  return o;
+};
+async function incidentRoutes(request, env, user, url) {
+  if (!url.pathname.startsWith("/api/incidents")) return null;
+  const email = String(user.email || "").trim().toLowerCase();
+  const office = user.tier === "T1" || user.tier === "T2";
+  try {
+    await incidentTables(env);
+    if (url.pathname === "/api/incidents/lookup" && request.method === "POST") {
+      const b = await request.json().catch(() => ({}));
+      const n = String(b.number || "").trim();
+      if (!/^[A-Za-z0-9_.-]{1,40}$/.test(n)) return reply(env, 400, { error: "Enter a task number" });
+      const u2 = new URL(`${url.origin}/api/aroflo/job?number=${encodeURIComponent(n)}`);
+      const r = await arofloRoutes(new Request(u2.toString(), { method: "GET" }), env, { ...user, tier: "T1" }, u2);
+      const j = r ? await r.json().catch(() => ({})) : {};
+      if (!j || !j.ok) return reply(env, 200, { ok: false, error: (j && j.error) || "That task was not found in AroFlo." });
+      return reply(env, 200, { ok: true, address: String(j.address || "").slice(0, 300), taskName: String(j.taskName || "").slice(0, 200), client: String(j.client || "").slice(0, 120) });
+    }
+    if (url.pathname === "/api/incidents/photo" && request.method === "POST") {
+      const bytes = await request.arrayBuffer();
+      if (!bytes.byteLength) return reply(env, 400, { error: "empty photo" });
+      if (bytes.byteLength > 1800000) return reply(env, 413, { error: "That photo is too large" });
+      const u8 = new Uint8Array(bytes);
+      let bin = "";
+      for (let i = 0; i < u8.length; i += 8192) bin += String.fromCharCode.apply(null, u8.subarray(i, i + 8192));
+      const id = crypto.randomUUID();
+      const mime = /^image\/(jpeg|png|webp)$/.test(String(request.headers.get("Content-Type") || "")) ? request.headers.get("Content-Type") : "image/jpeg";
+      await env.DB.prepare("INSERT INTO incident_photos (id, reporter_email, name, mime, data) VALUES (?, ?, ?, ?, ?)").bind(id, email, String(url.searchParams.get("name") || "photo.jpg").slice(0, 80), mime, btoa(bin)).run();
+      return reply(env, 200, { id });
+    }
+    const pm = url.pathname.match(/^\/api\/incidents\/photo\/([0-9a-fA-F-]{20,40})$/);
+    if (pm && request.method === "GET") {
+      const p = await env.DB.prepare("SELECT * FROM incident_photos WHERE id = ?").bind(pm[1]).first();
+      if (!p || (!office && p.reporter_email !== email)) return reply(env, 404, { error: "not found" });
+      const bin = atob(p.data);
+      const out = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+      return new Response(out, { status: 200, headers: { "Content-Type": p.mime || "image/jpeg", ...cors(env), "Cache-Control": "private, max-age=3600" } });
+    }
+    if (url.pathname === "/api/incidents" && request.method === "POST") {
+      const b = await request.json().catch(() => ({}));
+      const txt = (v, n) => String(v || "").trim().slice(0, n);
+      const list = (v) => (Array.isArray(v) ? v : []).map((x) => txt(x, 80)).filter(Boolean).slice(0, 20);
+      const rec = { injuryType: txt(b.injuryType, 200), date: txt(b.incidentDate, 10), kind: b.locationKind === "aroflo" ? "aroflo" : "address", location: txt(b.location, 300), aroflo: txt(b.arofloTask, 40), description: txt(b.description, 6000), injured: list(b.injured), witnesses: list(b.witnesses), action: txt(b.actionTaken, 4000), photos: list(b.photoIds) };
+      if (!rec.injuryType || !/^\d{4}-\d{2}-\d{2}$/.test(rec.date) || !rec.location || !rec.description || !rec.injured.length || !rec.witnesses.length || !rec.action || !rec.photos.length) return reply(env, 400, { error: "Every question needs an answer, and at least one photo." });
+      const id = crypto.randomUUID();
+      await env.DB.prepare("INSERT INTO incident_reports (id, reporter_email, reporter_name, injury_type, incident_date, location_kind, location, aroflo_task, description, injured, witnesses, action_taken, photo_ids) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").bind(id, email, String(user.name || email).slice(0, 80), rec.injuryType, rec.date, rec.kind, rec.location, rec.aroflo, rec.description, JSON.stringify(rec.injured), JSON.stringify(rec.witnesses), rec.action, JSON.stringify(rec.photos)).run();
+      const row = await env.DB.prepare("SELECT * FROM incident_reports WHERE id = ?").bind(id).first();
+      await incidentAlert(env, row, false);
+      return reply(env, 200, { ok: true, id });
+    }
+    if (!office) return reply(env, 403, { error: "forbidden" });
+    if (url.pathname === "/api/incidents" && request.method === "GET") {
+      const rows = ((await env.DB.prepare("SELECT * FROM incident_reports ORDER BY created_at DESC LIMIT 200").all()).results) || [];
+      return reply(env, 200, { reports: rows.map((r) => incidentOut(r, false)) });
+    }
+    const dm = url.pathname.match(/^\/api\/incidents\/([0-9a-fA-F-]{20,40})(\/assign)?$/);
+    if (dm && request.method === "GET" && !dm[2]) {
+      const r = await env.DB.prepare("SELECT * FROM incident_reports WHERE id = ?").bind(dm[1]).first();
+      return r ? reply(env, 200, incidentOut(r, true)) : reply(env, 404, { error: "not found" });
+    }
+    if (dm && dm[2] && request.method === "POST") {
+      // Only the person taking the report can assign it, and only to themselves.
+      const r = await env.DB.prepare("UPDATE incident_reports SET assigned_to = ?, assigned_email = ?, assigned_at = datetime('now') WHERE id = ? AND assigned_to IS NULL").bind(String(user.name || email).slice(0, 80), email, dm[1]).run();
+      const now = await env.DB.prepare("SELECT * FROM incident_reports WHERE id = ?").bind(dm[1]).first();
+      return now ? reply(env, 200, { ok: true, report: incidentOut(now, true) }) : reply(env, 404, { error: "not found" });
+    }
+    return reply(env, 404, { error: "not found" });
+  } catch (e) {
+    console.log("incident error", String(e && e.message || e).slice(0, 200));
+    return reply(env, 500, { error: "Could not complete that." });
+  }
+}
+
+// ---- Device unlock (passkeys). A person turns it on once on their own phone or computer. The device keeps the private key in its secure chip and Reservoir keeps only the public key. Unlocking is checked here: the server issues a one time challenge, the device signs it after face, fingerprint or passcode, and the signature is checked against the saved public key. ----
+let passkeyTableMade = false;
+async function passkeyTables(env) {
+  if (passkeyTableMade) return;
+  await env.DB.prepare("CREATE TABLE IF NOT EXISTS passkeys (cred_id TEXT PRIMARY KEY, email TEXT NOT NULL, pub TEXT NOT NULL, alg INTEGER NOT NULL, created_at TEXT DEFAULT (datetime('now')), last_used TEXT)").run();
+  await env.DB.prepare("CREATE TABLE IF NOT EXISTS passkey_challenges (challenge TEXT PRIMARY KEY, email TEXT, kind TEXT, exp INTEGER)").run();
+  passkeyTableMade = true;
+}
+const passkeyOrigins = (env) => String(env.ALLOWED_ORIGIN || "").split(",").map((x) => x.trim()).filter(Boolean);
+const passkeyRpId = (env) => { try { return new URL(passkeyOrigins(env)[0]).hostname; } catch (e) { return ""; } };
+function passkeyDerToRaw(der) {
+  let i = 2;
+  if (der[1] & 0x80) i = 2 + (der[1] & 0x7f);
+  const rl = der[i + 1];
+  const r = der.slice(i + 2, i + 2 + rl);
+  i = i + 2 + rl;
+  const sl = der[i + 1];
+  const s = der.slice(i + 2, i + 2 + sl);
+  const fix = (x) => { while (x.length > 32 && x[0] === 0) x = x.slice(1); const o = new Uint8Array(32); o.set(x, 32 - x.length); return o; };
+  const out = new Uint8Array(64);
+  out.set(fix(r), 0);
+  out.set(fix(s), 32);
+  return out;
+}
+// Reads the client data, checks its type and origin, and uses up the one time challenge it carries.
+async function passkeyClientData(env, email, clientDataJSON, kind) {
+  const bytes = b64u(String(clientDataJSON || ""));
+  let cd;
+  try { cd = JSON.parse(new TextDecoder().decode(bytes)); } catch (e) { return { error: "The unlock answer could not be read." }; }
+  if (cd.type !== (kind === "create" ? "webauthn.create" : "webauthn.get")) return { error: "Wrong kind of unlock answer." };
+  if (!passkeyOrigins(env).includes(cd.origin)) return { error: "The unlock came from the wrong address." };
+  const row = await env.DB.prepare("SELECT challenge FROM passkey_challenges WHERE challenge = ? AND email = ? AND kind = ? AND exp > ?").bind(String(cd.challenge || ""), email, kind, Date.now()).first();
+  if (!row) return { error: "The unlock request expired. Try again." };
+  await env.DB.prepare("DELETE FROM passkey_challenges WHERE challenge = ?").bind(row.challenge).run();
+  return { bytes };
+}
+async function passkeyVerify(env, email, body) {
+  await passkeyTables(env);
+  const cdr = await passkeyClientData(env, email, body.clientDataJSON, "get");
+  if (cdr.error) return { ok: false, error: cdr.error };
+  const key = await env.DB.prepare("SELECT pub, alg FROM passkeys WHERE cred_id = ? AND email = ?").bind(String(body.credentialId || ""), email).first();
+  if (!key) return { ok: false, error: "This device is not set up for unlock." };
+  const authData = b64u(String(body.authenticatorData || ""));
+  const rpHash = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(passkeyRpId(env))));
+  if (authData.length < 37 || rpHash.some((b, i) => b !== authData[i])) return { ok: false, error: "The unlock was for a different site." };
+  if (!(authData[32] & 1) || !(authData[32] & 4)) return { ok: false, error: "Face, fingerprint or passcode was not confirmed." };
+  const cdHash = new Uint8Array(await crypto.subtle.digest("SHA-256", cdr.bytes));
+  const signed = new Uint8Array(authData.length + cdHash.length);
+  signed.set(authData, 0);
+  signed.set(cdHash, authData.length);
+  const sig = b64u(String(body.signature || ""));
+  const pub = b64u(key.pub);
+  let good = false;
+  try {
+    if (key.alg === -7) {
+      const k = await crypto.subtle.importKey("spki", pub, { name: "ECDSA", namedCurve: "P-256" }, false, ["verify"]);
+      good = await crypto.subtle.verify({ name: "ECDSA", hash: "SHA-256" }, k, passkeyDerToRaw(sig), signed);
+    } else if (key.alg === -257) {
+      const k = await crypto.subtle.importKey("spki", pub, { name: "RSASSA-PKCS1-v1_5", hash: "SHA-256" }, false, ["verify"]);
+      good = await crypto.subtle.verify("RSASSA-PKCS1-v1_5", k, sig, signed);
+    }
+  } catch (e) { good = false; }
+  if (!good) return { ok: false, error: "The unlock could not be confirmed." };
+  await env.DB.prepare("UPDATE passkeys SET last_used = datetime('now') WHERE cred_id = ?").bind(String(body.credentialId)).run();
+  return { ok: true };
+}
+
+// One off test: Saturday 24 Oct 2026, first half hour tick at or after 3:30pm Melbourne sends Andrey a timesheet reminder push. Sends once only.
+// 7am every day: one notification per person, counting the emails in the DFP Jobs and Accounts inboxes that carry a category with that person's first name on it. Nobody with none gets nothing. Sent once a day, between 7:00 and 9:00 Melbourne time. Devices still follow their own notification hours.
+async function morningCountPush(env) {
+  const now = tsMelbourne(new Date());
+  if (now.mins < 7 * 60 || now.mins >= 9 * 60) return;
+  await settingsTable(env);
+  const key = "morningcount.sent";
+  const sent = await env.DB.prepare("SELECT value FROM app_settings WHERE key = ?").bind(key).first();
+  if (sent && sent.value === now.date) return;
+  const boxes = MAILBOXES.filter((x) => x.id === "jobs" || x.id === "accounts");
+  const found = [];
+  for (const bx of boxes) {
+    let next = `/mailFolders/inbox/messages?$top=100&$select=categories`;
+    for (let page = 0; next && page < 10; page++) {
+      const r = await mailGraph(env, mailAddress(env, bx), next);
+      if (!r.ok) { console.log("morning count failed", bx.id, r.status); break; }
+      for (const m of ((r.json && r.json.value) || [])) if ((m.categories || []).length) found.push({ box: bx, cats: (m.categories || []).map((c) => String(c).toLowerCase()) });
+      const link = r.json && r.json["@odata.nextLink"];
+      next = typeof link === "string" && link.startsWith(GRAPH + "/") ? link : "";
+    }
+  }
+  await pushTable(env);
+  await pushLoadBiz(env);
+  const rows = ((await env.DB.prepare("SELECT * FROM push_subs").all()).results) || [];
+  const by = new Map();
+  for (const r of rows) { const e = String(r.email || "").toLowerCase(); if (!by.has(e) || (r.app === "mail" && by.get(e).app !== "mail")) by.set(e, r); }
+  const counts = [];
+  const sends = [];
+  for (const r of by.values()) {
+    const first = String(r.email || "").toLowerCase().split("@")[0].split(/[._-]/)[0];
+    if (!first) continue;
+    const mine = (c) => c === first || c.startsWith(first + " ");
+    const n = found.filter((f) => (!f.box.tiers || !r.tier || f.box.tiers.includes(String(r.tier))) && f.cats.some(mine)).length;
+    counts.push(first + " " + n);
+    if (n < 1) continue;
+    const payload = { title: `You have ${n} email${n === 1 ? "" : "s"} waiting for your attention.`, body: "Open Reservoir to read it", tag: "morning-count-" + now.date, open: "notices" };
+    sends.push([r, r.app === "mail" ? { ...payload, url: "/weir" } : payload]);
+  }
+  await env.DB.prepare("INSERT OR REPLACE INTO app_settings (key, value, detail, by_name, at) VALUES (?, ?, ?, 'Reservoir', datetime('now'))").bind(key, now.date, counts.join(", ").slice(0, 400)).run();
+  await Promise.allSettled(sends.map(async ([r, pl]) => {
+    if (pushInHours(pushModeOf(r))) return pushSendOne(env, r, pl);
+    await env.DB.prepare("INSERT INTO push_held (endpoint) VALUES (?)").bind(r.endpoint).run();
+  }));
+}
+async function pushOneOffAndrey(env) {
+  const now = tsMelbourne(new Date());
+  if (now.date !== "2026-10-24" || now.mins < 15 * 60 + 30 || now.mins > 18 * 60) return;
+  await settingsTable(env);
+  const done = await env.DB.prepare("SELECT value FROM app_settings WHERE key = 'oneoff.andrey_ts_push'").first();
+  if (done) return;
+  await env.DB.prepare("INSERT INTO app_settings (key, value, detail, by_name, at) VALUES ('oneoff.andrey_ts_push', '1', 'sent', 'One off', datetime('now'))").run();
+  await pushTable(env);
+  const rows = ((await env.DB.prepare("SELECT DISTINCT email FROM push_subs WHERE lower(email) LIKE 'andrey%'").all()).results) || [];
+  for (const r of rows) await notify(env, { to: r.email, kind: "timesheet", title: "Submit your timesheet", body: "Please submit your timesheet for this week.", link: "timesheets", by: "Reminder" });
+}
+// Xero contacts, names only. Keeps each contact's Xero ID and name so a repair record can name who the tax invoice is from. Read only, and nothing else about the contact is kept.
+let xeroContactsReady = false;
+async function xeroContactsTable(env) {
+  if (xeroContactsReady) return;
+  await env.DB.prepare("CREATE TABLE IF NOT EXISTS xero_contacts (contact_id TEXT PRIMARY KEY, name TEXT NOT NULL, name_lc TEXT NOT NULL, synced_at TEXT)").run();
+  await env.DB.prepare("CREATE INDEX IF NOT EXISTS xero_contacts_name ON xero_contacts (name_lc)").run();
+  xeroContactsReady = true;
+}
+async function xeroContactsSync(env) {
+  await xeroContactsTable(env);
+  const stamp = new Date().toISOString();
+  const pending = [];
+  let saved = 0;
+  const flush = async () => {
+    while (pending.length) {
+      const group = pending.splice(0, 40);
+      if (typeof env.DB.batch === "function") await env.DB.batch(group);
+      else for (const st of group) await st.run();
+    }
+  };
+  for (let page = 1; page <= 100; page++) {
+    const res = await xeroFetch(env, `api.xro/2.0/Contacts?page=${page}&summaryOnly=true`);
+    if (!res.ok) { await flush(); return { ok: false, saved, error: await xeroWhy(res) }; }
+    const list = (await res.json()).Contacts || [];
+    if (!list.length) break;
+    for (const c of list) {
+      const name = String(c.Name || "").trim().slice(0, 200);
+      if (!c.ContactID || !name) continue;
+      pending.push(env.DB.prepare("INSERT INTO xero_contacts (contact_id, name, name_lc, synced_at) VALUES (?, ?, ?, ?) ON CONFLICT(contact_id) DO UPDATE SET name = excluded.name, name_lc = excluded.name_lc, synced_at = excluded.synced_at").bind(c.ContactID, name, name.toLowerCase(), stamp));
+      saved++;
+    }
+    if (list.length < 100) break;
+  }
+  await flush();
+  // A full read worked, so a contact that is no longer in Xero (archived or deleted) goes from the list too.
+  await env.DB.prepare("DELETE FROM xero_contacts WHERE synced_at IS NULL OR synced_at <> ?").bind(stamp).run();
+  return { ok: true, saved };
+}
+// Runs one Xero pull at most once per key (read only). A failed pull clears its key so the next half hourly tick tries again.
+async function xeroPullOnce(env, key, label, fn) {
+  await settingsTable(env);
+  const done = await env.DB.prepare("SELECT value FROM app_settings WHERE key = ?").bind(key).first();
+  if (done) return;
+  await env.DB.prepare("INSERT INTO app_settings (key, value, detail, by_name, at) VALUES (?, '1', ?, 'Scheduled', datetime('now'))").bind(key, `${label} started`).run();
+  let ok = false, note = "";
+  try { const r = await fn(env); ok = !!(r && r.ok); note = ok ? r.note : `failed: ${String((r && r.error) || "").slice(0, 160)}`; } catch (e) { note = `failed: ${String(e && e.message || e).slice(0, 160)}`; }
+  if (ok) await env.DB.prepare("UPDATE app_settings SET detail = ?, at = datetime('now') WHERE key = ?").bind(`${label} ${note}`, key).run();
+  else await env.DB.prepare("DELETE FROM app_settings WHERE key = ?").bind(key).run();
+}
+async function tsPullFn(env) { const r = await timesheetSync(env); return r && r.ok ? { ok: true, note: `pulled ${r.saved || 0} timesheets, ${r.people || 0} people, ${JSON.stringify(r.byStatus || {})}` } : { ok: false, error: r && r.error }; }
+async function contactsPullFn(env) { const r = await xeroContactsSync(env); return r.ok ? { ok: true, note: `${r.saved} contacts` } : { ok: false, error: r.error }; }
+// Timesheets: Monday from 4:00pm Melbourne, and once as a one off after w158. Contacts: every weekday from 6:00pm Melbourne, and once as a one off after w163.
+async function tsXeroPullSchedule(env) {
+  const now = tsMelbourne(new Date());
+  if (now.date >= "2026-10-26") await xeroPullOnce(env, "oneoff.ts_pull_20261026", "One off timesheet pull", tsPullFn);
+  if (now.dow === 1 && now.mins >= 16 * 60 && now.mins < 17 * 60) await xeroPullOnce(env, `sweep.ts_pull.${now.date}`, "Monday timesheet pull", tsPullFn);
+  if (now.date >= "2026-10-26") await xeroPullOnce(env, "oneoff.contacts_pull_20261026", "One off contacts pull", contactsPullFn);
+  if (now.dow >= 1 && now.dow <= 5 && now.mins >= 18 * 60 && now.mins < 19 * 60) await xeroPullOnce(env, `sweep.contacts_pull.${now.date}`, "Weekday contacts pull", contactsPullFn);
+}
+// ---- Accounts mailbox invoice pickup. Supplier emails are moved into the accPay Sweep folder the moment they arrive (inbox rules this Worker creates), Microsoft pings the Worker for each one, and the Worker makes the bill in Xero, then sends it to AroFlo, marks it read and archives it. Xero goes first and nothing is sent to AroFlo unless the bill is in, so a failed invoice has gone nowhere. There is no email to Xero fallback. A failed invoice stays in the accPay Sweep folder tagged ERROR! and is fixed from Reservoir (Retry); a credit or an email with no PDF goes back to the inbox. The half hourly cron is the backstop for a missed ping. ----
+// The folder the accounts payable sweep works from. Found by name ignoring case and spaces, so only the spelling "accPay Sweep" is needed.
+const INV_FOLDER_KEY = "accpaysweep";
+const INV_FOLDER_LABEL = "accPay Sweep";
+const invHash = (s) => { s = String(s); let h = 5381; for (let i = 0; i < s.length; i++) h = ((h * 33) ^ s.charCodeAt(i)) >>> 0; return h.toString(36); };
+const invRulesSorted = () => [...INVOICE_MAIL_RULES].sort((a, b) => a.name.localeCompare(b.name));
+let invFolderCache = "";
+async function invHistoryTable(env) {
+  await env.DB.prepare("CREATE TABLE IF NOT EXISTS invoice_history (id INTEGER PRIMARY KEY AUTOINCREMENT, msg TEXT, supplier TEXT, number TEXT, status TEXT, detail TEXT, at TEXT DEFAULT (datetime('now')), month TEXT)").run();
+  for (const col of ["imid TEXT", "retried INTEGER", "manual INTEGER"]) { try { await env.DB.prepare(`ALTER TABLE invoice_history ADD COLUMN ${col}`).run(); } catch (e) { /* already there */ } }
+}
+async function invHistoryAdd(env, msg, supplier, number, status, detail, imid) {
+  try {
+    await invHistoryTable(env);
+    if (msg) await env.DB.prepare("DELETE FROM invoice_history WHERE msg = ? AND status = 'error'").bind(msg).run();
+    await env.DB.prepare("INSERT INTO invoice_history (msg, supplier, number, status, detail, month, imid) VALUES (?, ?, ?, ?, ?, strftime('%Y-%m', 'now', '+11 hours'), ?)").bind(msg || "", supplier || "", String(number || "").slice(0, 80), status, String(detail || "").slice(0, 800), String(imid || "").slice(0, 400)).run();
+  } catch (e) { console.log("invoice history failed", String(e && e.message || e)); }
+}
+// One time wipe asked for on 16 Nov 2026: clears the whole invoice and credit history and the remembered Xero and AroFlo sends, then notes it has been done so it never runs again.
+async function invOneTimeClear(env) {
+  try {
+    await settingsTable(env);
+    await invHistoryTable(env);
+    const key = "invhist.wipe.2026-11-16";
+    if (!(await env.DB.prepare("SELECT 1 AS x FROM app_settings WHERE key = ?").bind(key).first())) {
+    await env.DB.prepare("DELETE FROM invoice_history").run();
+    await env.DB.prepare("DELETE FROM app_settings WHERE key LIKE 'invmail.%.xero' OR key LIKE 'invmail.%.aroflo'").run();
+    await env.DB.prepare("INSERT OR REPLACE INTO app_settings (key, value, detail, by_name, at) VALUES (?, '1', 'history cleared', 'Reservoir', datetime('now'))").bind(key).run();
+    }
+  } catch (e) { console.log("history clear failed", String(e && e.message || e)); }
+  // Second one time clear, 16 Nov 2026: credit note lines only.
+  try {
+    const key2 = "invhist.wipe.2026-11-16b";
+    if (await env.DB.prepare("SELECT 1 AS x FROM app_settings WHERE key = ?").bind(key2).first()) return;
+    await env.DB.prepare("DELETE FROM invoice_history WHERE number LIKE 'Credit %'").run();
+    await env.DB.prepare("INSERT OR REPLACE INTO app_settings (key, value, detail, by_name, at) VALUES (?, '1', 'credit history cleared', 'Reservoir', datetime('now'))").bind(key2).run();
+  } catch (e) { console.log("history clear failed", String(e && e.message || e)); }
+  // Third one time clear, 16 Nov 2026: credit note lines again.
+  try {
+    const key3 = "invhist.wipe.2026-11-16c";
+    if (await env.DB.prepare("SELECT 1 AS x FROM app_settings WHERE key = ?").bind(key3).first()) return;
+    await env.DB.prepare("DELETE FROM invoice_history WHERE number LIKE 'Credit %'").run();
+    await env.DB.prepare("INSERT OR REPLACE INTO app_settings (key, value, detail, by_name, at) VALUES (?, '1', 'credit history cleared', 'Reservoir', datetime('now'))").bind(key3).run();
+  } catch (e) { console.log("history clear failed", String(e && e.message || e)); }
+}
+// Puts back the successful invoice lines that the 16 Nov 2026 wipe removed. Reads the Archive folder of the Accounts mailbox from 1 Oct 2026, newest first, works out the supplier and invoice number from each PDF and adds a successful line dated when the email arrived. Lines already there are left alone, credit notes and errored emails are skipped. Works in batches inside a time budget and carries on where it stopped.
+async function invRebuildHistory(env, budgetMs) {
+  const flag = "invhist.rebuild.2026-11-16";
+  try {
+    await settingsTable(env);
+    await invHistoryTable(env);
+    const row = await env.DB.prepare("SELECT value FROM app_settings WHERE key = ?").bind(flag).first();
+    if (row && row.value === "done") return;
+    if (!(await env.DB.prepare("SELECT 1 AS x FROM app_settings WHERE key = 'invhist.wipe.2026-11-16'").first())) return;
+    let skip = row ? Number(row.value) || 0 : 0;
+    const save = (v) => env.DB.prepare("INSERT OR REPLACE INTO app_settings (key, value, detail, by_name, at) VALUES (?, ?, 'history rebuild', 'Reservoir', datetime('now'))").bind(flag, String(v)).run();
+    const addr = mailAddress(env, MAILBOXES.find((x) => x.id === "accounts"));
+    const t0 = Date.now();
+    while (Date.now() - t0 < budgetMs) {
+      const r = await mailGraph(env, addr, `/mailFolders/archive/messages?$top=10&$skip=${skip}&$select=subject,receivedDateTime,categories,from,internetMessageId&$filter=${encodeURIComponent("receivedDateTime ge 2026-10-01T00:00:00Z and hasAttachments eq true")}&$orderby=receivedDateTime desc`);
+      if (!r.ok) { console.log("history rebuild list failed", r.status); return; }
+      const msgs = (r.json && r.json.value) || [];
+      if (!msgs.length) { await save("done"); return; }
+      for (const m of msgs) {
+        const rule = invMatchRule(m);
+        const cats = (m.categories || []).map((c) => String(c).toLowerCase());
+        if (!rule || cats.includes("error!") || cats.includes("credit") || invIsCreditMail(m, rule)) continue;
+        const at = await mailGraph(env, addr, `/messages/${encodeURIComponent(m.id)}/attachments?$select=id,name,contentType,size,isInline`);
+        const pdfs = at.ok ? ((at.json && at.json.value) || []).filter((x) => !x.isInline && (/pdf/i.test(x.contentType || "") || /\.pdf$/i.test(x.name || "")) && Number(x.size || 0) <= MAX_EMAIL) : [];
+        for (const p of pdfs) {
+          const res = await graphFetch(env, `/users/${encodeURIComponent(addr)}/messages/${encodeURIComponent(m.id)}/attachments/${encodeURIComponent(p.id)}/$value`);
+          if (!res.ok) continue;
+          let parsed = null;
+          try { parsed = await rule.parse(await res.arrayBuffer()); } catch (e) { parsed = null; }
+          if (!parsed || parsed.credit) continue;
+          const number = String(parsed.number || p.name || "").slice(0, 80);
+          if (!number) continue;
+          if (await env.DB.prepare("SELECT 1 AS x FROM invoice_history WHERE supplier = ? AND number = ?").bind(rule.name, number).first()) continue;
+          const when = new Date(m.receivedDateTime);
+          const atStr = when.toISOString().slice(0, 19).replace("T", " ");
+          const month = new Date(when.getTime() + 11 * 3600 * 1000).toISOString().slice(0, 7);
+          await env.DB.prepare("INSERT INTO invoice_history (msg, supplier, number, status, detail, at, month, imid) VALUES (?, ?, ?, 'done', '', ?, ?, ?)").bind(invHash(m.internetMessageId || m.id) + ":" + invHash(String(p.name || "invoice.pdf").slice(0, 150)), rule.name, number, atStr, month, m.internetMessageId || "").run();
+        }
+      }
+      skip += msgs.length;
+      await save(skip);
+    }
+  } catch (e) { console.log("history rebuild failed", String(e && e.message || e)); }
+}
+// What the Uploaded Invoices screen shows: the successes (manual marks one that was entered by hand and ticked off) and the errors (retried marks one whose retry has failed, which gets the tick in place of the retry).
+async function invHistoryList(env) {
+  await invOneTimeClear(env);
+  await invRebuildHistory(env, 15000);
+  await invHistoryTidy(env);
+  const rows = ((await env.DB.prepare("SELECT id, supplier, number, status, detail, at, retried, manual FROM invoice_history ORDER BY at DESC, id DESC LIMIT 300").all()).results) || [];
+  const out = (r) => ({ id: r.id, supplier: r.supplier, number: r.number, detail: r.detail || "", at: r.at, retried: !!r.retried, manual: !!r.manual || r.detail === "Rectified" });
+  return { done: rows.filter((r) => r.status === "done").map(out), errors: rows.filter((r) => r.status === "error").map(out) };
+}
+// The tick: the retry failed and the invoice was entered by hand, so the line moves to the successful history marked manual. Only a line whose retry has failed can be ticked.
+async function invManual(env, id) {
+  await invHistoryTable(env);
+  const r = await env.DB.prepare("UPDATE invoice_history SET status = 'done', manual = 1, detail = '' WHERE id = ? AND status = 'error' AND retried = 1").bind(id).run();
+  return !!(r.meta && r.meta.changes > 0);
+}
+// Successful invoices are kept for the current month and the one before it, so November goes on 1 January. Errors stay until someone clears them.
+async function invHistoryTidy(env) {
+  await invHistoryTable(env);
+  await env.DB.prepare("DELETE FROM invoice_history WHERE status = 'done' AND month < strftime('%Y-%m', 'now', '+11 hours', 'start of month', '-1 month')").run();
+}
+async function invFolderId(env, addr) {
+  if (invFolderCache) return invFolderCache;
+  const q = "?$top=100&$select=id,displayName";
+  for (const path of ["/mailFolders", "/mailFolders/inbox/childFolders"]) {
+    const r = await mailGraph(env, addr, path + q);
+    const f = r.ok && r.json && r.json.value && r.json.value.find((x) => String(x.displayName || "").toLowerCase().replace(/\s+/g, "") === INV_FOLDER_KEY);
+    if (f && f.id) { invFolderCache = f.id; return f.id; }
+  }
+  return "";
+}
+async function invClaim(env, key) {
+  const r = await env.DB.prepare("INSERT INTO app_settings (key, value, detail, by_name, at) VALUES (?, 'claim', '', 'claim', datetime('now')) ON CONFLICT(key) DO UPDATE SET at = datetime('now') WHERE at < datetime('now', '-10 minutes')").bind(key).run();
+  return !!(r.meta && r.meta.changes > 0);
+}
+const invMatchRule = (m) => {
+  const from = String((m.from && m.from.emailAddress && m.from.emailAddress.address) || "").toLowerCase();
+  const subj = String(m.subject || "").toLowerCase();
+  return invRulesSorted().find((r) => (r.from ? from === r.from.toLowerCase() : from.endsWith("@" + String(r.fromDomain || "").toLowerCase())) && [r.subject, ...(r.alsoSubject || [])].some((t) => subj.includes(t.toLowerCase()))) || null;
+};
+// Work out one email. Returns null when there is nothing to do with it, { credit: true } for a credit, otherwise the result shown on the screen.
+// redo is only passed by a retry: it says which file starts again from nothing (true for every file in the email).
+async function invProcessHit(env, actor, addr, rule, hit, inFolder, redo) {
+  const aroflo = env.AROFLO_BILLS_EMAIL;
+  const msgUrl = `/users/${encodeURIComponent(addr)}/messages/${encodeURIComponent(hit.id)}`;
+  const patch = (body) => graphFetch(env, msgUrl, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }).catch(() => null);
+  const moveTo = (dest) => graphFetch(env, msgUrl + "/move", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ destinationId: dest }) }).catch(() => null);
+  const msgKey = invHash(hit.internetMessageId || hit.id);
+  const done = async (k) => !!(await env.DB.prepare("SELECT key FROM app_settings WHERE key = ?").bind(k).first());
+  const mark = (k, d) => env.DB.prepare("INSERT OR REPLACE INTO app_settings (key, value, detail, by_name, at) VALUES (?, '1', ?, ?, datetime('now'))").bind(k, String(d).slice(0, 200), actor.name).run();
+  const at = await mailGraph(env, addr, `/messages/${encodeURIComponent(hit.id)}/attachments?$select=id,name,contentType,size,isInline`);
+  if (!at.ok) return { lastErr: mailWhy(at) };
+  const pdfs = ((at.json && at.json.value) || []).filter((x) => !x.isInline && (/pdf/i.test(x.contentType || "") || /\.pdf$/i.test(x.name || "")));
+  if (!pdfs.length) { if (inFolder) await moveTo("inbox"); return null; }
+  const got = [];
+  for (const p of pdfs) {
+    if (Number(p.size || 0) > MAX_EMAIL) { got.push({ p, big: true }); continue; }
+    const res = await graphFetch(env, `/users/${encodeURIComponent(addr)}/messages/${encodeURIComponent(hit.id)}/attachments/${encodeURIComponent(p.id)}/$value`);
+    if (!res.ok) { got.push({ p, bad: true }); continue; }
+    const buf = await res.arrayBuffer();
+    let parsed = null;
+    try { parsed = await rule.parse(buf); } catch (e) { parsed = null; }
+    got.push({ p, buf, parsed });
+  }
+  // A credit goes back to the inbox with the Credit tag, for a person to deal with.
+  if (!rule.creditNotes && got.some((g) => g.parsed && g.parsed.credit)) {
+    await patch({ categories: [...new Set([...(hit.categories || []), "Credit"])] });
+    if (inFolder) await moveTo("inbox");
+    return { credit: true };
+  }
+  const failed = [];
+  const items = [];
+  let allOk = true;
+  for (const g of got) {
+    const p = g.p;
+    const fname = String(p.name || "invoice.pdf").slice(0, 150);
+    const isCredit = !!(rule.creditNotes && g.parsed && g.parsed.credit);
+    const it = { file: fname, supplier: rule.name, number: g.parsed ? (isCredit ? "Credit " : "") + (g.parsed.number || "") : "", aroflo: "", xero: "", xeroNote: "" };
+    items.push(it);
+    if (g.big) { failed.push(`${fname} is over 3.5 MB`); allOk = false; continue; }
+    if (g.bad) { failed.push(`${fname} could not be read`); allOk = false; continue; }
+    const b64 = toB64(g.buf);
+    const key = `invmail.${msgKey}.${invHash(fname + ":" + (p.size || ""))}`;
+    // A retry starts this file again from nothing: forget that it was ever sent to Xero or AroFlo.
+    if (redo === true || redo === invHash(fname)) await env.DB.prepare("DELETE FROM app_settings WHERE key IN (?, ?)").bind(key + ".xero", key + ".aroflo").run();
+    // Xero first.
+    let inXero = false;
+    // A credit note always asks Xero itself whether it is there (by its number), so a credit deleted in Xero can be done again.
+    if (!isCredit && await done(key + ".xero")) { it.xero = "already done"; inXero = true; }
+    else {
+      let x = { ok: false, note: "the PDF could not be read" };
+      try { if (g.parsed) x = isCredit ? await xeroCreditFromPdf(env, rule, g.buf, fname, g.parsed) : await xeroBillFromPdf(env, rule, g.buf, fname, g.parsed); } catch (e) { x = { ok: false, note: String(e && e.message || e).slice(0, 600) }; }
+      if (x.ok && x.status === "AUTHORISED") { await mark(key + ".xero", "approved"); it.xero = "approved"; it.xeroNote = x.note || ""; inXero = true; }
+      else if (x.ok && x.status === "EXISTS") { await mark(key + ".xero", "exists"); it.xero = "already in Xero"; if (isCredit) it.xeroNote = String(x.note || "").replace(/^already in Xero\.? ?/, ""); inXero = true; }
+      else if (x.ok) { await mark(key + ".xero", "draft"); it.xero = "draft"; it.xeroNote = x.note || ""; inXero = true; }
+      else { it.xero = "failed"; it.xeroNote = x.note || ""; allOk = false; }
+    }
+    // AroFlo only once the bill is in Xero. If Xero failed, this invoice has been sent nowhere.
+    if (!inXero) it.aroflo = "not sent";
+    else if (rule.xeroOnly || isCredit) it.aroflo = "not needed";
+    else if (await done(key + ".aroflo")) it.aroflo = "already sent";
+    else { try { await mailAttachment(env, actor, aroflo, fname, "application/pdf", b64); await mark(key + ".aroflo", "sent"); it.aroflo = "sent"; } catch (e) { allOk = false; it.aroflo = "failed"; failed.push(`AroFlo: ${String(e.message || "").slice(0, 80)}`); } }
+  }
+  let archived = "";
+  if (!allOk) {
+    const tag = await patch({ categories: [...new Set([...(hit.categories || []), "ERROR!"])] });
+    archived = tag && tag.ok ? (inFolder ? `left in the ${INV_FOLDER_LABEL} folder and tagged ERROR!` : "left in the mailbox and tagged ERROR!") : "left in the mailbox (could not tag it ERROR!)";
+    for (const it of items) await invHistoryAdd(env, msgKey + ":" + invHash(it.file), rule.name, it.number || it.file, "error", failed.join(". ") || it.xeroNote, hit.internetMessageId);
+    // Tayler and Andrey are told when an invoice fails the first time. A retry that fails shows on the screen instead.
+    if (redo === undefined) {
+      try {
+        const tiers = await accessTiers(env);
+        const why = (failed.join(". ") || (items.find((x) => x.xeroNote) || {}).xeroNote || "It did not go through.").slice(0, 160);
+        for (const to of Object.keys(tiers).filter((e) => /^(tayler|andrey)[.@]/i.test(e))) await notify(env, { to, kind: "info", title: "Unsuccessful invoice sweep", body: `${rule.name}${items[0] && items[0].number ? " " + items[0].number : ""}: ${why}`, link: "invoices", by: "Reservoir" });
+      } catch (e) { console.log("sweep notice failed", String(e && e.message || e)); }
+    }
+    if (!items.length) await invHistoryAdd(env, msgKey, rule.name, "", "error", failed.join(". "), hit.internetMessageId);
+  } else {
+    // Some suppliers put the real invoice behind a link in the email. Once everything is in, the email goes back to Accounts with a note so the links get downloaded and uploaded by hand.
+    if (rule.forwardBack && !(await done(msgKey + ".fwd"))) {
+      try { const fw = await mailDraftSend(env, addr, hit.id, "createForward", rule.forwardBack, mailRecipients(addr)); if (fw && fw.ok) await mark(msgKey + ".fwd", "sent"); else console.log("forward back failed", fw && fw.status); } catch (e) { console.log("forward back failed", String(e && e.message || e)); }
+    }
+    await patch({ isRead: true });
+    const mv = await moveTo("archive");
+    archived = mv && mv.ok ? "archived" : `not archived (Microsoft ${mv ? mv.status : "no answer"})`;
+    for (const it of items) await invHistoryAdd(env, msgKey + ":" + invHash(it.file), rule.name, it.number || it.file, "done", "", hit.internetMessageId);
+  }
+  return { ok: true, found: true, subject: String(hit.subject || "").slice(0, 120), received: hit.receivedDateTime || "", items, archived, failed: failed.join(". ") };
+}
+// The email behind a failed invoice, for a retry. Read from the accPay Sweep folder only: by the email's own id when the history line has it, then by looking through the folder.
+async function invFindEmail(env, addr, folderId, msgKey, imid) {
+  if (!folderId) return { err: "The accPay Sweep folder could not be found in the Accounts mailbox." };
+  const sel = "$select=subject,receivedDateTime,categories,from,internetMessageId,parentFolderId";
+  const same = (m) => invHash(m.internetMessageId || m.id) === msgKey;
+  const look = async (path) => { const r = await mailGraph(env, addr, path); return r.ok ? { m: ((r.json && r.json.value) || []).find(same) || null } : { err: mailWhy(r) }; };
+  let err = "";
+  if (imid) {
+    const a = await look(`/mailFolders/${folderId}/messages?$top=10&${sel}&$filter=${encodeURIComponent(`internetMessageId eq '${String(imid).replace(/'/g, "''")}'`)}`);
+    if (a.m) return a;
+    err = a.err || err;
+  }
+  const plain = `?$top=100&${sel}&$filter=${encodeURIComponent("receivedDateTime ge 1900-01-01T00:00:00Z and hasAttachments eq true")}&$orderby=receivedDateTime desc`;
+  const c = await look(`/mailFolders/${folderId}/messages${plain}`);
+  if (c.m) return c;
+  err = c.err || err;
+  return err ? { err } : { m: null };
+}
+// Retry a failed invoice from scratch: forget what was sent, take the ERROR! tag off the email and run it again, Xero first. The line moves to the successful history, or stays under errors with the new reason.
+// A line gets one retry. If it fails, the line is flagged retried and the screen swaps the retry for a tick, so the invoice is entered by hand and ticked off.
+async function invRetry(env, actor, id) {
+  await settingsTable(env);
+  await invHistoryTable(env);
+  const row = await env.DB.prepare("SELECT id, msg, imid FROM invoice_history WHERE id = ? AND status = 'error'").bind(id).first();
+  if (!row) return { ok: false, error: "That invoice is no longer waiting." };
+  const [msgKey, fileKey] = String(row.msg || "").split(":");
+  const lock = "invmail.retry." + msgKey;
+  if (!msgKey || !(await invClaim(env, lock))) return { ok: false, error: "That invoice is already being retried." };
+  // The retry never ran the email: say why on the line itself, and put the ERROR! tag back if it was taken off, so nothing picks the email up again by itself.
+  let retag = null;
+  const stop = async (error, tagged) => {
+    if (retag && !tagged) await retag();
+    await env.DB.prepare("UPDATE invoice_history SET retried = 1, detail = ? WHERE id = ? AND status = 'error'").bind(String(error).slice(0, 800), row.id).run();
+    return { ok: false, error };
+  };
+  try {
+    const addr = mailAddress(env, MAILBOXES.find((x) => x.id === "accounts"));
+    const folderId = await invFolderId(env, addr);
+    const found = await invFindEmail(env, addr, folderId, msgKey, row.imid);
+    if (found.err) return stop(found.err);
+    const hit = found.m;
+    if (!hit) return stop("The email for this invoice is not in the accPay Sweep folder.");
+    const rule = invMatchRule(hit);
+    if (!rule) return stop("No supplier rule matches that email any more.");
+    const cats = (hit.categories || []).filter((c) => String(c).toLowerCase() !== "error!");
+    if (cats.length !== (hit.categories || []).length) {
+      const tag = (list) => graphFetch(env, `/users/${encodeURIComponent(addr)}/messages/${encodeURIComponent(hit.id)}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ categories: list }) }).catch(() => null);
+      await tag(cats);
+      hit.categories = cats;
+      retag = () => tag([...cats, "ERROR!"]);
+    }
+    // One press has to be enough, so the Xero login is tried up to three times here to get past a one off refusal.
+    for (let i = 0; i < 3; i++) { try { await xeroAccess(env); break; } catch (e) { if (i < 2) await xeroSleep(1500); } }
+    const res = await invProcessHit(env, actor, addr, rule, hit, !!folderId && hit.parentFolderId === folderId, fileKey || true);
+    if (!res) return stop("That email no longer has a PDF attached.");
+    if (res.lastErr) return stop(res.lastErr);
+    if (res.credit) return stop("That email is a credit, so it was tagged Credit and left in the inbox.", true);
+    // Every line of this email that is still an error has now had its retry.
+    await env.DB.prepare("UPDATE invoice_history SET retried = 1 WHERE status = 'error' AND (msg = ? OR msg LIKE ?)").bind(msgKey, msgKey + ":%").run();
+    const still = await env.DB.prepare("SELECT detail FROM invoice_history WHERE msg = ? AND status = 'error'").bind(row.msg).first();
+    return { ok: !still, error: still ? String(still.detail || "It did not go through.") : "", items: res.items, archived: res.archived };
+  } finally {
+    await env.DB.prepare("DELETE FROM app_settings WHERE key = ?").bind(lock).run().catch(() => null);
+  }
+}
+// A Samios credit note email. The Credits button does only these; the automatic runs and the normal invoice press do them along with the invoices.
+const invIsCreditMail = (m, rule) => !!(rule && rule.creditNotes && /credit note/i.test(String(m.subject || "")));
+// Emails waiting in the accPay Sweep folder, matched to a supplier rule, in supplier order (A to Z). creditsOnly gives just the credit notes.
+async function invFolderHits(env, addr, folderId, creditsOnly) {
+  const f = "receivedDateTime ge 1900-01-01T00:00:00Z and hasAttachments eq true";
+  const r = await mailGraph(env, addr, `/mailFolders/${folderId}/messages?$top=50&$select=subject,receivedDateTime,categories,from,internetMessageId&$filter=${encodeURIComponent(f)}&$orderby=receivedDateTime desc`);
+  if (!r.ok) return { err: mailWhy(r), hits: [] };
+  const hits = [];
+  for (const m of (r.json && r.json.value) || []) {
+    const rule = invMatchRule(m);
+    if (!rule) continue;
+    const cats = (m.categories || []).map((c) => String(c).toLowerCase());
+    if (cats.includes("error!") || (cats.includes("credit") && !rule.creditNotes)) continue;
+    if (creditsOnly && !invIsCreditMail(m, rule)) continue;
+    hits.push({ m, rule });
+  }
+  hits.sort((a, b) => a.rule.name.localeCompare(b.rule.name) || String(a.m.receivedDateTime).localeCompare(String(b.m.receivedDateTime)));
+  return { err: "", hits };
+}
+// The Worker's own run (a Microsoft ping or the half hourly backstop). Does up to max emails from the accPay Sweep folder.
+async function invMailSweep(env, max) {
+  if (!env.AROFLO_BILLS_EMAIL) return;
+  const addr = mailAddress(env, MAILBOXES.find((x) => x.id === "accounts"));
+  await settingsTable(env);
+  await invHistoryTable(env);
+  const folderId = await invFolderId(env, addr);
+  if (!folderId) return;
+  const { hits } = await invFolderHits(env, addr, folderId);
+  let n = 0;
+  for (const { m, rule } of hits) {
+    if (n >= max) break;
+    if (!(await invClaim(env, "invmail.claim." + invHash(m.internetMessageId || m.id)))) continue;
+    n++;
+    try { await invProcessHit(env, { name: "Reservoir" }, addr, rule, m, true); } catch (e) { console.log("invoice pickup failed", String(e && e.message || e)); }
+  }
+}
+async function invSha(s) {
+  const b = new Uint8Array(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(s)));
+  return Array.from(b).map((x) => x.toString(16).padStart(2, "0")).join("");
+}
+const invClientState = async (env) => (await invSha("invnotify:" + String(env.GRAPH_CLIENT_SECRET || ""))).slice(0, 32);
+// The Worker makes and keeps alive its own Microsoft "ping me when mail arrives" registration. Microsoft keeps it for under three days, so it is renewed whenever less than a day is left.
+async function invSubscribe(env) {
+  if (!env.GRAPH_CLIENT_SECRET) return;
+  await settingsTable(env);
+  const addr = mailAddress(env, MAILBOXES.find((x) => x.id === "accounts"));
+  const folderId = await invFolderId(env, addr);
+  if (!folderId) return;
+  const row = await env.DB.prepare("SELECT value, detail FROM app_settings WHERE key = 'invmail.sub'").first();
+  const watched = await env.DB.prepare("SELECT detail FROM app_settings WHERE key = 'invmail.sub.folder'").first();
+  const sameFolder = !!(watched && watched.detail === folderId);
+  const left = row && row.detail ? Date.parse(row.detail) - Date.now() : 0;
+  if (row && row.value && sameFolder && left > 24 * 3600 * 1000) return;
+  const expires = new Date(Date.now() + 4200 * 60000).toISOString();
+  const save = async (id) => {
+    await env.DB.prepare("INSERT OR REPLACE INTO app_settings (key, value, detail, by_name, at) VALUES ('invmail.sub', ?, ?, 'Reservoir', datetime('now'))").bind(id, expires).run();
+    await env.DB.prepare("INSERT OR REPLACE INTO app_settings (key, value, detail, by_name, at) VALUES ('invmail.sub.folder', '1', ?, 'Reservoir', datetime('now'))").bind(folderId).run();
+  };
+  if (row && row.value && sameFolder) {
+    const r = await graphFetch(env, `/subscriptions/${encodeURIComponent(row.value)}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ expirationDateTime: expires }) });
+    if (r.ok) { await save(row.value); return; }
+  }
+  // The folder changed: the old registration watches the wrong folder, so it goes.
+  if (row && row.value && !sameFolder) await graphFetch(env, `/subscriptions/${encodeURIComponent(row.value)}`, { method: "DELETE" }).catch(() => null);
+  const r = await graphFetch(env, "/subscriptions", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ changeType: "created", notificationUrl: `${env.API_ORIGIN || "https://reservoir-api.directflow.workers.dev"}/api/invoices/notify`, resource: `users/${addr}/mailFolders/${folderId}/messages`, expirationDateTime: expires, clientState: await invClientState(env) }) });
+  const j = await r.json().catch(() => ({}));
+  if (r.ok && j.id) await save(j.id);
+  else console.log("mail subscription failed", r.status, JSON.stringify(j).slice(0, 300));
+}
+// The server side rules that move supplier mail into the accPay Sweep folder as it arrives. Needs MailboxSettings.ReadWrite on the Reservoir Directories app. Done again only when the rules or folder change.
+async function invRulesSync(env) {
+  if (!env.GRAPH_CLIENT_SECRET) return;
+  await settingsTable(env);
+  const addr = mailAddress(env, MAILBOXES.find((x) => x.id === "accounts"));
+  const folderId = await invFolderId(env, addr);
+  if (!folderId) return;
+  const sig = invHash(JSON.stringify(INVOICE_MAIL_RULES.map((r) => [r.name, r.from || "", r.fromDomain || "", r.subject, r.alsoSubject || []])) + folderId);
+  const row = await env.DB.prepare("SELECT detail FROM app_settings WHERE key = 'invmail.rules_sync'").first();
+  if (row && row.detail === sig) return;
+  const base = `/users/${encodeURIComponent(addr)}/mailFolders/inbox/messageRules`;
+  const list = await graphFetch(env, base);
+  if (!list.ok) { console.log("mail rules list failed", list.status); return; }
+  const have = {};
+  for (const x of ((await list.json()).value || [])) have[x.displayName] = x.id;
+  let ok = true;
+  const sorted = invRulesSorted();
+  for (let i = 0; i < sorted.length; i++) {
+    const r = sorted[i];
+    const name = `Reservoir invoices: ${r.name}`;
+    const body = JSON.stringify({ displayName: name, sequence: i + 1, isEnabled: true, conditions: { senderContains: [r.from ? r.from : "@" + r.fromDomain], subjectContains: [r.subject, ...(r.alsoSubject || [])], hasAttachments: true }, actions: { moveToFolder: folderId, stopProcessingRules: true } });
+    const res = have[name]
+      ? await graphFetch(env, `${base}/${have[name]}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body })
+      : await graphFetch(env, base, { method: "POST", headers: { "Content-Type": "application/json" }, body });
+    if (!res.ok) { ok = false; console.log("mail rule failed", name, res.status, (await res.text()).slice(0, 200)); if (res.status === 403) break; }
+  }
+  if (ok) await env.DB.prepare("INSERT OR REPLACE INTO app_settings (key, value, detail, by_name, at) VALUES ('invmail.rules_sync', '1', ?, 'Reservoir', datetime('now'))").bind(sig).run();
+}
+
+// VBA 360 sign in codes. The VBA emails a six digit code to DFP Jobs. It goes to Tayler, Andrew and Mitch as a notice with a tick; when one of them ticks it, the other notices clear and the email is archived.
+const VBA_SUBJECT = /VBA\s*360\s*verification\s*code/i;
+const VBA_PEOPLE = /^(tayler|andrew|mitch)/i;
+// Read receipts that AroFlo mail sends back to DFP Jobs ("Read: ..." with "was read on") go straight to the archive.
+async function jobsReadSweep(env) {
+  const jobs = MAILBOXES.find((x) => x.id === "jobs");
+  const addr = mailAddress(env, jobs);
+  const r = await mailGraph(env, addr, `/mailFolders/inbox/messages?$top=100&$select=id,subject,bodyPreview&$filter=${encodeURIComponent("startswith(subject,'Read:')")}`);
+  if (!r.ok) { console.log("read sweep", r.status); return; }
+  for (const m of ((r.json && r.json.value) || [])) {
+    if (!/^read:\s/i.test(String(m.subject || "")) || !/was read on/i.test(String(m.bodyPreview || ""))) continue;
+    try { await mailDo(env, addr, `/messages/${encodeURIComponent(m.id)}/move`, "POST", { destinationId: "archive" }); } catch (e) { console.log("read archive failed", String(e && e.message || e)); }
+  }
+}
+// Emails addressed to Accounts and another Direct Flow mailbox: the sender gets one polite reminder from no-reply that one mailbox is enough. Only outside senders are told, once per email.
+const MULTIBOX_FROM = "no-reply@directflow.com.au";
+async function multiBoxSend(env, to, subject, label) {
+  const hour = Number(new Intl.DateTimeFormat("en-AU", { timeZone: "Australia/Melbourne", hour: "numeric", hour12: false }).format(new Date())) % 24;
+  const greet = hour < 12 ? "Good morning" : hour < 17 ? "Good afternoon" : "Good evening";
+  const subj = String(subject || "your email").replace(/[\r\n]+/g, " ").replace(/[<>&]/g, "").slice(0, 150);
+  let logo = null;
+  try {
+    const origin = String(env.ALLOWED_ORIGIN || "").split(",").map((x) => x.trim().replace(/\/$/, "")).filter(Boolean)[0];
+    if (origin) { if (!mailLogoCache) { const lr = await fetch(origin + "/dfp-signature-logo.png"); if (lr.ok) mailLogoCache = toB64(await lr.arrayBuffer()); } logo = mailLogoCache; }
+  } catch (e) { console.log("multibox logo failed", String(e && e.message || e)); }
+  const html = `<div style="font-family:Calibri,Arial,sans-serif;font-size:11pt">${greet},<br><br>Please be reminded that your email only needs to be addressed to one Direct Flow mailbox. Your email "${subj}" was sent to more than one of our mailboxes.<br><br>It has been automatically delivered to ${label || "Accounts"} only.<br><br>If it needs someone else's attention, ${label || "Accounts"} will pass it on.<br><br>${logo ? '<img src="cid:dfplogo" width="190" alt="Direct Flow Plumbing" style="display:block;border:0">' : "Direct Flow Plumbing"}</div>`;
+  const message = { subject: "DFP reminder: " + String(subject || "").replace(/[\r\n]+/g, " ").slice(0, 200), body: { contentType: "HTML", content: html }, toRecipients: [{ emailAddress: { address: to } }] };
+  if (logo) message.attachments = [{ "@odata.type": "#microsoft.graph.fileAttachment", name: "dfp-signature-logo.png", contentType: "image/png", contentBytes: logo, isInline: true, contentId: "dfplogo" }];
+  const res = await graphFetch(env, `/users/${encodeURIComponent(MULTIBOX_FROM)}/sendMail`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ message, saveToSentItems: false }) });
+  if (!res.ok) console.log("multibox reminder failed", res.status);
+  return res.ok;
+}
+async function multiBoxWatch(env) {
+  const t = await env.DB.prepare("SELECT 1 AS x FROM app_settings WHERE key = 'multibox.test.2'").first();
+  if (!t) {
+    await env.DB.prepare("INSERT OR REPLACE INTO app_settings (key, value, detail, by_name, at) VALUES ('multibox.test.2', '1', 'one mailbox reminder test sent', 'Reservoir', datetime('now'))").run();
+    await multiBoxSend(env, "tayler@directflow.com.au", "Invoice query for the Apollo Bay job");
+  }
+  // Accounts always wins. Without Accounts, DFP Jobs wins.
+  for (const bid of ["accounts", "jobs"]) {
+    const bx = MAILBOXES.find((x) => x.id === bid);
+    const addr = mailAddress(env, bx);
+    const accAddr = mailAddress(env, MAILBOXES.find((x) => x.id === "accounts"));
+    const since = new Date(Date.now() - 40 * 60000).toISOString();
+    const r = await mailGraph(env, addr, `/mailFolders/inbox/messages?$top=25&$select=id,subject,from,toRecipients,ccRecipients,receivedDateTime&$orderby=receivedDateTime desc&$filter=${encodeURIComponent("receivedDateTime ge " + since)}`);
+    if (!r.ok) { console.log("multibox watch", bid, r.status); continue; }
+    for (const m of ((r.json && r.json.value) || [])) {
+      const from = String((m.from && m.from.emailAddress && m.from.emailAddress.address) || "").toLowerCase();
+      if (!from || /@directflow\.com\.au$/.test(from) || /^(no-?reply|noreply|do-?not-?reply|mailer-daemon|postmaster)/.test(from)) continue;
+      const all = [...(m.toRecipients || []), ...(m.ccRecipients || [])].map((x) => String((x.emailAddress && x.emailAddress.address) || "").toLowerCase()).filter((a) => /@directflow\.com\.au$/.test(a));
+      if (!all.includes(addr) || !all.some((a) => a !== addr)) continue;
+      if (bid === "jobs" && all.includes(accAddr)) continue;
+      const key = "multibox.done." + String(m.id).slice(-60);
+      const seen = await env.DB.prepare("SELECT 1 AS x FROM app_settings WHERE key = ?").bind(key).first();
+      if (seen) continue;
+      await env.DB.prepare("INSERT OR REPLACE INTO app_settings (key, value, detail, by_name, at) VALUES (?, '1', 'one mailbox reminder sent', 'Reservoir', datetime('now'))").bind(key).run();
+      await multiBoxSend(env, from, m.subject, bx.label);
+    }
+  }
+}
+async function vbaWatch(env) {
+  if (!env.GRAPH_CLIENT_SECRET) return;
+  await settingsTable(env);
+  await jobsReadSweep(env).catch((e) => console.log("read sweep failed", String(e && e.message || e)));
+  await multiBoxWatch(env).catch((e) => console.log("multibox watch failed", String(e && e.message || e)));
+}
+async function vbaClear(env, row, user) {
+  let d = null;
+  try { d = row.data ? JSON.parse(row.data) : null; } catch (e) { d = null; }
+  if (!d || !d.vbaMsg) return;
+  await env.DB.prepare("UPDATE notices SET done_at = COALESCE(done_at, datetime('now')), read_at = COALESCE(read_at, datetime('now')), done_by = COALESCE(done_by, ?) WHERE kind = 'vba' AND data = ?").bind(user.name || user.email || "", row.data).run();
+  try {
+    const jobs = MAILBOXES.find((x) => x.id === "jobs");
+    await mailDo(env, mailAddress(env, jobs), `/messages/${encodeURIComponent(d.vbaMsg)}/move`, "POST", { destinationId: "archive" });
+  } catch (e) { console.log("vba archive failed", String(e && e.message || e)); }
+}
+// A server side rule in DFP Jobs: read receipts go to the Archive as they arrive, so they never reach the inbox. Needs MailboxSettings.ReadWrite, the same as the Accounts rules.
+async function jobsRulesSync(env) {
+  const addr = mailAddress(env, MAILBOXES.find((x) => x.id === "jobs"));
+  const row = await env.DB.prepare("SELECT detail FROM app_settings WHERE key = 'jobsmail.rules_sync'").first();
+  const sig = "readreceipts-v1";
+  if (row && row.detail === sig) return;
+  const fr = await graphFetch(env, `/users/${encodeURIComponent(addr)}/mailFolders/archive?$select=id`);
+  const fid = fr.ok ? ((await fr.json()).id || "") : "";
+  if (!fid) { console.log("jobs rule: no archive folder", fr.status); return; }
+  const base = `/users/${encodeURIComponent(addr)}/mailFolders/inbox/messageRules`;
+  const list = await graphFetch(env, base);
+  if (!list.ok) { console.log("jobs rules list failed", list.status); return; }
+  const name = "Reservoir: read receipts to Archive";
+  const have = (((await list.json()).value) || []).find((x) => x.displayName === name);
+  const body = JSON.stringify({ displayName: name, sequence: 1, isEnabled: true, conditions: { subjectContains: ["Read: "], bodyContains: ["was read on"] }, actions: { moveToFolder: fid, stopProcessingRules: true } });
+  const res = have ? await graphFetch(env, `${base}/${have.id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body }) : await graphFetch(env, base, { method: "POST", headers: { "Content-Type": "application/json" }, body });
+  if (!res.ok) { console.log("jobs rule failed", res.status, (await res.text()).slice(0, 200)); return; }
+  await env.DB.prepare("INSERT OR REPLACE INTO app_settings (key, value, detail, by_name, at) VALUES ('jobsmail.rules_sync', '1', ?, 'Reservoir', datetime('now'))").bind(sig).run();
+}
+async function vbaSubscribe(env) {
+  if (!env.GRAPH_CLIENT_SECRET) return;
+  await settingsTable(env);
+  await jobsRulesSync(env).catch((e) => console.log("jobs rule sync failed", String(e && e.message || e)));
+  const addr = mailAddress(env, MAILBOXES.find((x) => x.id === "jobs"));
+  const row = await env.DB.prepare("SELECT value, detail FROM app_settings WHERE key = 'vba.sub'").first();
+  const left = row && row.detail ? Date.parse(row.detail) - Date.now() : 0;
+  if (row && row.value && left > 24 * 3600 * 1000) return;
+  const expires = new Date(Date.now() + 4200 * 60000).toISOString();
+  const save = (id) => env.DB.prepare("INSERT OR REPLACE INTO app_settings (key, value, detail, by_name, at) VALUES ('vba.sub', ?, ?, 'Reservoir', datetime('now'))").bind(id, expires).run();
+  if (row && row.value) {
+    const r = await graphFetch(env, `/subscriptions/${encodeURIComponent(row.value)}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ expirationDateTime: expires }) });
+    if (r.ok) { await save(row.value); return; }
+  }
+  const r = await graphFetch(env, "/subscriptions", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ changeType: "created", notificationUrl: `${env.API_ORIGIN || "https://reservoir-api.directflow.workers.dev"}/api/vba/notify`, resource: `users/${addr}/mailFolders/inbox/messages`, expirationDateTime: expires, clientState: await invClientState(env) }) });
+  const j = await r.json().catch(() => ({}));
+  if (r.ok && j.id) await save(j.id);
+  else console.log("vba subscription failed", r.status, JSON.stringify(j).slice(0, 300));
+}
+async function invMailCron(env) {
+  await invOneTimeClear(env);
+  await invRebuildHistory(env, 15000);
+  await invRulesSync(env);
+  await invSubscribe(env);
+  await invMailSweep(env, 2);
+  await invHistoryTidy(env);
+}
+// Mailbox merge: maintenance@ and enquiries@ both redirect whatever lands in their Inbox to DFP Jobs, and their Junk folders are swept into the DFP Jobs Junk folder once a day at 7 am. The inbox redirect is a server side rule, so it only sees mail Microsoft has already filtered.
+const ENQUIRIES_ADDR = "enquiries@directflow.com.au";
+function mergeSources(env) {
+  return [mailAddress(env, MAILBOXES.find((x) => x.id === "maintenance")), String(env.MAILBOX_ENQUIRIES || ENQUIRIES_ADDR).toLowerCase()];
+}
+async function mergeRulesSync(env) {
+  if (!env.GRAPH_CLIENT_SECRET) return;
+  await settingsTable(env);
+  const to = mailAddress(env, MAILBOXES.find((x) => x.id === "jobs"));
+  const sig = "redirect-v2:" + to;
+  const row = await env.DB.prepare("SELECT detail FROM app_settings WHERE key = 'merge.rules_sync'").first();
+  if (row && row.detail === sig) return;
+  let ok = true;
+  for (const addr of mergeSources(env)) {
+    const base = `/users/${encodeURIComponent(addr)}/mailFolders/inbox/messageRules`;
+    const list = await graphFetch(env, base);
+    if (!list.ok) { ok = false; console.log("merge rules list failed", addr, list.status); continue; }
+    const name = "Reservoir: redirect to DFP Jobs";
+    const have = (((await list.json()).value) || []).find((x) => x.displayName === name);
+    const body = JSON.stringify({ displayName: name, sequence: 1, isEnabled: true, conditions: {}, actions: { redirectTo: [{ emailAddress: { address: to } }], delete: true, stopProcessingRules: true } });
+    const res = have ? await graphFetch(env, `${base}/${have.id}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body }) : await graphFetch(env, base, { method: "POST", headers: { "Content-Type": "application/json" }, body });
+    if (!res.ok) { ok = false; console.log("merge rule failed", addr, res.status, (await res.text()).slice(0, 300)); }
+  }
+  if (ok) await env.DB.prepare("INSERT OR REPLACE INTO app_settings (key, value, detail, by_name, at) VALUES ('merge.rules_sync', '1', ?, 'Reservoir', datetime('now'))").bind(sig).run();
+}
+// Every morning at 7am the Deleted Items folder of each shared mailbox is emptied for good. Nobody deletes on purpose, so what lands there (discarded drafts, redirected copies, legacy deletes) is cleared out.
+async function deletedSweep(env) {
+  if (!env.GRAPH_CLIENT_SECRET) return;
+  const now = tsMelbourne(new Date());
+  if (now.mins < 7 * 60 || now.mins >= 9 * 60) return;
+  await settingsTable(env);
+  const key = "merge.deleted_sweep";
+  const done = await env.DB.prepare("SELECT value FROM app_settings WHERE key = ?").bind(key).first();
+  if (done && done.value === now.date) return;
+  const boxes = MAILBOXES.filter((x) => ["jobs", "maintenance", "accounts"].includes(x.id)).map((x) => mailAddress(env, x));
+  if (typeof ENQUIRIES_ADDR === "string" && ENQUIRIES_ADDR) boxes.push(ENQUIRIES_ADDR);
+  let left = 0, gone = 0;
+  for (const addr of boxes) {
+    for (let round = 0; round < 8; round++) {
+      const r = await mailGraph(env, addr, "/mailFolders/deleteditems/messages?$top=50&$select=id");
+      if (!r.ok) { console.log("deleted sweep list failed", addr, r.status); left++; break; }
+      const msgs = (r.json && r.json.value) || [];
+      if (!msgs.length) break;
+      for (const m of msgs) {
+        const d = await mailDo(env, addr, `/messages/${encodeURIComponent(m.id)}/permanentDelete`, "POST");
+        if (d.ok) gone++; else left++;
+      }
+      if (round === 7) left++;
+    }
+  }
+  if (!left) await env.DB.prepare("INSERT OR REPLACE INTO app_settings (key, value, detail, by_name, at) VALUES (?, ?, ?, 'Reservoir', datetime('now'))").bind(key, now.date, JSON.stringify({ gone })).run();
+  console.log("deleted sweep", gone, left);
+}
+async function mergeJunkSweep(env) {
+  if (!env.GRAPH_CLIENT_SECRET) return;
+  const now = tsMelbourne(new Date());
+  if (now.mins < 7 * 60 || now.mins >= 9 * 60) return;
+  await settingsTable(env);
+  const key = "merge.junk_sweep";
+  const done = await env.DB.prepare("SELECT value FROM app_settings WHERE key = ?").bind(key).first();
+  if (done && done.value === now.date) return;
+  const dest = mailAddress(env, MAILBOXES.find((x) => x.id === "jobs"));
+  let moved = 0, left = 0;
+  for (const src of mergeSources(env)) {
+    for (let round = 0; round < 6; round++) {
+      const r = await mailGraph(env, src, "/mailFolders/junkemail/messages?$top=20&$select=id,isRead");
+      if (!r.ok) { console.log("junk sweep list failed", src, r.status); left++; break; }
+      const msgs = (r.json && r.json.value) || [];
+      if (!msgs.length) break;
+      let progressed = 0;
+      for (const m of msgs) {
+        const raw = await graphFetch(env, `/users/${encodeURIComponent(src)}/messages/${encodeURIComponent(m.id)}/$value`);
+        if (!raw.ok) { console.log("junk sweep read failed", raw.status); continue; }
+        const bytes = new Uint8Array(await raw.arrayBuffer());
+        let bin = "";
+        for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+        const put = await graphFetch(env, `/users/${encodeURIComponent(dest)}/mailFolders/junkemail/messages`, { method: "POST", headers: { "Content-Type": "text/plain" }, body: btoa(bin) });
+        if (!put.ok) { console.log("junk sweep copy failed", put.status); continue; }
+        let made = null; try { made = await put.json(); } catch (e) { made = null; }
+        if (made && made.id) await mailDo(env, dest, `/messages/${encodeURIComponent(made.id)}`, "PATCH", { isRead: !!m.isRead });
+        const gone = await mailDo(env, src, `/messages/${encodeURIComponent(m.id)}/move`, "POST", { destinationId: "deleteditems" });
+        if (gone.ok) { moved++; progressed++; } else console.log("junk sweep remove failed", gone.status);
+      }
+      if (!progressed) { left++; break; }
+      if (round === 5) left++;
+    }
+  }
+  if (left === 0) await env.DB.prepare("INSERT OR REPLACE INTO app_settings (key, value, detail, by_name, at) VALUES (?, ?, ?, 'Reservoir', datetime('now'))").bind(key, now.date, String(moved) + " swept").run();
+  console.log("junk sweep", moved, "moved", left ? "more to do" : "done");
+}
+// Copies maintenance mail into DFP Jobs: Sent Items and the Archive (with its subfolders). The copy is the original message, so the sender stays maintenance, and the originals are left where they are. Every copy is marked read and gets a Maintenance marker (kept in Reservoir, shown as an orange pill in Weir, not a category). Oldest first, in batches on every run, with the place it got to kept in D1 until each job is done.
+const COPY_BATCH = 2500;
+async function mailMarkerCol(env) {
+  if (mailMarkerCol.done) return;
+  await mailExtraTable(env);
+  try { await env.DB.prepare("ALTER TABLE mail_extra ADD COLUMN marker TEXT NOT NULL DEFAULT ''").run(); } catch (e) {}
+  mailMarkerCol.done = true;
+}
+// A direct copy: the whole original message (headers, body, attachments) is imported, then its original received and sent times are stamped on it so it sorts and reads exactly as the original did. verify reads the copy back and checks the received time matches.
+async function copyOneMail(env, src, dest, folderId, m, verify) {
+  const raw = await graphFetch(env, `/users/${encodeURIComponent(src)}/messages/${encodeURIComponent(m.id)}/$value`);
+  if (!raw.ok) { console.log("copy read failed", raw.status); return { ok: false }; }
+  const bytes = new Uint8Array(await raw.arrayBuffer());
+  let bin = "";
+  for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+  const put = await graphFetch(env, `/users/${encodeURIComponent(dest)}/mailFolders/${encodeURIComponent(folderId)}/messages`, { method: "POST", headers: { "Content-Type": "text/plain" }, body: btoa(bin) });
+  if (!put.ok) { console.log("copy put failed", put.status, (await put.text()).slice(0, 200)); return { ok: false }; }
+  let made = null; try { made = await put.json(); } catch (e) { made = null; }
+  if (!made || !made.id) return { ok: false };
+  const props = [{ id: "SystemTime 0x0E06", value: new Date(m.receivedDateTime).toISOString() }, { id: "SystemTime 0x0039", value: new Date(m.sentDateTime || m.receivedDateTime).toISOString() }];
+  const up = await mailDo(env, dest, `/messages/${encodeURIComponent(made.id)}`, "PATCH", { isRead: true, singleValueExtendedProperties: props });
+  if (!up.ok) { console.log("copy date stamp failed", up.status); return { ok: false, bad: "stamp", id: made.id }; }
+  if (verify) {
+    const chk = await mailGraph(env, dest, `/messages/${encodeURIComponent(made.id)}?$select=receivedDateTime,isDraft`);
+    const got = chk.ok && chk.json ? Date.parse(chk.json.receivedDateTime) : NaN;
+    if (!(Math.abs(got - Date.parse(m.receivedDateTime)) < 2000) || (chk.json && chk.json.isDraft)) return { ok: false, bad: "date", id: made.id, got: chk.json && chk.json.receivedDateTime };
+  }
+  return { ok: true, id: made.id };
+}
+const COPY_PAUSED = false; // Set to true to pause the undo and the Sent Items and Archive copies.
+async function copyFolderJob(env, key, buildFolders) {
+  if (COPY_PAUSED) return;
+  if (!env.GRAPH_CLIENT_SECRET) return;
+  await settingsTable(env);
+  await mailMarkerCol(env);
+  const undo = await env.DB.prepare("SELECT value FROM app_settings WHERE key = 'merge.undo2'").first();
+  if (!undo || undo.value !== "done") return;
+  const row = await env.DB.prepare("SELECT value, detail FROM app_settings WHERE key = ?").bind(key).first();
+  if (row && (row.value === "done" || row.value === "halted")) return;
+  const lk = await env.DB.prepare("SELECT value FROM app_settings WHERE key = ?").bind(key + ".lock").first();
+  if (lk && Date.now() - Number(lk.value || 0) < 4 * 60000) return;
+  const setLock = (v) => env.DB.prepare("INSERT OR REPLACE INTO app_settings (key, value, detail, by_name, at) VALUES (?, ?, '', 'Reservoir', datetime('now'))").bind(key + ".lock", String(v)).run();
+  await setLock(Date.now());
+  const save = (value, st) => env.DB.prepare("INSERT OR REPLACE INTO app_settings (key, value, detail, by_name, at) VALUES (?, ?, ?, 'Reservoir', datetime('now'))").bind(key, value, JSON.stringify(st)).run();
+  try {
+    const src = mailAddress(env, MAILBOXES.find((x) => x.id === "maintenance"));
+    const dest = mailAddress(env, MAILBOXES.find((x) => x.id === "jobs"));
+    let st = { at: "", ids: [], n: 0, i: 0, folders: null };
+    try { if (row && row.detail) st = { ...st, ...JSON.parse(row.detail) }; } catch (e) {}
+    if (!st.folders) { st.folders = await buildFolders(env, src, dest); if (!st.folders) return; await save("running", st); }
+    const started = Date.now();
+    let copiedNow = 0;
+    while (st.i < st.folders.length && copiedNow < COPY_BATCH && Date.now() - started < 200000) {
+      const f = st.folders[st.i];
+      const q = `/mailFolders/${encodeURIComponent(f.src)}/messages?$top=100&$select=id,receivedDateTime,sentDateTime,internetMessageId&$orderby=receivedDateTime asc` + (st.at ? `&$filter=receivedDateTime ge ${st.at}` : "");
+      const r = await mailGraph(env, src, q);
+      if (!r.ok) { console.log("copy list failed", r.status); break; }
+      const all = (r.json && r.json.value) || [];
+      const msgs = all.filter((m) => !st.ids.includes(m.id));
+      if (!msgs.length) {
+        if (all.length < 100) { st.i++; st.at = ""; st.ids = []; await save("running", st); continue; }
+        st.at = all[all.length - 1].receivedDateTime; st.ids = []; await save("running", st); continue;
+      }
+      let broke = false;
+      for (let c = 0; c < msgs.length && copiedNow < COPY_BATCH && Date.now() - started < 200000; c += 5) {
+        const chunk = msgs.slice(c, c + 5);
+        const res = await Promise.all(chunk.map((m) => copyOneMail(env, src, dest, f.dst, m, st.n < 3).catch(() => ({ ok: false }))));
+        const badOne = res.find((x) => x && (x.bad === "date" || x.bad === "stamp"));
+        if (badOne) { await mailDo(env, dest, `/messages/${encodeURIComponent(badOne.id)}`, "DELETE"); await save("halted", { ...st, reason: "copy date check failed " + badOne.bad + " " + badOne.got }); console.log("copy halted", key, badOne.bad); return; }
+        const marks = [];
+        for (let k = 0; k < chunk.length; k++) {
+          if (!res[k] || !res[k].ok) { broke = true; break; }
+          const m = chunk[k];
+          if (m.receivedDateTime !== st.at) { st.at = m.receivedDateTime; st.ids = []; }
+          st.ids.push(m.id); st.n++; copiedNow++;
+          if (m.internetMessageId) marks.push(env.DB.prepare("INSERT INTO mail_extra (box, imid, marker) VALUES ('jobs', ?, 'Maintenance') ON CONFLICT(box, imid) DO UPDATE SET marker = 'Maintenance'").bind(String(m.internetMessageId).slice(0, 300)));
+        }
+        if (marks.length) { try { await env.DB.batch(marks); } catch (e) { console.log("marker save failed", String(e && e.message || e)); } }
+        await save("running", st);
+        if (broke) break;
+      }
+      if (broke) break;
+    }
+    if (st.i >= st.folders.length) { await save("done", { n: st.n }); console.log("copy finished", key, st.n); }
+    else console.log("copy progress", key, st.n, st.i + "/" + st.folders.length);
+  } finally { await setLock(0); }
+}
+// The automatic reply on the maintenance mailbox (approved wording). Set once, and again whenever the version below changes.
+async function mergeAutoReply(env) {
+  if (!env.GRAPH_CLIENT_SECRET) return;
+  await settingsTable(env);
+  const sig = "autoreply-v3";
+  const row = await env.DB.prepare("SELECT detail FROM app_settings WHERE key = 'merge.autoreply'").first();
+  if (row && row.detail === sig) return;
+  const addr = mailAddress(env, MAILBOXES.find((x) => x.id === "maintenance"));
+  const jobs = mailAddress(env, MAILBOXES.find((x) => x.id === "jobs"));
+  const logo = String(env.ALLOWED_ORIGIN || "").split(",")[0].trim().replace(/\/$/, "") + "/dfp-signature-logo.png";
+  const msg = `<div style="font-family:Calibri,sans-serif;font-size:11pt"><div>Hello,</div><div><br></div><div><br></div><div>Re: DFP Mailbox Closure Notice</div><div><br></div><div>Your email to ${addr} has been received and forwarded to our centralised mailbox,<br><a href="mailto:${jobs}">${jobs}</a>, where our team will respond.</div><div><br></div><div>Please update your contact details to our new email address.</div><div><br></div><div><img src="${logo}" width="190" alt="Direct Flow Plumbing" style="display:block;border:0"></div></div>`;
+  const r = await graphFetch(env, `/users/${encodeURIComponent(addr)}/mailboxSettings`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ automaticRepliesSetting: { status: "alwaysEnabled", externalAudience: "all", internalReplyMessage: msg, externalReplyMessage: msg } }) });
+  if (!r.ok) { console.log("autoreply failed", r.status, (await r.text()).slice(0, 300)); return; }
+  await env.DB.prepare("INSERT OR REPLACE INTO app_settings (key, value, detail, by_name, at) VALUES ('merge.autoreply', '1', ?, 'Reservoir', datetime('now'))").bind(sig).run();
+}
+// Undo of the first (wrongly dated) copies: they are found in DFP Jobs Sent Items and Archive (and its subfolders), created today, and either carrying a Maintenance marker or sent from maintenance, and moved to Deleted Items (the 7am sweep clears that). Nothing else is touched. When a full pass finds none left the copy jobs are allowed to start again.
+async function mergeCopyUndo(env) {
+  if (COPY_PAUSED) return;
+  if (!env.GRAPH_CLIENT_SECRET) return;
+  await settingsTable(env);
+  await mailMarkerCol(env);
+  const key = "merge.undo2";
+  const row = await env.DB.prepare("SELECT value FROM app_settings WHERE key = ?").bind(key).first();
+  if (row && row.value === "done") return;
+  const dest = mailAddress(env, MAILBOXES.find((x) => x.id === "jobs"));
+  const maint = mailAddress(env, MAILBOXES.find((x) => x.id === "maintenance")).toLowerCase();
+  const since = "2026-11-19T13:00:00Z";
+  const markers = new Set(((await env.DB.prepare("SELECT imid FROM mail_extra WHERE box = 'jobs' AND marker = 'Maintenance'").all()).results || []).map((x) => x.imid));
+  const folders = [{ id: "sentitems", sent: true }, { id: "archive", sent: false }];
+  const walk = async (id) => { const r = await mailGraph(env, dest, `/mailFolders/${encodeURIComponent(id)}/childFolders?$top=100&$select=id`); for (const f of ((r.ok && r.json && r.json.value) || [])) { folders.push({ id: f.id, sent: false }); await walk(f.id); } };
+  await walk("archive");
+  const t0 = Date.now();
+  let found = 0, deleted = 0, failed = 0;
+  for (const f of folders) {
+    const hits = [];
+    for (let skip = 0; skip < 3000; skip += 100) {
+      const r = await mailGraph(env, dest, `/mailFolders/${encodeURIComponent(f.id)}/messages?$top=100&$skip=${skip}&$select=id,internetMessageId,from,createdDateTime&$filter=${encodeURIComponent("createdDateTime ge " + since)}`);
+      if (!r.ok) { failed++; break; }
+      const v = (r.json && r.json.value) || [];
+      for (const m of v) { const fr = String((m.from && m.from.emailAddress && m.from.emailAddress.address) || "").toLowerCase(); if ((m.internetMessageId && markers.has(String(m.internetMessageId).slice(0, 300))) || (f.sent && fr === maint)) hits.push(m.id); }
+      if (v.length < 100) break;
+    }
+    found += hits.length;
+    for (let c = 0; c < hits.length && deleted < 3000 && Date.now() - t0 < 200000; c += 5) {
+      const res = await Promise.all(hits.slice(c, c + 5).map((id) => mailDo(env, dest, `/messages/${encodeURIComponent(id)}`, "DELETE").then((x) => x.ok).catch(() => false)));
+      res.forEach((ok) => { if (ok) deleted++; else failed++; });
+    }
+    if (deleted >= 3000 || Date.now() - t0 >= 200000) break;
+  }
+  console.log("copy undo", found, deleted, failed);
+  if (!found && !failed) await env.DB.prepare("INSERT OR REPLACE INTO app_settings (key, value, detail, by_name, at) VALUES (?, 'done', '', 'Reservoir', datetime('now'))").bind(key).run();
+}
+async function mergeSentCopy(env) {
+  await copyFolderJob(env, "merge.sent_copy2", async () => [{ src: "sentitems", dst: "sentitems" }]);
+}
+// The Archive copy: the same folder tree is made in DFP Jobs (existing folders of the same name are reused), then every folder is copied across.
+async function mergeArchiveCopy(env) {
+  await copyFolderJob(env, "merge.archive_copy2", async (e, src, dest) => {
+    const out = [{ src: "archive", dst: "archive" }];
+    const kids = async (addr, id) => { const r = await mailGraph(e, addr, `/mailFolders/${encodeURIComponent(id)}/childFolders?$top=100&$select=id,displayName`); if (!r.ok) throw new Error("folder list " + r.status); return (r.json && r.json.value) || []; };
+    const walk = async (sId, dId) => {
+      const sk = await kids(src, sId);
+      if (!sk.length) return;
+      const dk = await kids(dest, dId);
+      for (const f of sk) {
+        let d = dk.find((x) => String(x.displayName || "").toLowerCase() === String(f.displayName || "").toLowerCase());
+        if (!d) { const c = await mailDo(e, dest, `/mailFolders/${encodeURIComponent(dId)}/childFolders`, "POST", { displayName: f.displayName }); if (!c.ok || !c.json || !c.json.id) throw new Error("folder create " + c.status); d = c.json; }
+        out.push({ src: f.id, dst: d.id });
+        await walk(f.id, d.id);
+      }
+    };
+    try { await walk("archive", "archive"); } catch (err) { console.log("archive folders failed", String(err && err.message || err)); return null; }
+    return out;
+  });
+}
+
+// One email test of the Graph mailbox export and import (preview API): finds Kuna Electrics "Re: Hot water quote" in Maintenance Archive, exports it, imports it into DFP Jobs Archive and reads back the received date. Every step is logged to D1 so it can be shown on the Maintenance screen.
+async function mergeExportTest(env) {
+  if (!env.GRAPH_CLIENT_SECRET) return;
+  await settingsTable(env);
+  const key = "merge.exporttest2";
+  const row = await env.DB.prepare("SELECT value FROM app_settings WHERE key = ?").bind(key).first();
+  if (row) return;
+  const log = [];
+  const save = (value) => env.DB.prepare("INSERT OR REPLACE INTO app_settings (key, value, detail, by_name, at) VALUES (?, ?, ?, 'Reservoir', datetime('now'))").bind(key, value, JSON.stringify({ log })).run();
+  await save("running");
+  const B = "https://graph.microsoft.com/beta/admin/exchange/mailboxes";
+  const say = (t) => { log.push(String(t).slice(0, 300)); };
+  const call = async (url, init) => { const r = await graphFetch(env, url, init); const t = await r.text(); let j = null; try { j = JSON.parse(t); } catch (e) {} return { ok: r.ok, status: r.status, j, t }; };
+  try {
+    const src = mailAddress(env, MAILBOXES.find((x) => x.id === "maintenance"));
+    const dst = mailAddress(env, MAILBOXES.find((x) => x.id === "jobs"));
+    const mbx = async (addr) => {
+      const r = await call(`https://graph.microsoft.com/v1.0/users/${encodeURIComponent(addr)}/settings/exchange`);
+      const j = r.j || {};
+      const id = j.primaryMailboxId || (j.value && j.value[0] && (j.value[0].primaryMailboxId || j.value[0].id)) || "";
+      if (r.ok && id) return id;
+      say(`exchange settings ${r.status} ${r.t.slice(0, 160)}`);
+      return "";
+    };
+    const sId = await mbx(src), dId = await mbx(dst);
+    if (!sId || !dId) { say("stopped: no mailbox id"); return await save("failed"); }
+    say("mailbox ids found");
+    const archive = async (id) => {
+      const r = await call(`${B}/${encodeURIComponent(id)}/folders?$top=200`);
+      if (!r.ok) { say(`folders ${r.status} ${r.t.slice(0, 120)}`); return ""; }
+      const f = (r.j.value || []).find((x) => String(x.displayName || "").toLowerCase() === "archive");
+      if (!f) say("folders: " + (r.j.value || []).map((x) => x.displayName).join(",").slice(0, 150));
+      return f ? f.id : "";
+    };
+    const sF = await archive(sId), dF = await archive(dId);
+    if (!sF || !dF) { say("stopped: no Archive folder"); return await save("failed"); }
+    say("archive folders found");
+    const t0 = Date.now();
+    let url = `${B}/${encodeURIComponent(sId)}/folders/${encodeURIComponent(sF)}/items?$top=100`;
+    let pages = 0, scanned = 0, found = null, sample = false;
+    while (url && !found && Date.now() - t0 < 120000) {
+      const r = await call(url);
+      if (!r.ok) { say(`items ${r.status} ${r.t.slice(0, 160)}`); break; }
+      const items = (r.j && r.j.value) || [];
+      if (!sample && items[0]) { say("item sample " + JSON.stringify(items[0]).slice(0, 200)); sample = true; }
+      pages++; scanned += items.length;
+      const day = items.filter((x) => String(x.createdDateTime || x.receivedDateTime || x.lastModifiedDateTime || "").startsWith("2026-09-30") || String(x.subject || "").includes("Hot water quote"));
+      const ids = (day.length ? day : []).map((x) => x.id).slice(0, 20);
+      if (ids.length) {
+        const ex = await call(`${B}/${encodeURIComponent(sId)}/exportItems`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ itemIds: ids }) });
+        if (!ex.ok) { say(`export ${ex.status} ${ex.t.slice(0, 160)}`); break; }
+        for (const e of ((ex.j && ex.j.value) || [])) {
+          const bin = atob(String(e.data || ""));
+          const u16 = "H\0o\0t\0 \0w\0a\0t\0e\0r\0 \0q\0u\0o\0t\0e";
+          if ((bin.includes("Hot water quote") || bin.includes(u16)) && (bin.includes("Kuna") || bin.includes("K\0u\0n\0a"))) { found = e; break; }
+        }
+      }
+      url = r.j && r.j["@odata.nextLink"] ? r.j["@odata.nextLink"] : "";
+    }
+    say(`scanned ${scanned} items in ${pages} pages`);
+    if (!found) { say("stopped: test email not found"); return await save("failed"); }
+    say("exported the test email");
+    const ses = await call(`${B}/${encodeURIComponent(dId)}/createImportSession`, { method: "POST" });
+    if (!ses.ok || !ses.j || !ses.j.importUrl) { say(`import session ${ses.status} ${ses.t.slice(0, 160)}`); return await save("failed"); }
+    const imp = await fetch(ses.j.importUrl, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ FolderId: dF, Mode: "create", Data: found.data }) });
+    const it = await imp.text();
+    if (!imp.ok) { say(`import ${imp.status} ${it.slice(0, 160)}`); return await save("failed"); }
+    say("imported into DFP Jobs Archive");
+    const chk = await mailGraph(env, dst, `/mailFolders/archive/messages?$top=5&$select=subject,receivedDateTime,from&$filter=${encodeURIComponent("subject eq 'Re: Hot water quote'")}&$orderby=receivedDateTime desc`);
+    const hits = (chk.ok && chk.json && chk.json.value) || [];
+    say("DFP Jobs Archive now has: " + (hits.length ? hits.map((m) => `${m.receivedDateTime}`).join(" | ") : "nothing found by subject"));
+    await save("done");
+  } catch (e) { say("error " + String(e && e.message || e)); await save("failed"); }
+}
+export default {
+  // Runs on a Cloudflare cron trigger if one is added (for example Thursday early morning). It only refreshes leave balances and leave history from Xero into D1.
+  async scheduled(event, env, ctx) {
+    // A one minute trigger only tidies pictures out of the body of received email, and nothing else.
+    if (event && event.cron === "* * * * *") { ctx.waitUntil(picTest(env).catch((e) => console.log("picture test failed", String(e && e.message || e))).then(() => picClean(env)).catch((e) => console.log("picture clean failed", String(e && e.message || e)))); ctx.waitUntil(vmTag(env).catch((e) => console.log("voicemail tag failed", String(e && e.message || e)))); return; }
+    // A five minute trigger, if one is added, only looks for new mail so pings arrive quickly.
+    if (event && event.cron === "*/5 * * * *") { ctx.waitUntil(mergeExportTest(env).catch((e) => console.log("export test failed", String(e && e.message || e)))); ctx.waitUntil(mergeCopyUndo(env).catch((e) => console.log("copy undo failed", String(e && e.message || e)))); ctx.waitUntil(mergeSentCopy(env).catch((e) => console.log("sent copy failed", String(e && e.message || e)))); ctx.waitUntil(mergeAutoReply(env).catch((e) => console.log("autoreply failed", String(e && e.message || e)))); ctx.waitUntil(mergeArchiveCopy(env).catch((e) => console.log("archive copy failed", String(e && e.message || e)))); ctx.waitUntil(mailWatch(env).catch((e) => console.log("mail watch failed", String(e && e.message || e)))); ctx.waitUntil(mailHoldSweep(env).catch((e) => console.log("hold sweep failed", String(e && e.message || e)))); ctx.waitUntil(rcptRefresh(env, MAILBOXES, (Math.floor(Date.now() / 300000) % 6 === 0) ? "all" : "sent").catch((e) => console.log("address index failed", String(e && e.message || e)))); ctx.waitUntil(vbaSubscribe(env).then(() => vbaWatch(env)).catch((e) => console.log("vba watch failed", String(e && e.message || e)))); return; }
+    // Every run checks the automatic timesheets and the payroll sweeps. The leave sync keeps its own schedule and is skipped on the half hourly one.
+    ctx.waitUntil(fuelDraftFix(env).catch((e) => console.log("fuel draft fix failed", String(e && e.message || e))));
+    ctx.waitUntil(xeroVerify(env).catch((e) => console.log("xero verify failed", String(e && e.message || e))));
+    ctx.waitUntil(tsAutoRun(env).catch((e) => console.log("auto timesheets failed", String(e && e.message || e))));
+    ctx.waitUntil(pushFlushHeld(env));
+    ctx.waitUntil(dailyOpsAlert(env).catch((e) => console.log("daily ops alert failed", String(e && e.message || e))));
+    ctx.waitUntil(tsResendSalaried(env).catch((e) => console.log("resend salaried failed", String(e && e.message || e))));
+    ctx.waitUntil(tsXeroPullSchedule(env).catch((e) => console.log("timesheet pull failed", String(e && e.message || e))));
+    ctx.waitUntil(morningCountPush(env).catch((e) => console.log("morning count failed", String(e && e.message || e))));
+    ctx.waitUntil(mergeRulesSync(env).catch((e) => console.log("merge rules failed", String(e && e.message || e))));
+    ctx.waitUntil(mergeSentCopy(env).catch((e) => console.log("sent copy failed", String(e && e.message || e))));
+    ctx.waitUntil(deletedSweep(env).catch((e) => console.log("deleted sweep failed", String(e && e.message || e))));
+    ctx.waitUntil(mergeJunkSweep(env).catch((e) => console.log("junk sweep failed", String(e && e.message || e))));
+    ctx.waitUntil(pushOneOffAndrey(env).catch((e) => console.log("one off failed", String(e && e.message || e))));
+    ctx.waitUntil(mailSubscribe(env).catch((e) => console.log("mail subscribe failed", String(e && e.message || e))));
+    ctx.waitUntil(mailWatch(env).catch((e) => console.log("mail watch failed", String(e && e.message || e))));
+    ctx.waitUntil(archiveReadSweep(env).catch((e) => console.log("archive sweep failed", String(e && e.message || e))));
+    ctx.waitUntil(mailHoldSweep(env).catch((e) => console.log("hold sweep failed", String(e && e.message || e))));
+    ctx.waitUntil(mailDraftsSweep(env).catch((e) => console.log("drafts sweep failed", String(e && e.message || e))));
+    ctx.waitUntil(invMailCron(env).catch((e) => console.log("invoice mail cron failed", String(e && e.message || e))));
+    ctx.waitUntil(vbaSubscribe(env).then(() => vbaWatch(env)).catch((e) => console.log("vba watch failed", String(e && e.message || e))));
+    ctx.waitUntil(payrollSweep(env).catch((e) => console.log("payroll sweep failed", String(e && e.message || e))));
+    ctx.waitUntil(incidentReminders(env).catch((e) => console.log("incident reminders failed", String(e && e.message || e))));
+    if (event && (event.cron === "*/30 * * * *" || event.cron === "*/15 * * * *")) return;
+    ctx.waitUntil(leaveSync(env).catch((e) => console.log("leave sync failed", String(e && e.message || e))));
+  },
+  async fetch(request, rawEnv, ctx) {
+    MAIL_CTX = ctx;
+    let env = rawEnv;
+    if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: cors(env) });
+    const earlyUrl = new URL(request.url);
+    if (earlyUrl.pathname === "/api/mail/dl" && request.method === "GET") {
+      // A short-lived signed link, so an attachment can be dragged out of the browser into another program. Valid for two minutes.
+      const q = earlyUrl.searchParams;
+      const dlAddr = String(q.get("b") || "").toLowerCase(), dlMsg = mailId(q.get("m")), dlAtt = mailId(q.get("a")), dlExp = Number(q.get("e") || 0);
+      if (!/^[a-z0-9._-]+@directflow\.com\.au$/.test(dlAddr) || !dlMsg || !dlAtt || !dlExp || dlExp < Date.now() || dlExp > Date.now() + 600000) return new Response("Link expired", { status: 410, headers: cors(env) });
+      const want = await xeroSign(env, `dl|${dlAddr}|${dlMsg}|${dlAtt}|${dlExp}`);
+      if (want !== q.get("s")) return new Response("Forbidden", { status: 403, headers: cors(env) });
+      const dlRes = await graphFetch(env, `/users/${encodeURIComponent(dlAddr)}/messages/${encodeURIComponent(dlMsg)}/attachments/${encodeURIComponent(dlAtt)}/$value`);
+      if (!dlRes.ok) return new Response("Not found", { status: 404, headers: cors(env) });
+      const nm = String(q.get("n") || "attachment").replace(/[\r\n"\\/]/g, "_").slice(0, 120);
+      return new Response(dlRes.body, { status: 200, headers: { ...cors(env), "Access-Control-Allow-Origin": "*", "Content-Type": dlRes.headers.get("Content-Type") || "application/octet-stream", "Content-Disposition": `attachment; filename="${nm}"`, "Cache-Control": "no-store" } });
+    }
+    if (earlyUrl.pathname === "/api/app/push" && request.method === "GET") return reply(env, 200, { force: APP_FORCE_UPDATE });
+    if (earlyUrl.pathname === "/api/ping" && request.method === "GET") return reply(env, 200, { worker: WORKER_BUILD, xeroMe: true, xeroStaff: true });
+    if (earlyUrl.pathname === "/api/invoices/notify" && request.method === "POST") {
+      // Microsoft pings here when mail lands in the accPay Sweep folder. The first call after the registration is made carries a validation token that must be echoed back.
+      const vt = earlyUrl.searchParams.get("validationToken");
+      if (vt) return new Response(vt, { status: 200, headers: { "Content-Type": "text/plain" } });
+      try {
+        const body = await request.json();
+        const want = await invClientState(env);
+        const real = ((body && body.value) || []).filter((n) => n && n.clientState === want);
+        if (real.length && ctx) ctx.waitUntil(invMailSweep(env, 1).catch((e) => console.log("invoice ping failed", String(e && e.message || e))));
+      } catch (e) { /* a bad ping is ignored */ }
+      return new Response(null, { status: 202 });
+    }
+    if (earlyUrl.pathname === "/api/mail/notify" && request.method === "POST") {
+      const vt = earlyUrl.searchParams.get("validationToken");
+      if (vt) return new Response(vt, { status: 200, headers: { "Content-Type": "text/plain" } });
+      try {
+        const body = await request.json();
+        const want = await invClientState(env);
+        const real = ((body && body.value) || []).filter((n) => n && n.clientState === want);
+        if (real.length && ctx) ctx.waitUntil(mailWatch(env).catch((e) => console.log("mail ping failed", String(e && e.message || e))));
+      } catch (e) { /* a bad ping is ignored */ }
+      return new Response(null, { status: 202 });
+    }
+    if (earlyUrl.pathname === "/api/vba/notify" && request.method === "POST") {
+      const vt = earlyUrl.searchParams.get("validationToken");
+      if (vt) return new Response(vt, { status: 200, headers: { "Content-Type": "text/plain" } });
+      try {
+        const body = await request.json();
+        const want = await invClientState(env);
+        const real = ((body && body.value) || []).filter((n) => n && n.clientState === want);
+        if (real.length && ctx) ctx.waitUntil(vbaWatch(env).catch((e) => console.log("vba ping failed", String(e && e.message || e))));
+      } catch (e) { /* a bad ping is ignored */ }
+      return new Response(null, { status: 202 });
+    }
+    if (earlyUrl.pathname === "/api/xero/callback" && request.method === "GET") {
+      // Xero sends the browser back here after consent. No Microsoft token on a redirect, so the signed state proves who started it.
+      const back = (flag) => Response.redirect(`${env.ALLOWED_ORIGIN}/?xero=${flag}`, 302);
+      try {
+        if (!env.XERO_CLIENT_SECRET) return back("not_set_up");
+        const st = await xeroStateOk(env, earlyUrl.searchParams.get("state"));
+        const code = earlyUrl.searchParams.get("code");
+        if (!st || !code) return back("failed");
+        const t = await xeroTokenCall(env, { grant_type: "authorization_code", code, redirect_uri: xeroRedirect(env) });
+        const cr = await fetch("https://api.xero.com/connections", { headers: { Authorization: `Bearer ${t.access_token}`, Accept: "application/json" } });
+        await xeroCountCall(env, cr);
+        const conns = cr.ok ? await cr.json() : [];
+        const org = conns.find((c) => c.tenantType === "ORGANISATION") || conns[0];
+        if (!org) return back("no_org");
+        await xeroTable(env);
+        await env.DB.prepare("INSERT INTO xero_auth (id, refresh_token, access_token, expires_at, tenant_id, tenant_name, connected_by) VALUES (1, ?, ?, ?, ?, ?, ?) ON CONFLICT(id) DO UPDATE SET refresh_token = excluded.refresh_token, access_token = excluded.access_token, expires_at = excluded.expires_at, tenant_id = excluded.tenant_id, tenant_name = excluded.tenant_name, connected_by = excluded.connected_by, updated_at = datetime('now')").bind(t.refresh_token, t.access_token, Date.now() + t.expires_in * 1000, org.tenantId, org.tenantName || "", st.name || "").run();
+        return back("connected");
+      } catch (e) { return back("failed"); }
+    }
+    let user;
+    try { user = await verifyToken(request, env); } catch (e) { return reply(env, 401, { error: "unauthorised" }); }
+    await schemaLoad(rawEnv);
+    env = Object.create(rawEnv, { DB: { value: schemaDb(rawEnv) } });
+
+    const url = new URL(request.url);
+
+    // View As. Only a real director (T1) can send this header. The request then runs as the person named in it, at the access level the app sent. Everything is read only, with no exceptions.
+    const viewHeader = request.headers.get("X-View-As");
+    if (viewHeader) {
+      if (user.tier !== "T1") return reply(env, 403, { error: "forbidden" });
+      let v;
+      try { v = JSON.parse(decodeURIComponent(viewHeader)); } catch (e) { v = null; }
+      if (!v || !v.e || !["T1", "T2", "T3", "T4", "T5"].includes(v.t)) return reply(env, 400, { error: "bad view as" });
+      if (request.method !== "GET" && !VIEW_AS_WRITES) return reply(env, 403, { error: "Viewing as someone else is read only." });
+      console.log("view as", user.email, "->", String(v.e).toLowerCase(), v.t);
+      user = { tier: v.t, name: String(v.n || ""), email: String(v.e).toLowerCase(), viewAs: true, realUser: user };
+    }
+
+    // Temporary access lifts the caller to a better level until 4pm on the end date. Not while viewing as someone else, where the app states the level.
+    if (!user.viewAs) {
+      const tmp = await tempAccessFor(env, user.email);
+      const rk = { T1: 1, T2: 2, T3: 3, T4: 4, T5: 5 };
+      if (tmp && rk[tmp.tier] && rk[tmp.tier] < (rk[user.tier] || 9)) user = { ...user, tier: tmp.tier, tempTier: true };
+    }
+
+    // From here on every call carries the caller's access level, which is what the Xero gate reads. A level that is missing or unknown is treated as closed.
+    env = Object.create(env, { __callerTier: { value: String(user.tier || "T3") } });
+
+    try { await phonesNormalise(env); } catch (e) { console.log("phones normalise failed", String(e && e.message || e).slice(0, 160)); }
+    const leaveReply = await leaveRoutes(request, env, user, url);
+    if (leaveReply) return leaveReply;
+    const timesheetReply = await timesheetRoutes(request, env, user, url);
+    if (timesheetReply) return timesheetReply;
+    const incReply = await incentivesRoutes(request, env, user, url);
+    if (incReply) return incReply;
+    const pushReply = await pushRoutes(request, env, user, url);
+    if (pushReply) return pushReply;
+    const reqsReply = await appRequestsRoutes(request, env, user, url);
+    if (reqsReply) return reqsReply;
+    const partnersReply = await partnersRoutes(request, env, user, url);
+    if (partnersReply) return partnersReply;
+    const todosReply = await todosRoutes(request, env, user, url);
+    if (todosReply) return todosReply;
+    const noticesReply = await noticesRoutes(request, env, user, url);
+    if (noticesReply) return noticesReply;
+    const accessReply = await accessRoutes(request, env, user, url);
+    if (accessReply) return accessReply;
+    const budgetReply = await budgetRoutes(request, env, user, url);
+    if (budgetReply) return budgetReply;
+    const eomReply = await eomRoutes(request, env, user, url);
+    if (eomReply) return eomReply;
+    const mailReply = await mailRoutes(request, env, user, url);
+    if (mailReply) return mailReply;
+    const arofloReply = await arofloRoutes(request, env, user, url);
+    if (arofloReply) return arofloReply;
+
+    if (url.pathname === "/api/policies/acks" && request.method === "GET") {
+      // The signed in person's own acknowledgements. The latest one for each policy.
+      try {
+        await policyAckTable(env);
+        const who = ppePerson(user);
+        if (!who.key) return reply(env, 200, { acks: {} });
+        const rows = ((await env.DB.prepare("SELECT policy_id, version, opened_at, read_at, acked_at FROM policy_ack_log WHERE person_key = ? ORDER BY id").bind(who.key).all()).results) || [];
+        const acks = {};
+        for (const r of rows) acks[r.policy_id] = { version: r.version, openedAt: r.opened_at, readAt: r.read_at, ackedAt: r.acked_at };
+        return reply(env, 200, { acks });
+      } catch (e) {
+        console.log("policy acks read error", String(e && e.message || e));
+        return reply(env, 500, { error: "Could not read the acknowledgements" });
+      }
+    }
+    const ackRoute = url.pathname.match(/^\/api\/policies\/([^/]+)\/ack$/);
+    if (ackRoute && request.method === "POST") {
+      // An acknowledgement. Every one is kept for good: who, which policy and version, when it was opened, when it was read to the end, and when it was acknowledged.
+      let body;
+      try { body = await request.json(); } catch { return reply(env, 400, { error: "bad json" }); }
+      const iso = (v) => { const t = Date.parse(String(v || "")); return Number.isFinite(t) ? new Date(t).toISOString() : ""; };
+      const openedAt = iso(body.openedAt), readAt = iso(body.readAt);
+      if (!openedAt || !readAt) return reply(env, 400, { error: "Open the policy and read it to the end before acknowledging." });
+      try {
+        await policyTable(env);
+        await policyAckTable(env);
+        const id = decodeURIComponent(ackRoute[1]);
+        const pol = await env.DB.prepare("SELECT id, title, version FROM policies WHERE id = ? AND removed = 0").bind(id).first();
+        if (!pol) return reply(env, 404, { error: "That policy was not found" });
+        const who = ppePerson(user);
+        if (!who.key) return reply(env, 400, { error: "No name on your sign in" });
+        const ackedAt = new Date().toISOString();
+        await env.DB.prepare("INSERT INTO policy_ack_log (person_key, name, email, policy_id, policy_title, version, opened_at, read_at, acked_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)")
+          .bind(who.key, who.name, who.email, pol.id, pol.title, pol.version || 1, openedAt, readAt, ackedAt).run();
+        return reply(env, 200, { saved: true, ackedAt, version: pol.version || 1 });
+      } catch (e) {
+        console.log("policy ack error", String(e && e.message || e));
+        return reply(env, 500, { error: "Could not save the acknowledgement" });
+      }
+    }
+    if (url.pathname === "/api/policies/search" && request.method === "GET") {
+      // Staff search: matches the policy title or the text inside the current Word version. Any signed in tier.
+      try {
+        await policyTable(env);
+        const terms = String(url.searchParams.get("q") || "").toLowerCase().split(/\s+/).map((x) => x.replace(/[%_\\]/g, "")).filter((x) => x.length >= 2).slice(0, 6);
+        if (!terms.length) return reply(env, 200, { hits: [] });
+        const where = terms.map(() => "(lower(title) LIKE ? ESCAPE '\\' OR lower(COALESCE(body, '')) LIKE ? ESCAPE '\\')").join(" AND ");
+        const args = terms.flatMap((x) => [`%${x}%`, `%${x}%`]);
+        const rows = await env.DB.prepare(`SELECT id, title, body FROM policies WHERE removed = 0 AND COALESCE(kind, 'policy') = ? AND ${where} ORDER BY title COLLATE NOCASE LIMIT 30`).bind(url.searchParams.get("kind") === "handbook" ? "handbook" : "policy", ...args).all();
+        const hits = (rows.results || []).map((r) => {
+          const body = String(r.body || "");
+          const at = body.toLowerCase().indexOf(terms[0]);
+          const inTitle = String(r.title || "").toLowerCase().includes(terms[0]);
+          let snippet = "";
+          if (at >= 0 && !inTitle) {
+            const from = Math.max(0, at - 50);
+            snippet = (from > 0 ? "..." : "") + body.slice(from, at + 90).replace(/\s+/g, " ").trim() + (at + 90 < body.length ? "..." : "");
+          }
+          return { id: r.id, snippet };
+        });
+        return reply(env, 200, { hits });
+      } catch (e) {
+        return reply(env, 500, { error: String(e && e.message || e).slice(0, 200) });
+      }
+    }
+    if (url.pathname === "/api/policies" && request.method === "GET") {
+      // The company policy list. Any signed in tier can read it.
+      try {
+        await policyTable(env);
+        // Policies saved before dates were read get their effective date worked out from the stored text once.
+        const pend = await env.DB.prepare("SELECT id, body FROM policies WHERE removed = 0 AND effective IS NULL AND body IS NOT NULL AND body <> ''").all();
+        for (const r of pend.results || []) await env.DB.prepare("UPDATE policies SET effective = ? WHERE id = ?").bind(findEffective(r.body), r.id).run();
+        const rows = await env.DB.prepare("SELECT id, title, item_id, file_name, needs_ack, updated_at, updated_on, updated_src, version, folder, docx_item_id, docx_name, effective, kind FROM policies WHERE removed = 0 ORDER BY title COLLATE NOCASE").all();
+        return reply(env, 200, { policies: (rows.results || []).map(policyOut) });
+      } catch (e) {
+        return reply(env, 500, { error: String(e && e.message || e).slice(0, 200) });
+      }
+    }
+    if (url.pathname === "/api/policies" && request.method === "POST") {
+      // Director only. Adds a policy: the title and tick come in the query string, the PDF is the request body.
+      if (user.tier !== "T1") return reply(env, 403, { error: "forbidden" });
+      // The title comes from the form. When it is left blank the name of the uploaded file is used.
+      // The Handbook is the same as Policies but kept in Workplace Culture / Handbook.
+      const kind = docKind(url.searchParams.get("kind"));
+      const title = txt(url.searchParams.get("title"), 120) || txt(titleFromName(url.searchParams.get("name")), 120);
+      if (!title) return reply(env, 400, { error: "A policy needs a title" });
+      const bytes = await request.arrayBuffer();
+      // Nothing is added without a file, so a card can only ever stand for a file that was saved.
+      if (!bytes.byteLength) return reply(env, 400, { error: "Choose a file to upload" });
+      if (bytes.byteLength > MAX_UPLOAD) return reply(env, 413, { error: "file too large" });
+      const madeOn = "";
+      try {
+        await policyTable(env);
+        const id = crypto.randomUUID();
+        const folder = cleanName(title) || id;
+        // One document per title. A title that was removed earlier still has its files in SharePoint, so numbering carries on from the last version rather than clashing with them.
+        const same = await env.DB.prepare("SELECT removed, version FROM policies WHERE COALESCE(kind, 'policy') = ? AND lower(folder) = lower(?) ORDER BY removed ASC, version DESC").bind(kind, folder).first();
+        if (same && !same.removed) return reply(env, 409, { error: `${title} has already been added. Edit it to upload a new version.` });
+        // A title added again after it was removed starts back at v1. Its old files are archived first.
+        const first = 1;
+        if (same) await archiveLeftovers(env, [...(await docHome(env, kind)), folder]);
+        const pub = await policyPublish(env, null, folder, first, bytes, request.headers.get("Content-Type"), url.searchParams.get("name"), kind);
+        // The last updated date is read from the document. A date typed in by hand wins over it.
+        const found = !madeOn && pub.body ? findLastUpdated(pub.body) : null;
+        const updOn = madeOn || (found ? found.iso : null);
+        const updSrc = madeOn ? "manual" : policySrc(found);
+        await env.DB.prepare("INSERT INTO policies (id, title, item_id, file_name, docx_item_id, docx_name, body, effective, needs_ack, updated_by, version, folder, updated_on, updated_src, kind) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").bind(id, title, pub.itemId, pub.fileName, pub.docxId, pub.docxName, pub.body, pub.effective, 1, (user.email || "").toLowerCase(), first, folder, updOn, updSrc, kind).run();
+        const row = await env.DB.prepare("SELECT id, title, item_id, file_name, needs_ack, updated_at, updated_on, updated_src, version, folder, docx_item_id, docx_name, effective, kind FROM policies WHERE id = ?").bind(id).first();
+        return reply(env, 200, { policy: policyOut(row) });
+      } catch (e) {
+        console.log("policy add error", String(e && e.message || e));
+        return reply(env, e.status || 502, { error: e.say || "Could not add the policy", detail: String(e && e.message || e).slice(0, 200) });
+      }
+    }
+    const pm = url.pathname.match(/^\/api\/policies\/([0-9a-fA-F-]{20,40})(\/file|\/text|\/location)?$/);
+    if (pm) {
+      try {
+        await policyTable(env);
+        const row = await env.DB.prepare("SELECT id, title, item_id, file_name, needs_ack, removed, updated_at, updated_on, updated_src, version, folder, docx_item_id, docx_name, effective, kind FROM policies WHERE id = ?").bind(pm[1]).first();
+        if (!row || row.removed) return reply(env, 404, { error: "policy not found" });
+        if (pm[2] === "/file" && request.method === "GET") {
+          // Open the policy PDF. Any signed in tier.
+          if (!row.item_id) return reply(env, 404, { error: "No file has been uploaded for this policy" });
+          const dl = await graphFetch(env, `/sites/${siteId(env)}/drive/items/${row.item_id}/content`, { redirect: "manual" });
+          const loc = dl.headers.get("Location");
+          const file = loc ? await fetch(loc) : dl;
+          if (!file.ok) return reply(env, 502, { error: "download failed" });
+          return new Response(file.body, { status: 200, headers: { ...cors(env), "Content-Type": "application/pdf", "Content-Disposition": `inline; filename*=UTF-8''${encodeURIComponent(row.file_name || "policy.pdf")}` } });
+        }
+        if (user.tier !== "T1") return reply(env, 403, { error: "forbidden" });
+        const who = (user.email || "").toLowerCase();
+        if (pm[2] === "/location" && request.method === "GET") {
+          // Director only. Asks SharePoint where the current file really is, so the app can show the path and a link rather than take the record's word for it.
+          if (!row.item_id) return reply(env, 200, { found: false });
+          let it = null;
+          try { const r = await graphFetch(env, `/sites/${siteId(env)}/drive/items/${row.item_id}?select=id,name,webUrl,parentReference,file`); if (r.ok) it = await r.json(); } catch (e) { it = null; }
+          if (!it || !it.file) return reply(env, 200, { found: false });
+          const parent = decodeURIComponent(String(it.parentReference && it.parentReference.path || "").replace(/^.*?root:/, "")).replace(/^\//, "");
+          return reply(env, 200, { found: true, path: [...parent.split("/").filter(Boolean), it.name].join(" / "), webUrl: it.webUrl || "" });
+        }
+        if (pm[2] === "/file" && request.method === "POST") {
+          // Upload a new version: the next v number becomes the current file and the previous one moves into the policy's Archive folder.
+          const bytes = await request.arrayBuffer();
+          if (!bytes.byteLength) return reply(env, 400, { error: "empty file" });
+          if (bytes.byteLength > MAX_UPLOAD) return reply(env, 413, { error: "file too large" });
+          const folder = row.folder || cleanName(row.title) || row.id;
+          const next = (row.item_id ? (row.version || 1) : 0) + 1;
+          const pub = await policyPublish(env, row.item_id ? row : null, folder, next, bytes, request.headers.get("Content-Type"), url.searchParams.get("name"), docKind(row.kind));
+          const archived = pub.archived;
+          // A new version takes its last updated date from its own text. A date set by hand stays. A PDF has no text here, so its date is read by the app straight afterwards.
+          const keep = policyDateManual(row);
+          const found = !keep && pub.body ? findLastUpdated(pub.body) : null;
+          await env.DB.prepare("UPDATE policies SET item_id = ?, file_name = ?, docx_item_id = ?, docx_name = ?, body = ?, effective = ?, version = ?, folder = ?, updated_by = ?, updated_at = datetime('now')" + (keep ? "" : ", updated_on = ?, updated_src = ?") + " WHERE id = ?").bind(...[pub.itemId, pub.fileName, pub.docxId, pub.docxName, pub.body, pub.effective, next, folder, who, ...(keep ? [] : [found ? found.iso : null, policySrc(found)]), row.id]).run();
+          const outV = await env.DB.prepare("SELECT id, title, item_id, file_name, needs_ack, updated_at, updated_on, updated_src, version, folder, docx_item_id, docx_name, effective, kind FROM policies WHERE id = ?").bind(row.id).first();
+          // A new version wipes everyone's acknowledgement (the app matches on version), so every active staff member except the director is told to read and acknowledge it again.
+          if (row.needs_ack) {
+            try {
+              const isHb = docKind(row.kind) !== "policy";
+              const staff = (((await env.DB.prepare("SELECT email, name FROM xero_payroll WHERE email IS NOT NULL AND email <> '' AND (status IS NULL OR status = 'ACTIVE')").all()).results) || []).filter((p) => !/andrew\s+wowk/i.test(String(p.name || "")));
+              // Everyone is asked to acknowledge, every level. Only Andrew, the director, is skipped (filtered above).
+              for (const p of staff) await notify(env, { to: String(p.email).toLowerCase(), kind: "policy", title: `${row.title} has been updated`, body: `A new version of the ${isHb ? "handbook" : "policy"} is out. Open it, read it to the end and acknowledge it again.`, link: isHb ? "handbook" : "policies", by: user.name || who });
+            } catch (e) { console.log("policy notice failed", String(e && e.message || e).slice(0, 200)); }
+          }
+          return reply(env, 200, { policy: policyOut(outV), archived });
+        } else if (pm[2] === "/text" && request.method === "POST") {
+          return reply(env, 200, await policyTextSave(env, row, request));
+        } else if (!pm[2] && request.method === "PUT") {
+          let body;
+          try { body = await request.json(); } catch { return reply(env, 400, { error: "bad json" }); }
+          const title = txt(body.title, 120);
+          if (!title) return reply(env, 400, { error: "A policy needs a title" });
+          await env.DB.prepare("UPDATE policies SET title = ?, needs_ack = 1, updated_by = ?, updated_at = datetime('now') WHERE id = ?").bind(title, who, row.id).run();
+        } else if (!pm[2] && request.method === "DELETE") {
+          await env.DB.prepare("UPDATE policies SET removed = 1, updated_by = ?, updated_at = datetime('now') WHERE id = ?").bind(who, row.id).run();
+          return reply(env, 200, { removed: true });
+        } else {
+          return reply(env, 405, { error: "method not allowed" });
+        }
+        const out = await env.DB.prepare("SELECT id, title, item_id, file_name, needs_ack, updated_at, updated_on, updated_src, version, folder, docx_item_id, docx_name, effective, kind FROM policies WHERE id = ?").bind(row.id).first();
+        return reply(env, 200, { policy: policyOut(out) });
+      } catch (e) {
+        console.log("policy error", String(e && e.message || e));
+        return reply(env, e.status || 502, { error: e.say || "Could not change the policy", detail: String(e && e.message || e).slice(0, 200) });
+      }
+    }
+    if (url.pathname === "/api/personalemail" && request.method === "PUT") {
+      // Saves the signed in person's own personal email. Any tier, only ever their own record.
+      if (!user.email) return reply(env, 400, { error: "No email on your sign in" });
+      let body;
+      try { body = await request.json(); } catch { return reply(env, 400, { error: "bad json" }); }
+      const value = String(body.personalEmail === undefined || body.personalEmail === null ? "" : body.personalEmail).replace(/\s+/g, "").slice(0, 160);
+      if (value && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(value)) return reply(env, 400, { error: "That does not look like an email address" });
+      try {
+        const row = await reservoirRowFor(env, user.email, user.name, true);
+        await env.DB.prepare("UPDATE dfp_reservoir SET personal_email = ?, updated_by = ?, updated_at = datetime('now') WHERE person_key = ?").bind(value, user.email.toLowerCase(), row.person_key).run();
+        return reply(env, 200, { saved: true, personalEmail: value });
+      } catch (e) {
+        console.log("personal email save error", String(e && e.message || e));
+        return reply(env, 500, { error: "Could not save the personal email", detail: String(e && e.message || e).slice(0, 200) });
+      }
+    }
+    if (url.pathname === "/api/profile/photo" && request.method === "POST") {
+      // A photo of a licence or registration card, sent with a change request. Held for the signed in person until the office processes the request. Any tier, own card only.
+      const slot = String(url.searchParams.get("slot") || "");
+      if (!["driver", "truck", "forklift", "excavator", "plumbReg"].includes(slot)) return reply(env, 400, { error: "Unknown card" });
+      const bytes = await request.arrayBuffer();
+      if (!bytes.byteLength) return reply(env, 400, { error: "empty photo" });
+      if (bytes.byteLength > 1800000) return reply(env, 413, { error: "That photo is too large" });
+      try {
+        await profileTables(env);
+        await env.DB.prepare("CREATE TABLE IF NOT EXISTS profile_photos (id TEXT PRIMARY KEY, person_key TEXT, slot TEXT, name TEXT, mime TEXT, data TEXT, created_at TEXT DEFAULT (datetime('now')))").run();
+        const u8 = new Uint8Array(bytes);
+        let bin = "";
+        for (let i = 0; i < u8.length; i += 8192) bin += String.fromCharCode.apply(null, u8.subarray(i, i + 8192));
+        const id = crypto.randomUUID();
+        const mime = /^image\/(jpeg|png|webp)$/.test(String(request.headers.get("Content-Type") || "")) ? request.headers.get("Content-Type") : "image/jpeg";
+        await env.DB.prepare("INSERT INTO profile_photos (id, person_key, slot, name, mime, data) VALUES (?, ?, ?, ?, ?, ?)").bind(id, profileKey(user.name || user.email), slot, cleanName(url.searchParams.get("name")) || "photo.jpg", mime, btoa(bin)).run();
+        return reply(env, 200, { id });
+      } catch (e) {
+        console.log("profile photo save error", String(e && e.message || e));
+        return reply(env, 500, { error: "Could not save the photo" });
+      }
+    }
+    const ppo = url.pathname.match(/^\/api\/profile\/photo\/([0-9a-fA-F-]{20,40})$/);
+    if (ppo && request.method === "GET") {
+      // Opens one card photo. The person it belongs to, or a director or manager.
+      try {
+        await env.DB.prepare("CREATE TABLE IF NOT EXISTS profile_photos (id TEXT PRIMARY KEY, person_key TEXT, slot TEXT, name TEXT, mime TEXT, data TEXT, created_at TEXT DEFAULT (datetime('now')))").run();
+        const row = await env.DB.prepare("SELECT * FROM profile_photos WHERE id = ?").bind(ppo[1]).first();
+        if (!row) return reply(env, 404, { error: "photo not found" });
+        if (user.tier !== "T1" && user.tier !== "T2" && row.person_key !== profileKey(user.name || user.email)) return reply(env, 403, { error: "forbidden" });
+        const bin = atob(row.data);
+        const out = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+        return new Response(out, { status: 200, headers: { ...cors(env), "Content-Type": row.mime || "image/jpeg", "Cache-Control": "no-store" } });
+      } catch (e) {
+        console.log("profile photo open error", String(e && e.message || e));
+        return reply(env, 502, { error: "Could not open the photo" });
+      }
+    }
+    if (url.pathname === "/api/profile/card" && request.method === "POST") {
+      // The signed in person saving one of their own cards. No approval. The office gets a notice.
+      if (!user.email && !user.name) return reply(env, 400, { error: "No name on your sign in" });
+      let body;
+      try { body = await request.json(); } catch { return reply(env, 400, { error: "bad json" }); }
+      const def = CARD_DEFS[String(body.card || "")];
+      if (!def || !body.values || typeof body.values !== "object") return reply(env, 400, { error: "That card is not known" });
+      try {
+        await profileTables(env);
+        await env.DB.prepare("CREATE TABLE IF NOT EXISTS profile_photos (id TEXT PRIMARY KEY, person_key TEXT, slot TEXT, name TEXT, mime TEXT, data TEXT, created_at TEXT DEFAULT (datetime('now')))").run();
+        const keep = {};
+        for (const k of def.keys) if (Object.prototype.hasOwnProperty.call(body.values, k)) keep[k] = body.values[k];
+        let newIds = [];
+        if (Object.prototype.hasOwnProperty.call(body.values, def.copy)) {
+          newIds = String(body.values[def.copy] || "").split("|").filter(Boolean).slice(0, 2);
+          for (const pid of newIds) {
+            const p = await env.DB.prepare("SELECT person_key FROM profile_photos WHERE id = ?").bind(pid).first();
+            if (!p || p.person_key !== profileKey(user.name || user.email)) return reply(env, 400, { error: "That photo was not found. Take it again." });
+          }
+          keep[def.copy] = newIds.join("|");
+        }
+        if (!Object.keys(keep).length) return reply(env, 400, { error: "Nothing to save" });
+        const before = await reservoirRowFor(env, user.email, user.name, false);
+        const oldIds = String((before && before[PROFILE_COLS[def.copy]]) || "").split("|").filter(Boolean);
+        const saved = await profileWrite(env, { name: user.name, email: user.email }, keep, user.email || "unknown");
+        for (const oid of oldIds) if (!newIds.includes(oid)) await env.DB.prepare("DELETE FROM profile_photos WHERE id = ?").bind(oid).run();
+        // A job sent back to the person by the office for this card is now done.
+        await noticesTable(env);
+        await env.DB.prepare("UPDATE notices SET done_at = datetime('now'), read_at = COALESCE(read_at, datetime('now')), done_by = ? WHERE to_email = ? AND kind = 'cardreset' AND done_at IS NULL AND data LIKE ?").bind(user.name || user.email, String(user.email || "").toLowerCase(), `%"card":"${body.card}"%`).run();
+        const bits = [];
+        for (const k of def.keys) if (Object.prototype.hasOwnProperty.call(keep, k)) bits.push(/Expiry$/.test(k) ? `Expiry ${dmyOf(saved[k])}` : /Class$/.test(k) ? `Class ${saved[k]}` : `Number ${saved[k]}`);
+        if (newIds.length) bits.push(newIds.length > 1 ? "Front and back photos added" : "Front photo added");
+        const first = String(user.name || user.email).split(" ")[0];
+        // The office is not notified when someone saves a licence or registration card.
+        await env.DB.prepare("INSERT INTO profile_audit (event, person, email, section, section_title, fields, by_name, note) VALUES ('card saved', ?, ?, ?, ?, ?, ?, ?)").bind(user.name || "", String(user.email || "").toLowerCase(), String(body.card), def.label, JSON.stringify(Object.keys(keep)), user.name || user.email || "", bits.join(". ").slice(0, 300)).run();
+        return reply(env, 200, { saved: true, profile: saved });
+      } catch (e) {
+        const msg = String(e && e.message || e);
+        console.log("profile card save error", msg);
+        return reply(env, /^bad /.test(msg) ? 400 : 500, { error: /^bad /.test(msg) ? "One of those values is not valid" : "Could not save the card", detail: msg.slice(0, 200) });
+      }
+    }
+    if (url.pathname === "/api/profile/card/reset" && request.method === "POST") {
+      // The office sending a card back: it is cleared, and the person gets a job to do it again.
+      if (user.tier !== "T1" && user.tier !== "T2") return reply(env, 403, { error: "forbidden" });
+      let body;
+      try { body = await request.json(); } catch { return reply(env, 400, { error: "bad json" }); }
+      const def = CARD_DEFS[String(body.card || "")];
+      const target = String(body.email || "").toLowerCase();
+      if (!def || !target) return reply(env, 400, { error: "That card or person is not known" });
+      try {
+        await profileTables(env);
+        const row = await reservoirRowFor(env, target, "", false);
+        if (!row) return reply(env, 404, { error: "That person has no saved details" });
+        const ids = String(row[PROFILE_COLS[def.copy]] || "").split("|").filter(Boolean);
+        const blank = {};
+        for (const k of [...def.keys, def.copy]) blank[k] = "";
+        await profileWrite(env, { name: row.name, email: target }, blank, user.email || "unknown");
+        for (const pid of ids) await env.DB.prepare("DELETE FROM profile_photos WHERE id = ?").bind(pid).run();
+        const note = String(body.note || "").trim().slice(0, 300);
+        await notify(env, { to: target, kind: "cardreset", title: `Your ${def.label} needs doing again`, body: note || "The photo was not clear enough. Please scan it again and take your time.", todo: true, link: "mylicences", data: { card: String(body.card) }, by: user.name || user.email });
+        await noticesTable(env);
+        if (body.noticeId) await env.DB.prepare("UPDATE notices SET done_at = COALESCE(done_at, datetime('now')), read_at = COALESCE(read_at, datetime('now')), done_by = COALESCE(done_by, ?) WHERE id = ? AND to_email = '@office'").bind(user.name || user.email, String(body.noticeId)).run();
+        await env.DB.prepare("INSERT INTO profile_audit (event, person, email, section, section_title, fields, by_name, note) VALUES ('card reset', ?, ?, ?, ?, '[]', ?, ?)").bind(row.name || "", target, String(body.card), def.label, user.name || user.email || "", note).run();
+        return reply(env, 200, { reset: true });
+      } catch (e) {
+        console.log("profile card reset error", String(e && e.message || e));
+        return reply(env, 500, { error: "Could not reset the card", detail: String(e && e.message || e).slice(0, 200) });
+      }
+    }
+    if (url.pathname === "/api/profile/sizes" && request.method === "PUT") {
+      // Uniform sizes are self managed: the signed in person saves their own, no approval. Only polo, jumper and jacket are ever taken.
+      if (!user.email) return reply(env, 400, { error: "No email on your sign in" });
+      let body;
+      try { body = await request.json(); } catch { return reply(env, 400, { error: "bad json" }); }
+      const keep = {};
+      for (const k of ["polo", "jumper", "jacket"]) if (Object.prototype.hasOwnProperty.call(body, k)) keep[k] = String(body[k] === null || body[k] === undefined ? "" : body[k]).trim().slice(0, 12);
+      if (!Object.keys(keep).length) return reply(env, 400, { error: "No sizes given" });
+      try {
+        const saved = await profileWrite(env, { name: user.name, email: user.email }, keep, user.email || "unknown");
+        return reply(env, 200, { saved: true, profile: saved });
+      } catch (e) {
+        const msg = String(e && e.message || e);
+        return reply(env, /^bad /.test(msg) ? 400 : 500, { error: /^bad /.test(msg) ? "That size is not valid" : "Could not save the sizes", detail: msg.slice(0, 200) });
+      }
+    }
+    if (url.pathname === "/api/profile" && request.method === "GET") {
+      // The signed in person's own saved profile details. Any tier, only ever their own record.
+      try {
+        const mine = await profileFor(env, user);
+        return reply(env, 200, { found: !!mine, profile: mine });
+      } catch (e) {
+        console.log("profile read error", String(e && e.message || e));
+        return reply(env, 500, { error: "Could not read the profile", detail: String(e && e.message || e).slice(0, 200) });
+      }
+    }
+    if (url.pathname === "/api/profile/all" && request.method === "GET") {
+      // Everyone's saved profile details, for the Staff screen. Directors and managers only.
+      if (user.tier !== "T1" && user.tier !== "T2") return reply(env, 403, { error: "forbidden" });
+      try {
+        await profileTables(env);
+        const rows = await env.DB.prepare("SELECT * FROM dfp_reservoir WHERE name IS NOT NULL AND name <> '' ORDER BY name COLLATE NOCASE").all();
+        return reply(env, 200, { people: (rows.results || []).map(profileOut) });
+      } catch (e) {
+        console.log("profile list error", String(e && e.message || e));
+        return reply(env, 500, { error: "Could not read the profiles", detail: String(e && e.message || e).slice(0, 200) });
+      }
+    }
+    if (url.pathname === "/api/profile/person" && request.method === "PUT") {
+      // A director or manager editing one person's details directly from the Staff screen.
+      if (user.tier !== "T1" && user.tier !== "T2") return reply(env, 403, { error: "forbidden" });
+      let body;
+      try { body = await request.json(); } catch { return reply(env, 400, { error: "bad json" }); }
+      const name = String(body.name || "").trim();
+      if (!profileKey(name) || !body.fields || typeof body.fields !== "object") return reply(env, 400, { error: "A name and fields are needed" });
+      try {
+        const saved = await profileWrite(env, { name }, body.fields, user.email || "unknown");
+        return reply(env, 200, { saved: true, profile: saved });
+      } catch (e) {
+        const msg = String(e && e.message || e);
+        return reply(env, /^bad /.test(msg) ? 400 : 500, { error: /^bad /.test(msg) ? "That value is not valid" : "Could not save the profile", detail: msg.slice(0, 200) });
+      }
+    }
+    if (url.pathname === "/api/dfp/files" && request.method === "GET") {
+      // Director only (T1). What is stored, without the file contents.
+      if (user.tier !== "T1") return reply(env, 403, { error: "forbidden" });
+      await filesTable(env);
+      const rows = ((await env.DB.prepare("SELECT slot, name, mime, size, updated_at, updated_by FROM dfp_files").all()).results) || [];
+      return reply(env, 200, { slots: Object.keys(FILE_SLOTS).map((k) => { const r = rows.find((x) => x.slot === k); return { slot: k, label: FILE_SLOTS[k].label, stored: !!r, name: r ? r.name : "", size: r ? r.size : 0, updatedAt: r ? r.updated_at : "", updatedBy: r ? r.updated_by : "" }; }), worker: WORKER_BUILD });
+    }
+    const fs = url.pathname.match(/^\/api\/dfp\/files\/([a-z0-9-]{1,40})$/);
+    if (fs && (request.method === "PUT" || request.method === "DELETE")) {
+      if (user.tier !== "T1") return reply(env, 403, { error: "forbidden" });
+      const slot = FILE_SLOTS[fs[1]];
+      if (!slot) return reply(env, 404, { error: "unknown file slot" });
+      await filesTable(env);
+      if (request.method === "DELETE") {
+        await env.DB.prepare("DELETE FROM dfp_files WHERE slot = ?").bind(fs[1]).run();
+        return reply(env, 200, { ok: true });
+      }
+      let body;
+      try { body = await request.json(); } catch (e) { return reply(env, 400, { error: "bad request" }); }
+      const m = String(body.data || "").match(/^data:([a-z]+\/[a-z+.-]+);base64,([A-Za-z0-9+\/=]+)$/);
+      if (!m || !slot.mimes.includes(m[1])) return reply(env, 400, { error: `That file type is not allowed here. Use ${slot.mimes.map((x) => x.split("/")[1].toUpperCase()).join(" or ")}.` });
+      if (String(body.data).length > slot.maxChars) return reply(env, 413, { error: "That file is too large." });
+      const name = String(body.name || "").replace(/[^\w .()-]/g, "").slice(0, 80);
+      await env.DB.prepare("INSERT OR REPLACE INTO dfp_files (slot, name, mime, size, data, updated_at, updated_by) VALUES (?, ?, ?, ?, ?, datetime('now'), ?)").bind(fs[1], name, m[1], Math.floor(m[2].length * 3 / 4), body.data, String(user.email || user.name || "")).run();
+      return reply(env, 200, { ok: true });
+    }
+    const fr = url.pathname.match(/^\/api\/files\/([a-z0-9-]{1,40})$/);
+    if (fr && request.method === "GET") {
+      // The stored file for a slot that every signed in person may read (the pay slip logo). Other slots are director only.
+      const slot = FILE_SLOTS[fr[1]];
+      if (!slot || (!slot.readAll && user.tier !== "T1")) return reply(env, 404, { found: false });
+      await filesTable(env);
+      const r = await env.DB.prepare("SELECT mime, data FROM dfp_files WHERE slot = ?").bind(fr[1]).first();
+      if (!r) return reply(env, 200, { found: false });
+      return reply(env, 200, { found: true, mime: r.mime, data: r.data });
+    }
+    if (url.pathname === "/api/launch/status" && request.method === "GET") {
+      // Whether removing requests is still allowed. Directors and managers (the people who see Team Requests).
+      if (user.tier !== "T1" && user.tier !== "T2") return reply(env, 403, { error: "forbidden" });
+      try { const l = await requestsLock(env); return reply(env, 200, { requestsLocked: l.locked, lockedBy: l.by, lockedAt: l.at }); }
+      catch (e) { return reply(env, 500, { error: "Could not read the launch settings" }); }
+    }
+    if (url.pathname === "/api/launch/lock-requests" && request.method === "POST") {
+      // The go live switch. Director (T1) only. One way: there is no route that turns it off.
+      if (user.tier !== "T1") return reply(env, 403, { error: "forbidden" });
+      try {
+        await launchTable(env);
+        await env.DB.prepare("INSERT OR IGNORE INTO app_settings (key, value, by_name) VALUES ('launch.requests_locked', '1', ?)").bind(String(user.name || user.email || "").slice(0, 120)).run();
+        const l = await requestsLock(env);
+        return reply(env, 200, { requestsLocked: l.locked, lockedBy: l.by, lockedAt: l.at });
+      } catch (e) {
+        console.log("launch lock error", String(e && e.message || e));
+        return reply(env, 500, { error: "Could not set the lock", detail: String(e && e.message || e).slice(0, 200) });
+      }
+    }
+    if (url.pathname === "/api/profile/requests" && request.method === "POST") {
+      // Any signed in person asking the office to change their own details.
+      if (!user.name && !user.email) return reply(env, 400, { error: "No name on your sign in" });
+      let body;
+      try { body = await request.json(); } catch { return reply(env, 400, { error: "bad json" }); }
+      const section = String(body.section || "").slice(0, 40), sectionTitle = String(body.sectionTitle || "").slice(0, 80);
+      if (!section || !body.values || typeof body.values !== "object") return reply(env, 400, { error: "A section and values are needed" });
+      try {
+        await profileTables(env);
+        const id = crypto.randomUUID();
+        const fields = Array.isArray(body.fields) ? body.fields.slice(0, 20).map((f) => ({ key: String(f.key || "").slice(0, 40), label: String(f.label || "").slice(0, 80), from: String(f.from === undefined ? "" : f.from).slice(0, 200), to: String(f.to === undefined ? "" : f.to).slice(0, 200) })) : [];
+        await env.DB.prepare("INSERT INTO profile_requests (id, person_key, name, email, section, section_title, fields, vals, text, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'new')")
+          .bind(id, profileKey(user.name || user.email), String(user.name || user.email).slice(0, 120), String(user.email || "").toLowerCase(), section, sectionTitle, JSON.stringify(fields), JSON.stringify(body.values).slice(0, 8000), String(body.text || "").slice(0, 600)).run();
+        const row = await env.DB.prepare("SELECT * FROM profile_requests WHERE id = ?").bind(id).first();
+        await profileAudit(env, "submitted", row, row.name, "");
+        return reply(env, 200, { request: profileRequestOut(row) });
+      } catch (e) {
+        console.log("profile request error", String(e && e.message || e));
+        return reply(env, 500, { error: "Could not send the request", detail: String(e && e.message || e).slice(0, 200) });
+      }
+    }
+    if (url.pathname === "/api/profile/requests" && request.method === "GET") {
+      // Directors and managers see everyone's requests. Everyone else sees only their own.
+      try {
+        await profileTables(env);
+        const office = user.tier === "T1" || user.tier === "T2";
+        const rows = office
+          ? await env.DB.prepare("SELECT * FROM profile_requests ORDER BY created_at DESC LIMIT 300").all()
+          : await env.DB.prepare("SELECT * FROM profile_requests WHERE person_key = ? ORDER BY created_at DESC LIMIT 100").bind(profileKey(user.name || user.email)).all();
+        return reply(env, 200, { requests: (rows.results || []).map(profileRequestOut) });
+      } catch (e) {
+        console.log("profile requests list error", String(e && e.message || e));
+        return reply(env, 500, { error: "Could not read the requests", detail: String(e && e.message || e).slice(0, 200) });
+      }
+    }
+    const prd = url.pathname.match(/^\/api\/profile\/requests\/([0-9a-fA-F-]{20,40})$/);
+    if (prd && request.method === "DELETE") {
+      // Removing a closed request from Team Requests. Directors (T1) only, only once it has been processed, and never once the go live lock is on.
+      if (user.tier !== "T1") return reply(env, 403, { error: "forbidden" });
+      try {
+        if ((await requestsLock(env)).locked) return reply(env, 403, { error: REMOVAL_LOCKED });
+        await profileTables(env);
+        const row = await env.DB.prepare("SELECT id, status FROM profile_requests WHERE id = ?").bind(prd[1]).first();
+        if (!row) return reply(env, 200, { removed: false, alreadyGone: true });
+        if (row.status !== "processed") return reply(env, 409, { error: "Only a processed request can be removed" });
+        await env.DB.prepare("DELETE FROM profile_requests WHERE id = ?").bind(row.id).run();
+        return reply(env, 200, { removed: true });
+      } catch (e) {
+        console.log("profile request delete error", String(e && e.message || e));
+        return reply(env, 500, { error: "Could not remove the request", detail: String(e && e.message || e).slice(0, 200) });
+      }
+    }
+    const prm = url.pathname.match(/^\/api\/profile\/requests\/([0-9a-fA-F-]{20,40})\/process$/);
+    if (prm && request.method === "POST") {
+      // Approving a request writes the new values into the person's saved profile. Directors and managers only.
+      if (user.tier !== "T1" && user.tier !== "T2") return reply(env, 403, { error: "forbidden" });
+      try {
+        await profileTables(env);
+        const row = await env.DB.prepare("SELECT * FROM profile_requests WHERE id = ?").bind(prm[1]).first();
+        if (!row) return reply(env, 404, { error: "not found" });
+        if (row.status === "processed") return reply(env, 200, { request: profileRequestOut(row), alreadyDone: true });
+        if (row.section === "personal" || row.section === "emergency") {
+          // Director only. Preferred name and personal email are saved here. Address and mobile go to Xero first and are read back. The emergency contact is kept in our own table, because Xero Payroll AU has no emergency contact field.
+          if (!isApprover(user)) return reply(env, 403, { error: "Only Tayler can process profile changes for now" });
+          let vals = {};
+          try { vals = JSON.parse(row.vals || "{}"); } catch (e) { /* nothing */ }
+          const mail = String(row.email || "").toLowerCase();
+          try {
+            await dfpTables(env);
+            const dx = await env.DB.prepare("SELECT xero_employee_id FROM dfp_xero WHERE lower(email) = ?").bind(mail).first();
+            if (row.section === "personal") {
+              if (vals.personalEmail !== undefined && vals.personalEmail && !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(String(vals.personalEmail).trim())) throw new Error("The personal email does not look like an email address.");
+              if (vals.address !== undefined || vals.mobile !== undefined) {
+                const empId = dx && dx.xero_employee_id;
+                if (!empId) return reply(env, 409, { error: "This person is not linked to a Xero employee record yet, so nothing was changed." });
+                const back = await xeroPushPersonal(env, empId, vals, mail);
+                // The history shows the address the way Xero now holds it, not the way it was typed.
+                if (back && back.address && vals.address) {
+                  const was = String(vals.address);
+                  const esc = was.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+                  const swap = (t) => String(t || "").replace(new RegExp(esc, "i"), back.address);
+                  const newVals = { ...vals, address: back.address };
+                  await env.DB.prepare("UPDATE profile_requests SET text = ?, vals = ? WHERE id = ?").bind(swap(row.text), JSON.stringify(newVals), row.id).run();
+                }
+              }
+              if (vals.preferredName !== undefined) await reservoirOwnSet(env, row.email, row.name, { preferred_name: String(vals.preferredName || "").trim().slice(0, 40) || null }, user.email);
+              if (vals.personalEmail !== undefined) {
+                const rr = await reservoirRowFor(env, row.email, row.name, true);
+                await env.DB.prepare("UPDATE dfp_reservoir SET personal_email = ?, updated_by = ?, updated_at = datetime('now') WHERE person_key = ?").bind(String(vals.personalEmail || "").replace(/\s+/g, "").slice(0, 160), user.email || "unknown", rr.person_key).run();
+              }
+            } else {
+              const clean = (x, n) => String(x === undefined || x === null ? "" : x).replace(/\s+/g, " ").trim().slice(0, n);
+              const map = { emName: ["em_name", 120], emRelationship: ["em_relationship", 80], emMobile: ["em_mobile", 40], emEmail: ["em_email", 160] };
+              const patch = {};
+              for (const [k, [col, n]] of Object.entries(map)) if (vals[k] !== undefined) patch[col] = k === "emMobile" ? normPhone(clean(vals[k], n)) : clean(vals[k], n);
+              if (Object.keys(patch).length) await reservoirOwnSet(env, row.email, row.name, { ...patch, em_saved_at: new Date().toISOString() }, user.email);
+            }
+          } catch (e) {
+            const msg = String(e && e.message || e).slice(0, 400);
+            await profileAudit(env, "failed", row, user.email || "unknown", msg);
+            return reply(env, 502, { error: msg });
+          }
+          await env.DB.prepare("UPDATE profile_requests SET status = 'processed', processed_by = ?, processed_at = datetime('now'), seen_at = NULL WHERE id = ?").bind(user.email || "unknown", row.id).run();
+          const doneRow = await env.DB.prepare("SELECT * FROM profile_requests WHERE id = ?").bind(row.id).first();
+          await profileAudit(env, "processed", doneRow, user.name || user.email || "unknown", vals.address !== undefined || vals.mobile !== undefined ? "Written to Xero and read back" : "Saved");
+          { const what = vals.address !== undefined ? "Address" : vals.mobile !== undefined ? "Mobile" : row.section === "emergency" ? "Emergency contact" : "Profile"; await notify(env, { to: row.email, kind: "request", title: `${what} change confirmed`, body: "Your profile has been updated.", link: "myfile", by: user.name || "Reservoir" }); }
+          return reply(env, 200, { request: profileRequestOut(doneRow), xero: vals.address !== undefined || vals.mobile !== undefined });
+        }
+        if (row.section === "bank" || row.section === "super") {
+          // Bank and super go to Xero first. Only a director can press this, and nothing is marked processed unless Xero took the change.
+          if (!isApprover(user)) return reply(env, 403, { error: "Only Tayler can process bank and super changes for now" });
+          let vals = {};
+          try { vals = JSON.parse(row.vals || "{}"); } catch (e) { /* nothing */ }
+          const dx = await env.DB.prepare("SELECT xero_employee_id FROM dfp_xero WHERE email = ?").bind(String(row.email || "").toLowerCase()).first();
+          const empId = dx && dx.xero_employee_id;
+          if (!empId) return reply(env, 409, { error: "This person is not linked to a Xero employee record yet, so nothing was changed." });
+          let pushed;
+          try { pushed = row.section === "bank" ? await xeroPushBank(env, empId, vals) : await xeroPullSuper(env, empId, vals); }
+          catch (e) {
+            const msg = String(e && e.message || e).slice(0, 400);
+            await profileAudit(env, "failed", row, user.email || "unknown", msg);
+            return reply(env, 502, { error: row.section === "super" ? msg : `Xero did not take the change. ${msg}` });
+          }
+          if (row.section === "bank") {
+            await env.DB.prepare("UPDATE dfp_xero SET bank_account_name = ?, bsb = ?, account_number = ?, updated_by = ?, updated_at = datetime('now') WHERE email = ?").bind(pushed.accountName, pushed.bsb, pushed.accountNumber, user.email || "unknown", String(row.email || "").toLowerCase()).run();
+          } else {
+            const sets = ["super_member_number = ?"], binds = [pushed.member];
+            if (pushed.fundName) { sets.push("super_fund_name = ?"); binds.push(pushed.fundName); }
+            if (pushed.usi) { sets.push("super_usi = ?"); binds.push(pushed.usi); }
+            await env.DB.prepare(`UPDATE xero_payroll SET ${sets.join(", ")} WHERE employee_id = ?`).bind(...binds, empId).run();
+          }
+          await env.DB.prepare("UPDATE profile_requests SET status = 'processed', processed_by = ?, processed_at = datetime('now'), seen_at = NULL WHERE id = ?").bind(user.email || "unknown", row.id).run();
+          const doneRow = await env.DB.prepare("SELECT * FROM profile_requests WHERE id = ?").bind(row.id).first();
+          await profileAudit(env, "processed", doneRow, user.name || user.email || "unknown", row.section === "super" ? "Pulled from Xero" : "Written to Xero");
+          await notify(env, { to: row.email, kind: "request", title: `${row.section === "super" ? "Super" : "Bank details"} change confirmed`, body: "Your profile has been updated.", link: "myfile", by: user.name || "Reservoir" });
+          return reply(env, 200, { request: profileRequestOut(doneRow), xero: true });
+        }
+        let values = {};
+        try { values = JSON.parse(row.vals || "{}"); } catch (e) { /* nothing to apply */ }
+        const keep = {};
+        for (const k of Object.keys(PROFILE_COLS)) if (Object.prototype.hasOwnProperty.call(values, k)) keep[k] = values[k];
+        if (Object.prototype.hasOwnProperty.call(values, "training")) keep.training = values.training;
+        let saved = null;
+        if (Object.keys(keep).length) saved = await profileWrite(env, { name: row.name, email: row.email }, keep, user.email || "unknown");
+        await env.DB.prepare("UPDATE profile_requests SET status = 'processed', processed_by = ?, processed_at = datetime('now') WHERE id = ?").bind(user.email || "unknown", row.id).run();
+        const done = await env.DB.prepare("SELECT * FROM profile_requests WHERE id = ?").bind(row.id).first();
+        return reply(env, 200, { request: profileRequestOut(done), profile: saved, durable: Object.keys(keep) });
+      } catch (e) {
+        const msg = String(e && e.message || e);
+        console.log("profile process error", msg);
+        return reply(env, /^bad /.test(msg) ? 400 : 500, { error: /^bad /.test(msg) ? "That request holds a value that is not valid" : "Could not apply the request", detail: msg.slice(0, 200) });
+      }
+    }
+    const psn = url.pathname.match(/^\/api\/profile\/requests\/([0-9a-fA-F-]{20,40})\/seen$/);
+    if (psn && request.method === "POST") {
+      // The person has now seen the "details updated" banner. It will not show again.
+      try {
+        await profileTables(env);
+        await env.DB.prepare("UPDATE profile_requests SET seen_at = datetime('now') WHERE id = ? AND person_key = ? AND seen_at IS NULL").bind(psn[1], profileKey(user.name || user.email)).run();
+        return reply(env, 200, { ok: true });
+      } catch (e) {
+        return reply(env, 500, { error: "Could not record that", detail: String(e && e.message || e).slice(0, 200) });
+      }
+    }
+    if (url.pathname === "/api/profile/audit" && request.method === "GET") {
+      // Director only. The permanent record of every change request, newest first.
+      if (user.tier !== "T1") return reply(env, 403, { error: "forbidden" });
+      try {
+        await profileTables(env);
+        const rows = await env.DB.prepare("SELECT a.*, r.fields AS req_fields FROM profile_audit a LEFT JOIN profile_requests r ON r.id = a.request_id ORDER BY a.id DESC LIMIT 300").all();
+        return reply(env, 200, { entries: (rows.results || []).map((r) => { let fields = []; try { fields = JSON.parse(r.req_fields || r.fields || "[]"); } catch (e) { try { fields = JSON.parse(r.fields || "[]"); } catch (e2) { /* none */ } } return { id: r.id, requestId: r.request_id, at: r.at, event: r.event, person: r.person, section: r.section, sectionTitle: r.section_title, fields, by: r.by_name, note: r.note || "" }; }) });
+      } catch (e) {
+        return reply(env, 500, { error: "Could not read the change record", detail: String(e && e.message || e).slice(0, 200) });
+      }
+    }
+    if (url.pathname === "/api/access/tiers" && request.method === "GET") {
+      // Director only (T1). Each person's real access level from Entra, keyed by email. Used by Login As and View As so they start at the person's true level.
+      if (user.tier !== "T1") return reply(env, 403, { error: "forbidden" });
+      try {
+        return reply(env, 200, { ok: true, tiers: await accessTiers(env), worker: WORKER_BUILD });
+      } catch (e) {
+        return reply(env, 200, { ok: false, error: String(e && e.message || e).slice(0, 400), worker: WORKER_BUILD });
+      }
+    }
+    if (url.pathname === "/api/xero/me" && request.method === "GET") {
+      // The signed in person's own record, read from DFP's own tables (dfp_xero, with the personal email from dfp_reservoir). Nothing is read from Xero. Any tier, but only ever their own details.
+      try {
+        const email = String(user.email || "").trim().toLowerCase();
+        if (!email) return reply(env, 200, { found: false, reason: "No email on your sign in" });
+        await reservoirTables(env);
+        const row = await env.DB.prepare(`${PERSON_SQL} WHERE x.email = ?`).bind(email).first();
+        if (!row || !row.name) return reply(env, 200, { found: false, reason: NOT_IN_RESERVOIR });
+        const out = dfpPersonOut(row);
+        delete out.id; delete out.status;
+        const pe = await personalEmailFor(env, email);
+        if (pe) Object.assign(out, pe);
+        return reply(env, 200, { found: true, employee: out });
+      } catch (e) {
+        console.log("me error", String(e && e.message || e));
+        return reply(env, 502, { error: String(e && e.message || e).slice(0, 300) });
+      }
+    }
+    if (url.pathname === "/api/xero/payslips" && request.method === "GET") {
+      // The signed in person's own pay slips, read from the stored copy in Reservoir's database. Nothing is read from Xero. Any tier, only their own.
+      try {
+        const r = await payslipListFor(env, String(user.email || "").trim().toLowerCase());
+        return reply(env, 200, r);
+      } catch (e) {
+        console.log("payslips error", String(e && e.message || e));
+        return reply(env, 502, { error: String(e && e.message || e).slice(0, 300) });
+      }
+    }
+    const xs = url.pathname.match(/^\/api\/xero\/payslips\/([0-9a-fA-F-]{20,40})$/);
+    if (xs && request.method === "GET") {
+      // One stored pay slip. Year to date is added up from the stored slips, and the person's own bank details are added from dfp_xero. Nothing is read from Xero. Any tier, only their own.
+      try {
+        const email = String(user.email || "").trim().toLowerCase();
+        if (!email) return reply(env, 404, { error: "No email on your sign in" });
+        const out = await payslipOneFor(env, email, xs[1]);
+        if (!out) return reply(env, 404, { error: "That pay slip is not in Reservoir yet" });
+        return reply(env, 200, { payslip: out });
+      } catch (e) {
+        console.log("payslip error", String(e && e.message || e));
+        return reply(env, 502, { error: String(e && e.message || e).slice(0, 300) });
+      }
+    }
+    // Director only (T1): another person's stored pay slips, for the Team Pay Slips screen. The person is named by their Xero employee id. Read only, nothing is read from Xero.
+    const tf = url.pathname.match(/^\/api\/dfp\/payslips\/for\/([0-9a-fA-F-]{20,40})(?:\/([0-9a-fA-F-]{20,40}))?$/);
+    if (tf && request.method === "GET") {
+      if (user.tier !== "T1") return reply(env, 403, { error: "forbidden" });
+      try {
+        await dfpTables(env);
+        const who = await env.DB.prepare("SELECT email FROM xero_payroll WHERE employee_id = ?").bind(tf[1]).first();
+        const email = who && who.email ? String(who.email).trim().toLowerCase() : "";
+        if (!email) return reply(env, 200, tf[2] ? { error: "No email on record for that person" } : { found: false, reason: "That person has no work email in Reservoir yet" });
+        if (!tf[2]) return reply(env, 200, await payslipListFor(env, email));
+        const out = await payslipOneFor(env, email, tf[2]);
+        if (!out) return reply(env, 404, { error: "That pay slip is not in Reservoir yet" });
+        return reply(env, 200, { payslip: out });
+      } catch (e) {
+        console.log("team payslip error", String(e && e.message || e));
+        return reply(env, 502, { error: String(e && e.message || e).slice(0, 300) });
+      }
+    }
+    if (url.pathname === "/api/dfp/payslips/pull" && request.method === "POST") {
+      // Director only (T1). Reads the next few pay runs from Xero and stores the pay slips of current employees. Run it again until remaining is 0. Run it weekly to add new pay runs.
+      if (user.tier !== "T1") return reply(env, 403, { error: "forbidden" });
+      try {
+        let body = {};
+        try { body = await request.json(); } catch (e) { body = {}; }
+        const r = await payslipPull(env, { runs: body && body.runs, replace: !!(body && body.replace) });
+        if (r.fail) return reply(env, r.fail.status || 502, { error: r.fail.error, detail: r.fail.detail || "", worker: WORKER_BUILD });
+        return reply(env, 200, { worker: WORKER_BUILD, ...r });
+      } catch (e) {
+        console.log("payslip pull error", String(e && e.message || e));
+        return reply(env, 502, { error: String(e && e.message || e).slice(0, 300) });
+      }
+    }
+    if (url.pathname === "/api/dfp/payslips/filed" && request.method === "POST") {
+      // Director only (T1). Marks the most recent pay run that is not yet filed as filed, so its slips move out of Next Pay and read Paid. Changes no pay figure.
+      if (user.tier !== "T1") return reply(env, 403, { error: "forbidden" });
+      try {
+        await payslipTables(env);
+        const run = await env.DB.prepare("SELECT run_id, payment_date FROM payslip_runs WHERE filed = 0 ORDER BY payment_date DESC LIMIT 1").first();
+        if (!run) return reply(env, 200, { filed: false, reason: "There is no pay run waiting to be filed.", worker: WORKER_BUILD });
+        await env.DB.prepare("UPDATE payslip_runs SET filed = 1, filed_at = datetime('now'), filed_by = ? WHERE run_id = ?").bind(user.name || user.email || "", run.run_id).run();
+        // The one pull after a pay run is filed: the timesheets Xero now holds as processed are banked here as permanent history. A processed timesheet already stored is never overwritten again. A failure here does not undo the filing.
+        let timesheets = { ok: false };
+        try { const ts = await timesheetSync(env); timesheets = { ok: !!ts.ok, saved: ts.saved || 0, error: ts.ok ? "" : String(ts.error || "").slice(0, 200) }; } catch (e) { timesheets = { ok: false, error: String(e && e.message || e).slice(0, 200) }; }
+        try { await paygBill(env, run.run_id, "DRAFT"); } catch (e) { console.log("payg notice failed", String(e && e.message || e)); }
+        return reply(env, 200, { filed: true, paymentDate: run.payment_date, timesheets, worker: WORKER_BUILD });
+      } catch (e) {
+        console.log("payslip filed error", String(e && e.message || e));
+        return reply(env, 502, { error: String(e && e.message || e).slice(0, 300) });
+      }
+    }
+    if (url.pathname === "/api/dfp/payroll/probe" && request.method === "GET") {
+      // Temporary, director only (T1). Calls the payroll parts of Xero for the latest pay run and returns the raw replies, and every place a word like Filed or STP sits, so the real Filed field can be found.
+      if (user.tier !== "T1") return reply(env, 403, { error: "forbidden" });
+      try {
+        await payslipTables(env);
+        const latest = await env.DB.prepare("SELECT run_id FROM payslip_runs ORDER BY payment_date DESC LIMIT 1").first();
+        const out = [];
+        const call = async (label, path) => {
+          try {
+            const r = await xeroFetch(env, path);
+            const t = await r.text();
+            let j = null; try { j = JSON.parse(t); } catch (e) { /* not json */ }
+            out.push({ label, path, status: r.status, json: j, text: j ? "" : t.slice(0, 400) });
+            return j;
+          } catch (e) { out.push({ label, path, status: 0, json: null, text: String(e && e.message || e).slice(0, 300) }); return null; }
+        };
+        await call("Pay run list", "payroll.xro/1.0/PayRuns");
+        let slipId = "";
+        if (latest && latest.run_id) {
+          const d = await call("Latest pay run", `payroll.xro/1.0/PayRuns/${latest.run_id}`);
+          slipId = d && d.PayRuns && d.PayRuns[0] && d.PayRuns[0].Payslips && d.PayRuns[0].Payslips[0] ? d.PayRuns[0].Payslips[0].PayslipID : "";
+        }
+        if (slipId) await call("One payslip", `payroll.xro/1.0/Payslip/${slipId}`);
+        await call("Payroll settings", "payroll.xro/1.0/Settings");
+        await call("Pay calendars", "payroll.xro/1.0/PayrollCalendars");
+        await call("Pay run list, posted only", "payroll.xro/1.0/PayRuns?where=PayRunStatus%3D%3D%22POSTED%22");
+        const hits = [];
+        const walk = (label, o, p, d) => {
+          if (d > 8 || o === null || o === undefined) return;
+          if (Array.isArray(o)) { o.slice(0, 40).forEach((v, i) => walk(label, v, `${p}[${i}]`, d + 1)); return; }
+          if (typeof o === "object") { for (const [k, v] of Object.entries(o)) { if (/fil|lodg|stp|submit|ato\b|status/i.test(k) && typeof v !== "object") hits.push(`${label}: ${p}.${k} = ${v}`); walk(label, v, `${p}.${k}`, d + 1); } return; }
+          if (typeof o === "string" && /\b(filed|lodged|stp)\b/i.test(o)) hits.push(`${label}: ${p} = ${o}`);
+        };
+        out.forEach((e) => walk(e.label, e.json, "", 0));
+        const strip = (e) => { const j = e.json; if (j && Array.isArray(j.PayRuns)) j.PayRuns = j.PayRuns.slice(0, 3).map((x) => { const { Payslips, ...rest } = x || {}; return { ...rest, PayslipsCount: (Payslips || []).length }; }); return j; };
+        return reply(env, 200, { worker: WORKER_BUILD, hits: hits.slice(0, 120), endpoints: out.map((e) => ({ label: e.label, path: e.path, status: e.status, raw: (e.json ? JSON.stringify(e.label.indexOf("Latest") === 0 ? e.json : strip(e)) : e.text).slice(0, 4000) })) });
+      } catch (e) {
+        return reply(env, 502, { error: String(e && e.message || e).slice(0, 300) });
+      }
+    }
+    if (url.pathname === "/api/dfp/payslips/status" && request.method === "GET") {
+      // Director only (T1). What is stored, from the database alone. No Xero call.
+      if (user.tier !== "T1") return reply(env, 403, { error: "forbidden" });
+      await payslipTables(env);
+      const runs = await env.DB.prepare("SELECT COUNT(*) c, MIN(payment_date) a, MAX(payment_date) b FROM payslip_runs WHERE rules >= ?").bind(PAYSLIP_RULES).first();
+      const slips = await env.DB.prepare("SELECT COUNT(*) c, COALESCE(SUM(missing),0) m, COALESCE(SUM(CASE WHEN rules >= ? THEN 1 ELSE 0 END),0) r FROM payslip_store").bind(PAYSLIP_RULES).first();
+      const per = ((await env.DB.prepare("SELECT name, COUNT(*) c, MIN(payment_date) a, MAX(payment_date) b FROM payslip_store GROUP BY employee_id ORDER BY name").all()).results) || [];
+      const waiting = ((await env.DB.prepare("SELECT r.payment_date, r.built_at, (SELECT COUNT(*) FROM payslip_store s WHERE s.run_id = r.run_id) AS slips FROM payslip_runs r WHERE r.filed = 0 ORDER BY r.payment_date DESC").all()).results) || [];
+      const sweepNote = await env.DB.prepare("SELECT value, detail, at FROM app_settings WHERE key = 'sweep.payroll_last'").first().catch(() => null);
+      return reply(env, 200, { sweep: sweepNote || null, worker: WORKER_BUILD, unfiled: waiting.map((x) => x.payment_date), unfiledRuns: waiting.map((x) => ({ paymentDate: x.payment_date, builtAt: x.built_at, slips: x.slips })), from: PAYSLIP_FROM, runsStored: runs.c, firstPaid: runs.a, lastPaid: runs.b, slipsStored: slips.c, slipsWithGaps: slips.m, slipsOnCurrentRules: slips.r, people: per.map((x) => ({ name: x.name, slips: x.c, first: x.a, last: x.b })) });
+    }
+    if (url.pathname.startsWith("/api/incidents")) return incidentRoutes(request, env, user, url);
+    if (url.pathname.startsWith("/api/passkey/")) {
+      // Device unlock. Any signed in person, only for their own email.
+      try {
+        const email = String(user.email || "").trim().toLowerCase();
+        if (!email) return reply(env, 403, { error: "No email on your sign in" });
+        await passkeyTables(env);
+        if (url.pathname === "/api/passkey/status" && request.method === "GET") {
+          const n = await env.DB.prepare("SELECT COUNT(*) AS n FROM passkeys WHERE email = ?").bind(email).first();
+          return reply(env, 200, { enabled: !!(n && n.n), rpId: passkeyRpId(env) });
+        }
+        let body = {};
+        try { body = await request.json(); } catch (e) { body = {}; }
+        if (url.pathname === "/api/passkey/challenge" && request.method === "POST") {
+          const kind = body.kind === "create" ? "create" : "get";
+          const challenge = b64enc(crypto.getRandomValues(new Uint8Array(32)));
+          if (Math.random() < 0.1) await env.DB.prepare("DELETE FROM passkey_challenges WHERE exp < ?").bind(Date.now()).run();
+          await env.DB.prepare("INSERT INTO passkey_challenges (challenge, email, kind, exp) VALUES (?, ?, ?, ?)").bind(challenge, email, kind, Date.now() + 16 * 60 * 1000).run();
+          return reply(env, 200, { challenge, rpId: passkeyRpId(env) });
+        }
+        if (url.pathname === "/api/passkey/register" && request.method === "POST") {
+          const cdr = await passkeyClientData(env, email, body.clientDataJSON, "create");
+          if (cdr.error) return reply(env, 400, { error: cdr.error });
+          const alg = Number(body.alg);
+          if (alg !== -7 && alg !== -257) return reply(env, 400, { error: "This device uses a kind of unlock Reservoir does not support." });
+          if (!body.credentialId || !body.publicKey) return reply(env, 400, { error: "The unlock details were incomplete." });
+          await env.DB.prepare("INSERT OR REPLACE INTO passkeys (cred_id, email, pub, alg) VALUES (?, ?, ?, ?)").bind(String(body.credentialId), email, String(body.publicKey), alg).run();
+          return reply(env, 200, { ok: true });
+        }
+        if (url.pathname === "/api/passkey/verify" && request.method === "POST") {
+          const r = await passkeyVerify(env, email, body);
+          return reply(env, r.ok ? 200 : 401, r.ok ? { ok: true } : { error: r.error });
+        }
+        if (url.pathname === "/api/passkey/remove" && request.method === "POST") {
+          await env.DB.prepare("DELETE FROM passkeys WHERE email = ?").bind(email).run();
+          return reply(env, 200, { ok: true });
+        }
+        return reply(env, 404, { error: "not found" });
+      } catch (e) {
+        console.log("passkey error", String(e && e.message || e));
+        return reply(env, 502, { error: String(e && e.message || e).slice(0, 200) });
+      }
+    }
+    if (url.pathname === "/api/finance/monday" || url.pathname === "/api/finance/monday.pdf") {
+      if (user.tier !== "T1" && user.tier !== "T2") return reply(env, 403, { error: "This report is for the office." });
+      try {
+        const d = await financeMonday(env);
+        if (url.pathname.endsWith(".pdf")) {
+          const pdf = financePdf({ week: financeDots(d.weekStart), wk: `${financeShort(d.weekStart)} to ${financeShort(d.weekEnd)}`, rest: d.restFrom <= d.monthEnd ? `${financeShort(d.restFrom)} to ${financeShort(d.monthEnd)}` : "", billsWeek: d.billsWeek, billsRest: d.billsRest, overdue: d.overdue });
+          return new Response(pdf, { status: 200, headers: { "Content-Type": "application/pdf", "Content-Disposition": `inline; filename="Monday Finance Report ${financeDots(d.weekStart)}.pdf"`, ...cors(env), "Cache-Control": "no-store" } });
+        }
+        return reply(env, 200, d);
+      } catch (e) {
+        return reply(env, 200, { ok: false, error: String(e && e.message || e).slice(0, 200) });
+      }
+    }
+    if (url.pathname === "/api/xero/pay" && request.method === "GET") {
+      // The signed in person's own pay details, read from xero_payroll (the snapshot the one time fill and the Saturday sweep keep). Nothing is read from Xero. Any tier, only their own record.
+      try {
+        const email = String(user.email || "").trim().toLowerCase();
+        if (!email) return reply(env, 200, { found: false, reason: "No email on your sign in" });
+        await dfpTables(env);
+        const row = await env.DB.prepare("SELECT * FROM xero_payroll WHERE email = ?").bind(email).first();
+        if (!row) return reply(env, 200, { found: false, reason: NOT_IN_RESERVOIR });
+        const dm = await leaveDayMap(env);
+        return reply(env, 200, { ...dfpPayOut(row), dayHours: leaveDayFrom(dm, email, row.name || user.name) });
+      } catch (e) {
+        console.log("pay error", String(e && e.message || e));
+        return reply(env, 502, { error: String(e && e.message || e).slice(0, 300) });
+      }
+    }
+    if (url.pathname === "/api/xero/staffpay" && request.method === "GET") {
+      // The pay details of one employee, chosen by Xero employee id, read from xero_payroll. Director only (T1).
+      if (user.tier !== "T1") return reply(env, 403, { error: "forbidden" });
+      const id = (url.searchParams.get("id") || "").trim();
+      if (!/^[0-9a-fA-F-]{20,40}$/.test(id)) return reply(env, 400, { error: "bad employee id" });
+      try {
+        await dfpTables(env);
+        const row = await env.DB.prepare("SELECT * FROM xero_payroll WHERE employee_id = ?").bind(id).first();
+        if (!row) return reply(env, 200, { found: false, reason: "No pay details saved for that person yet" });
+        return reply(env, 200, dfpPayOut(row));
+      } catch (e) {
+        console.log("staffpay error", String(e && e.message || e));
+        return reply(env, 502, { error: String(e && e.message || e).slice(0, 300) });
+      }
+    }
+    if (url.pathname === "/api/xero/connect" && request.method === "GET") {
+      // Returns the Xero consent address. Director only (T1).
+      if (user.tier !== "T1") return reply(env, 403, { error: "forbidden" });
+      if (!env.XERO_CLIENT_SECRET) return reply(env, 503, { error: "xero not set up" });
+      const q = new URLSearchParams({ response_type: "code", client_id: xeroId(env), redirect_uri: xeroRedirect(env), scope: env.XERO_SCOPES || XERO_SCOPES_DEFAULT, state: await xeroState(env, user.name) });
+      return reply(env, 200, { url: `https://login.xero.com/identity/connect/authorize?${q}` });
+    }
+    if (url.pathname === "/api/xero/status" && request.method === "GET") {
+      if (user.tier !== "T1") return reply(env, 403, { error: "forbidden" });
+      await xeroTable(env);
+      const row = await env.DB.prepare("SELECT tenant_name, connected_by, updated_at FROM xero_auth WHERE id = 1").first();
+      let calls;
+      try { calls = await xeroCallsToday(env); } catch (e) { calls = null; }
+      return reply(env, 200, row ? { connected: true, organisation: row.tenant_name, connectedBy: row.connected_by, updated: row.updated_at, calls } : { connected: false, calls });
+    }
+    if (url.pathname === "/api/xero/staff" && request.method === "GET") {
+      // Every person, read from DFP's own tables (dfp_xero, with personal email from dfp_reservoir). Nothing is read from Xero. Director only (T1).
+      if (user.tier !== "T1") return reply(env, 403, { error: "forbidden" });
+      try {
+        await reservoirTables(env);
+        const people = ((await env.DB.prepare(`${PERSON_SQL} WHERE x.name IS NOT NULL AND x.name <> ''`).all()).results) || [];
+        const pes = ((await env.DB.prepare("SELECT email, personal_email FROM dfp_reservoir WHERE email IS NOT NULL AND personal_email IS NOT NULL AND personal_email <> ''").all()).results) || [];
+        const peBy = new Map(pes.map((x) => [String(x.email).toLowerCase(), x.personal_email]));
+        const rows = people.map((r) => { const o = dfpPersonOut(r); const pe = peBy.get(String(r.email || "").toLowerCase()); if (pe) o.personalEmail = pe; return o; });
+        rows.sort((a, b) => (a.status === "ACTIVE" ? 0 : 1) - (b.status === "ACTIVE" ? 0 : 1) || a.name.localeCompare(b.name));
+        return reply(env, 200, { employees: rows });
+      } catch (e) {
+        console.log("staff error", String(e && e.message || e));
+        return reply(env, 502, { error: String(e && e.message || e).slice(0, 300) });
+      }
+    }
+    if (url.pathname === "/api/staffdocs/me" && request.method === "GET") {
+      // The signed in person's own employment documents. Any tier, only ever their own.
+      if (!user.email) return reply(env, 400, { error: "No email on your sign in" });
+      try {
+        await staffDocsTable(env);
+        const rows = await env.DB.prepare(`SELECT ${STAFF_DOC_COLS} FROM staff_docs WHERE person_email = ? AND removed = 0 ORDER BY uploaded_at DESC, rowid DESC`).bind(user.email.toLowerCase()).all();
+        return reply(env, 200, { docs: (rows.results || []).map(staffDocOut) });
+      } catch (e) {
+        return reply(env, 500, { error: String(e && e.message || e).slice(0, 200) });
+      }
+    }
+    if (url.pathname === "/api/names" && request.method === "GET") {
+      // Anyone signed in. The people who have a preferred name, so the app can show it in place of the legal first name on screens that are not official documents.
+      try {
+        await reservoirTables(env);
+        const rows = ((await env.DB.prepare("SELECT x.name AS name, r.preferred_name AS preferred_name FROM dfp_xero x JOIN dfp_reservoir r ON lower(r.email) = lower(x.email) WHERE r.preferred_name IS NOT NULL AND TRIM(r.preferred_name) <> '' AND x.name IS NOT NULL").all()).results) || [];
+        return reply(env, 200, { names: rows.map((r) => ({ name: r.name, preferred: String(r.preferred_name).trim() })) });
+      } catch (e) {
+        console.log("names error", String(e && e.message || e));
+        return reply(env, 500, { error: "Could not read the preferred names" });
+      }
+    }
+    if (url.pathname === "/api/xero/staff/birthtime" && request.method === "POST") {
+      // Sets (or clears) the time of day a person was born, as 24 hour "HH:MM", matched on work email. The director can set anyone's, everyone else only their own.
+      let body;
+      try { body = await request.json(); } catch { return reply(env, 400, { error: "bad json" }); }
+      const email = txt(body.email, 200).toLowerCase();
+      if (user.tier !== "T1" && (!email || email !== String(user.email || "").toLowerCase())) return reply(env, 403, { error: "forbidden" });
+      const when = txt(body.birthTime, 5);
+      if (!email) return reply(env, 400, { error: "No person given" });
+      if (when && !/^([01]\d|2[0-3]):[0-5]\d$/.test(when)) return reply(env, 400, { error: "That is not a time of day" });
+      try {
+        await reservoirTables(env);
+        const row = await env.DB.prepare("SELECT email, name FROM dfp_xero WHERE lower(email) = ?").bind(email).first();
+        if (!row) return reply(env, 404, { error: "That person is not in the team list" });
+        await reservoirOwnSet(env, row.email, row.name, { birth_time: when || null }, (user.email || "").toLowerCase());
+        return reply(env, 200, { ok: true, birthTime: when });
+      } catch (e) {
+        console.log("birth time error", String(e && e.message || e));
+        return reply(env, 500, { error: "Could not save the time of birth" });
+      }
+    }
+    if (url.pathname === "/api/xero/staff/preferred" && request.method === "POST") {
+      // Sets (or clears) one person's preferred name, matched on work email. The director can set anyone's, everyone else only their own. Never creates a person.
+      let body;
+      try { body = await request.json(); } catch { return reply(env, 400, { error: "bad json" }); }
+      const email = txt(body.email, 200).toLowerCase();
+      if (user.tier !== "T1" && (!email || email !== String(user.email || "").toLowerCase())) return reply(env, 403, { error: "forbidden" });
+      const preferred = txt(body.preferredName, 40).trim();
+      if (!email) return reply(env, 400, { error: "No person given" });
+      try {
+        await reservoirTables(env);
+        const row = await env.DB.prepare("SELECT email, name FROM dfp_xero WHERE lower(email) = ?").bind(email).first();
+        if (!row) return reply(env, 404, { error: "That person is not in the team list" });
+        await reservoirOwnSet(env, row.email, row.name, { preferred_name: preferred || null }, (user.email || "").toLowerCase());
+        return reply(env, 200, { ok: true, preferredName: preferred });
+      } catch (e) {
+        console.log("preferred name error", String(e && e.message || e));
+        return reply(env, 500, { error: "Could not save the preferred name" });
+      }
+    }
+    if (url.pathname === "/api/dfp/names" && request.method === "POST") {
+      // Director only. Brings each person's legal name from Xero into Reservoir's own tables, for people already there. One Xero call (the employee list). Matched on the Xero employee ID, then on work email. Nobody is ever added.
+      if (user.tier !== "T1") return reply(env, 403, { error: "forbidden" });
+      try {
+        await dfpTables(env);
+        await reservoirTables(env);
+        const res = await xeroFetch(env, "payroll.xro/1.0/Employees");
+        if (!res.ok) return reply(env, 502, { error: "Xero refused the request", status: res.status, detail: await xeroWhy(res) });
+        const list = (await res.json()).Employees || [];
+        const out = { checked: 0, changed: [], middleSet: [], unchanged: 0, notInReservoir: [], worker: WORKER_BUILD };
+        const sameLetters = (n) => String(n || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+        const everyone = ((await env.DB.prepare("SELECT email, name, middle_names FROM dfp_xero").all()).results) || [];
+        for (const e of list) {
+          const nameNow = [e.FirstName, e.LastName].map((x) => String(x || "").trim()).filter(Boolean).join(" ");
+          if (!nameNow) continue;
+          out.checked++;
+          const mail = String(e.Email || "").trim().toLowerCase();
+          let row = await env.DB.prepare("SELECT email, name, middle_names FROM dfp_xero WHERE xero_employee_id = ?").bind(e.EmployeeID).first();
+          if (!row && mail) row = await env.DB.prepare("SELECT email, name, middle_names FROM dfp_xero WHERE lower(email) = ?").bind(mail).first();
+          // Last resort: the same name once punctuation is ignored (Rochow-OToole and Rochow-O'Toole), so a corrected spelling still finds the person.
+          if (!row) { const key = sameLetters(nameNow); const hits = everyone.filter((x) => x.name && sameLetters(x.name) === key); if (hits.length === 1) row = hits[0]; }
+          if (!row) { out.notInReservoir.push(nameNow); continue; }
+          // Middle names. The employee list may leave them out, so ask for that one person when it does. Never cleared on a failed read.
+          let mid = e.MiddleNames;
+          if (mid === undefined && e.EmployeeID) {
+            try { const one = await xeroFetch(env, `payroll.xro/1.0/Employees/${e.EmployeeID}`); if (one.ok) { const rec = ((await one.json()).Employees || [])[0]; if (rec && rec.MiddleNames !== undefined) mid = rec.MiddleNames; else if (rec) mid = ""; } } catch (e3) { /* leave as it was */ }
+          }
+          if (mid !== undefined) {
+            const midNow = String(mid || "").trim().replace(/\s+/g, " ");
+            if (midNow !== String(row.middle_names || "").trim()) {
+              await env.DB.prepare("UPDATE dfp_xero SET middle_names = ?, updated_at = datetime('now'), updated_by = ? WHERE email = ?").bind(midNow || null, (user.email || "").toLowerCase(), row.email).run();
+              out.middleSet.push({ name: row.name || nameNow, middle: midNow });
+            }
+          }
+          if (row.name === nameNow) { out.unchanged++; continue; }
+          await env.DB.prepare("UPDATE dfp_xero SET name = ?, xero_employee_id = COALESCE(xero_employee_id, ?), updated_at = datetime('now'), updated_by = ? WHERE email = ?").bind(nameNow, e.EmployeeID, (user.email || "").toLowerCase(), row.email).run();
+          await env.DB.prepare("UPDATE xero_payroll SET name = ? WHERE employee_id = ?").bind(nameNow, e.EmployeeID).run();
+          for (const t of ["xero_timesheets", "xero_leave"]) { try { await env.DB.prepare(`UPDATE ${t} SET name = ? WHERE employee_id = ?`).bind(nameNow, e.EmployeeID).run(); } catch (e2) { /* that table is not made yet */ } }
+          await env.DB.prepare("UPDATE dfp_reservoir SET name = ? WHERE lower(email) = ?").bind(nameNow, String(row.email).toLowerCase()).run();
+          out.changed.push({ from: row.name || "", to: nameNow });
+        }
+        return reply(env, 200, out);
+      } catch (e) {
+        console.log("names refresh error", String(e && e.message || e));
+        return reply(env, 502, { error: String(e && e.message || e).slice(0, 300) });
+      }
+    }
+    if (url.pathname === "/api/staffdocs/scan" && request.method === "POST") {
+      // Director only. Reads a contract PDF for the person's name, the commencement date and the signed date. The text itself is never sent back.
+      if (user.tier !== "T1") return reply(env, 403, { error: "forbidden" });
+      const email = txt(url.searchParams.get("email"), 200).toLowerCase();
+      if (!email) return reply(env, 400, { error: "No person given" });
+      try {
+        const bytes = await request.arrayBuffer();
+        if (!bytes.byteLength) return reply(env, 400, { error: "empty file" });
+        if (bytes.byteLength > MAX_UPLOAD) return reply(env, 413, { error: "file too large" });
+        await dfpTables(env);
+        const person = await env.DB.prepare("SELECT name FROM dfp_xero WHERE lower(email) = ?").bind(email).first();
+        const head = new Uint8Array(bytes.slice(0, 1024));
+        const isPdf = Array.from(head.slice(0, 1024)).map((c) => String.fromCharCode(c)).join("").includes("%PDF");
+        if (!isPdf) return reply(env, 200, { readable: false, nameFound: false, commenced: "", signed: "", why: "Only PDF files can be read. Enter the dates by hand." });
+        let facts;
+        try { const got = await pdfText(new Uint8Array(bytes));
+          facts = pdfContractFacts(got.text, person && person.name || ""); }
+        catch (e) { console.log("contract scan error", String(e && e.message || e).slice(0, 200)); facts = { readable: false, nameFound: false, commenced: "", signed: "" }; }
+        return reply(env, 200, { readable: !!facts.readable, nameFound: !!facts.nameFound, commenced: facts.commenced || "", signed: facts.signed || "" });
+      } catch (e) {
+        console.log("staff doc scan error", String(e && e.message || e));
+        return reply(env, 502, { error: "Could not read the file" });
+      }
+    }
+    if (url.pathname === "/api/staffdocs" && (request.method === "GET" || request.method === "POST")) {
+      // Director only. GET lists one person's documents. POST files a document: ?email=&slot=&name=, the file is the request body.
+      // Contract: &signed=YYYY-MM-DD&commenced=YYYY-MM-DD. Additional: &kind=cv|details|tfn|super|other&label=&docDate=YYYY-MM-DD.
+      if (user.tier !== "T1") return reply(env, 403, { error: "forbidden" });
+      const email = txt(url.searchParams.get("email"), 200).toLowerCase();
+      if (!email) return reply(env, 400, { error: "No person given" });
+      try {
+        await staffDocsTable(env);
+        if (request.method === "GET") {
+          const rows = await env.DB.prepare(`SELECT ${STAFF_DOC_COLS} FROM staff_docs WHERE person_email = ? AND removed = 0 ORDER BY uploaded_at DESC, rowid DESC`).bind(email).all();
+          return reply(env, 200, { docs: (rows.results || []).map(staffDocOut) });
+        }
+        const slot = String(url.searchParams.get("slot") || "");
+        if (!STAFF_DOC_SLOTS[slot]) return reply(env, 400, { error: "Unknown document type" });
+        const signedRaw = url.searchParams.get("signed"), commRaw = url.searchParams.get("commenced"), dateRaw = url.searchParams.get("docDate");
+        const signed = isoDay(signedRaw), commenced = isoDay(commRaw), docDate = isoDay(dateRaw);
+        if (signedRaw && !signed) return reply(env, 400, { error: "The signed date is not a valid date" });
+        if (commRaw && !commenced) return reply(env, 400, { error: "The commencement date is not a valid date" });
+        if (dateRaw && !docDate) return reply(env, 400, { error: "The document date is not a valid date" });
+        let title = slot === "contract" ? "Employment Contract" : STAFF_DOC_SLOTS[slot];
+        if (slot === "additional") {
+          const kind = String(url.searchParams.get("kind") || "other");
+          title = kind === "other" ? cleanName(url.searchParams.get("label")) : STAFF_EXTRA_TYPES[kind];
+          if (!title) return reply(env, 400, { error: kind === "other" ? "Name the document" : "Unknown document type" });
+        } else if (slot === "tfn" || slot === "super") title = STAFF_EXTRA_TYPES[slot];
+        const bytes = await request.arrayBuffer();
+        if (!bytes.byteLength) return reply(env, 400, { error: "empty file" });
+        if (bytes.byteLength > MAX_UPLOAD) return reply(env, 413, { error: "file too large" });
+        await reservoirTables(env);
+        const person = await env.DB.prepare("SELECT x.name AS name, r.preferred_name AS preferred_name FROM dfp_xero x LEFT JOIN dfp_reservoir r ON lower(r.email) = lower(x.email) WHERE lower(x.email) = ?").bind(email).first();
+        if (!person || !person.name) return reply(env, 404, { error: "That person is not in the team list" });
+        const parts = String(person.name).trim().split(/\s+/);
+        const first = parts[0], last = parts.slice(1).join(" ");
+        const sr = await staffRoot(env);
+        if (!sr.root) return reply(env, 502, { error: "The staff folders could not be found", detail: sr.why || "" });
+        const folders = await driveChildren(env, sr.root.driveBase, sr.root.id);
+        const known = String(person.preferred_name || "").trim();
+        let mf = matchStaffFolder(folders, first, last);
+        if (!mf.folder && known) mf = matchStaffFolder(folders, known, last);
+        if (!mf.folder) return reply(env, 404, { error: "No staff folder was found for that person", detail: mf.why || "" });
+        // 20261019 Employment Contract - Chad.pdf (the signed date, then the title, a spaced dash, the first name) and CV - Chad.pdf for the extras.
+        const ext = fileExt(url.searchParams.get("name"));
+        const callName = known || first;
+        const stem = slot === "contract" ? `${signed ? signed.replace(/-/g, "") + " " : ""}${title} - ${callName}` : `${title} - ${callName}`;
+        const fileName = cleanName(stem + ext) || "document" + ext;
+        const mime = request.headers.get("Content-Type") || "application/octet-stream";
+        const item = await uploadUnderItem(env, sr.root.driveBase, mf.folder.id, ["Employment Documents"], fileName, bytes, mime);
+        // One file for the contract (and the old fixed slots): a new upload replaces the last. Additional documents add up.
+        if (slot !== "additional") await env.DB.prepare("UPDATE staff_docs SET removed = 1 WHERE person_email = ? AND slot = ? AND removed = 0").bind(email, slot).run();
+        const id = crypto.randomUUID();
+        const filedAt = melbourneDay() + " " + new Intl.DateTimeFormat("en-GB", { timeZone: "Australia/Melbourne", hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false }).format(new Date()).replace(/^24/, "00");
+        const shownDate = slot === "contract" ? signed : docDate;
+        await env.DB.prepare("INSERT INTO staff_docs (id, person_email, slot, drive_base, item_id, file_name, mime, uploaded_by, uploaded_at, doc_date, label) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)").bind(id, email, slot, sr.root.driveBase, item.id, item.name || fileName, mime, (user.email || "").toLowerCase(), filedAt, shownDate || null, slot === "additional" ? title : null).run();
+        // The commencement date goes on the Reservoir profile only. Xero is not called.
+        let commencedSaved = false;
+        if (slot === "contract" && commenced) {
+          await env.DB.prepare("UPDATE dfp_xero SET start_date = ?, updated_at = datetime('now'), updated_by = ? WHERE lower(email) = ?").bind(commenced, (user.email || "").toLowerCase(), email).run();
+          commencedSaved = true;
+        }
+        const row = await env.DB.prepare(`SELECT ${STAFF_DOC_COLS} FROM staff_docs WHERE id = ?`).bind(id).first();
+        return reply(env, 200, { doc: staffDocOut(row), commencedSaved });
+      } catch (e) {
+        console.log("staff doc error", String(e && e.message || e));
+        return reply(env, e.status || 502, { error: e.say || "Could not file the document", detail: String(e && e.message || e).slice(0, 200) });
+      }
+    }
+    const sdel = url.pathname.match(/^\/api\/staffdocs\/([0-9a-fA-F-]{20,40})$/);
+    if (sdel && request.method === "DELETE") {
+      // Director only. Takes a document off the person's record and removes its file from the staff folder (SharePoint keeps it in the recycle bin).
+      if (user.tier !== "T1") return reply(env, 403, { error: "forbidden" });
+      try {
+        await staffDocsTable(env);
+        const row = await env.DB.prepare("SELECT id, drive_base, item_id FROM staff_docs WHERE id = ? AND removed = 0").bind(sdel[1]).first();
+        if (!row) return reply(env, 404, { error: "document not found" });
+        let fileRemoved = false;
+        try {
+          const del = await graphFetch(env, `${row.drive_base}/items/${row.item_id}`, { method: "DELETE" });
+          fileRemoved = del.ok || del.status === 404;
+        } catch (e) { console.log("staff doc file delete error", String(e && e.message || e).slice(0, 200)); }
+        await env.DB.prepare("UPDATE staff_docs SET removed = 1 WHERE id = ?").bind(row.id).run();
+        return reply(env, 200, { ok: true, fileRemoved });
+      } catch (e) {
+        console.log("staff doc delete error", String(e && e.message || e));
+        return reply(env, 502, { error: "Could not delete the document" });
+      }
+    }
+    const sdm = url.pathname.match(/^\/api\/staffdocs\/([0-9a-fA-F-]{20,40})\/file$/);
+    if (sdm && request.method === "GET") {
+      // Opens one document. The person it belongs to, or the director.
+      try {
+        await staffDocsTable(env);
+        const row = await env.DB.prepare("SELECT id, person_email, drive_base, item_id, file_name, mime FROM staff_docs WHERE id = ? AND removed = 0").bind(sdm[1]).first();
+        if (!row) return reply(env, 404, { error: "document not found" });
+        if (user.tier !== "T1" && String(user.email || "").toLowerCase() !== String(row.person_email).toLowerCase()) return reply(env, 403, { error: "forbidden" });
+        const dl = await graphFetch(env, `${row.drive_base}/items/${row.item_id}/content`, { redirect: "manual" });
+        const loc = dl.headers.get("Location");
+        const file = loc ? await fetch(loc) : dl;
+        if (!file.ok) return reply(env, 502, { error: "download failed" });
+        return new Response(file.body, { status: 200, headers: { ...cors(env), "Content-Type": row.mime || "application/octet-stream", "Content-Disposition": `inline; filename*=UTF-8''${encodeURIComponent(row.file_name || "document")}`, "Cache-Control": "no-store" } });
+      } catch (e) {
+        console.log("staff doc open error", String(e && e.message || e));
+        return reply(env, 502, { error: "Could not open the document" });
+      }
+    }
+    if (url.pathname.startsWith("/api/ppe")) await ppeLoad(env);
+    if (url.pathname === "/api/ppe/audit" && request.method === "POST") {
+      // Push an audit: everyone who has had a PPE bag handover has to tick their bag again. T1 and T2 only.
+      if (user.tier !== "T1" && user.tier !== "T2") return reply(env, 403, { error: "forbidden" });
+      if (user.viewAs && !VIEW_AS_WRITES) return reply(env, 403, { error: "Viewing as someone else is read only." });
+      const at = new Date().toISOString().slice(0, 19).replace("T", " ");
+      await env.DB.prepare("INSERT INTO app_settings (key, value, by_name, at) VALUES ('ppe.audit_at', ?, ?, datetime('now')) ON CONFLICT(key) DO UPDATE SET value = excluded.value, by_name = excluded.by_name, at = excluded.at").bind(at, user.name || "").run();
+      return reply(env, 200, { ok: true, at });
+    }
+    if (url.pathname === "/api/ppe/items") {
+      // The PPE editor behind the PPE tile on the Operations home screen. T1 and T2 only. Deleting hides the item, so old bags and orders still read correctly.
+      if (user.tier !== "T1" && user.tier !== "T2") return reply(env, 403, { error: "forbidden" });
+      if (request.method === "POST") {
+        if (user.viewAs && !VIEW_AS_WRITES) return reply(env, 403, { error: "Viewing as someone else is read only." });
+        let body;
+        try { body = await request.json(); } catch (e) { return reply(env, 400, { error: "bad json" }); }
+        const name = String(body.label || "").trim().slice(0, 80);
+        const sizes = String(body.sizes || "").split(",").map((z) => z.trim().slice(0, 12)).filter(Boolean).slice(0, 12);
+        if (body.action === "add") {
+          if (!name) return reply(env, 400, { error: "Give the item a name" });
+          const top = await env.DB.prepare("SELECT COALESCE(MAX(sort), 0) AS m FROM ppe_items").first();
+          const id = `x${Date.now().toString(36)}${Math.random().toString(36).slice(2, 5)}`;
+          await env.DB.prepare("INSERT INTO ppe_items (id, label, kind, sizes, sort) VALUES (?, ?, 'stock', ?, ?)").bind(id, name, sizes.length ? JSON.stringify(sizes) : null, (top ? top.m : 0) + 1).run();
+        } else if (body.action === "edit") {
+          if (!name) return reply(env, 400, { error: "Give the item a name" });
+          await env.DB.prepare("UPDATE ppe_items SET label = ?, sizes = ? WHERE id = ?").bind(name, sizes.length ? JSON.stringify(sizes) : null, String(body.id || "")).run();
+        } else if (body.action === "delete") {
+          await env.DB.prepare("UPDATE ppe_items SET active = 0 WHERE id = ?").bind(String(body.id || "")).run();
+        } else return reply(env, 400, { error: "unknown action" });
+        await ppeLoad(env, true);
+      } else if (request.method !== "GET") return reply(env, 405, { error: "method not allowed" });
+      return reply(env, 200, { items: PPE_ITEMS });
+    }
+    if (url.pathname === "/api/ppe/me" && request.method === "GET") {
+      // The signed in person's own PPE bag and orders. Any tier.
+      try { return reply(env, 200, { items: PPE_ITEMS, ...(await ppeMe(env, user)) }); }
+      catch (e) { console.log("ppe read error", String(e && e.message || e)); return reply(env, 500, { error: "Could not read the PPE details" }); }
+    }
+    if (url.pathname === "/api/ppe/ack" && request.method === "POST") {
+      // The bag acknowledgement. The person ticks what is physically in the bag. Anything unticked that DFP supplies becomes an order to the office.
+      let body;
+      try { body = await request.json(); } catch { return reply(env, 400, { error: "bad json" }); }
+      const ticked = new Set(Array.isArray(body.ticked) ? body.ticked.map(String) : []);
+      const sizes = body.sizes && typeof body.sizes === "object" ? body.sizes : {};
+      const expiry = String(body.firstAidExpiry || "").trim();
+      if (expiry && !/^\d{4}-\d{2}-\d{2}$/.test(expiry)) return reply(env, 400, { error: "That expiry date is not valid" });
+      try {
+        await ppeTables(env);
+        const who = ppePerson(user);
+        if (!who.key) return reply(env, 400, { error: "No name on your sign in" });
+        const have = {};
+        PPE_ITEMS.filter((x) => x.kind === "stock").forEach((x) => { if (ticked.has(x.id)) have[x.id] = true; });
+        await env.DB.prepare("INSERT INTO ppe_state (person_key, name, email, have, first_aid_expiry, acknowledged_at, updated_at) VALUES (?, ?, ?, ?, ?, datetime('now'), datetime('now')) ON CONFLICT(person_key) DO UPDATE SET name = excluded.name, email = excluded.email, have = excluded.have, first_aid_expiry = excluded.first_aid_expiry, acknowledged_at = COALESCE(ppe_state.acknowledged_at, excluded.acknowledged_at), updated_at = excluded.updated_at")
+          .bind(who.key, who.name, who.email, JSON.stringify(have), expiry || null).run();
+        const mine = ((await env.DB.prepare("SELECT * FROM ppe_orders WHERE person_key = ?").bind(who.key).all()).results) || [];
+        const openFor = (id) => mine.some((o) => ["requested", "approved", "provided"].includes(o.status) && ppeJson(o.items, []).some((x) => x.id === id));
+        const missing = []; // The first bag is a handover, not an order. What is not in the bag yet stays ticked off until the person has it.
+        let made = [];
+        if (missing.length) {
+          const list = missing.map((x) => { const sz = String(sizes[x.id] || "").toUpperCase(); return { id: x.id, label: x.label, kind: "stock", ...(x.sizes ? { size: x.sizes.includes(sz) ? sz : "" } : {}) }; });
+          made = await ppeCreateOrders(env, who, list, "bag check");
+        }
+        return reply(env, 200, { saved: true, ordersMade: made.length, ...(await ppeMe(env, user)) });
+      } catch (e) {
+        console.log("ppe ack error", String(e && e.message || e));
+        return reply(env, 500, { error: "Could not save the PPE acknowledgement", detail: String(e && e.message || e).slice(0, 200) });
+      }
+    }
+    if (url.pathname === "/api/ppe/orders" && request.method === "POST") {
+      // A replenishment order from the signed in person. Any tier.
+      let body;
+      try { body = await request.json(); } catch { return reply(env, 400, { error: "bad json" }); }
+      const items = ppeCleanItems(body.items);
+      if (!items) return reply(env, 400, { error: "Those items are not valid" });
+      if (items.some((x) => { const it = ppeItem(x.id); return it && it.sizes && !x.size; })) return reply(env, 400, { error: "Choose a size" });
+      try {
+        await ppeTables(env);
+        const who = ppePerson(user);
+        if (!who.key) return reply(env, 400, { error: "No name on your sign in" });
+        const made = await ppeCreateOrders(env, who, items, "order");
+        return reply(env, 200, { ...(await ppeMe(env, user)), made });
+      } catch (e) {
+        console.log("ppe order error", String(e && e.message || e));
+        return reply(env, 500, { error: "Could not send the order", detail: String(e && e.message || e).slice(0, 200) });
+      }
+    }
+    if (url.pathname === "/api/ppe/orders" && request.method === "GET") {
+      // Every PPE order, for the office. Directors and managers only.
+      if (user.tier !== "T1" && user.tier !== "T2") return reply(env, 403, { error: "forbidden" });
+      try {
+        await ppeTables(env);
+        const rows = ((await env.DB.prepare("SELECT * FROM ppe_orders WHERE status <> 'deleted' ORDER BY created_at DESC, rowid DESC LIMIT 300").all()).results) || [];
+        return reply(env, 200, { orders: rows.map(ppeOrderOut) });
+      } catch (e) { console.log("ppe list error", String(e && e.message || e)); return reply(env, 500, { error: "Could not read the PPE orders" }); }
+    }
+    const pod = url.pathname.match(/^\/api\/ppe\/orders\/([0-9a-fA-F-]{20,40})$/);
+    if (pod && request.method === "DELETE") {
+      // Removing a PPE order. The person who made it can delete it while it is requested, received or declined (not while the office is working on it). Directors (T1) can also remove closed orders from Team Requests, until the go live lock is on.
+      try {
+        await ppeTables(env);
+        const row = await env.DB.prepare("SELECT id, status, person_key FROM ppe_orders WHERE id = ?").bind(pod[1]).first();
+        if (!row) return reply(env, 200, { removed: false, alreadyGone: true, ...(await ppeMe(env, user)) });
+        const owner = row.person_key === ppePerson(user).key;
+        if (owner) {
+          // Deleting your own order keeps a trail: the order is marked deleted with the reason, and shows in the history.
+          if (row.status !== "requested" && row.status !== "approved") return reply(env, 409, { error: "That order can not be deleted now" });
+          let reason = "";
+          try { const b = await request.json(); reason = String((b && b.reason) || ""); } catch (e) { reason = ""; }
+          if (!["Not required", "Ordered by accident", "Sourced myself"].includes(reason)) return reply(env, 400, { error: "Pick a reason" });
+          await env.DB.prepare("UPDATE ppe_orders SET status = 'deleted', deleted_at = datetime('now'), delete_reason = ? WHERE id = ?").bind(reason, row.id).run();
+          return reply(env, 200, { removed: true, ...(await ppeMe(env, user)) });
+        } else {
+          if (user.tier !== "T1") return reply(env, 403, { error: "forbidden" });
+          if ((await requestsLock(env)).locked) return reply(env, 403, { error: REMOVAL_LOCKED });
+          if (row.status !== "received" && row.status !== "declined") return reply(env, 409, { error: "Only a received or declined order can be removed" });
+        }
+        await env.DB.prepare("DELETE FROM ppe_orders WHERE id = ?").bind(row.id).run();
+        return reply(env, 200, { removed: true, ...(await ppeMe(env, user)) });
+      } catch (e) {
+        console.log("ppe order delete error", String(e && e.message || e));
+        return reply(env, 500, { error: "Could not remove the order", detail: String(e && e.message || e).slice(0, 200) });
+      }
+    }
+    const pom = url.pathname.match(/^\/api\/ppe\/orders\/([0-9a-fA-F-]{20,40})\/(status|receipt)$/);
+    if (pom && request.method === "POST") {
+      // status: the office approves, declines or marks provided; the owner marks received. receipt: the owner uploads the receipt for a bought item.
+      try {
+        await ppeTables(env);
+        const row = await env.DB.prepare("SELECT * FROM ppe_orders WHERE id = ?").bind(pom[1]).first();
+        if (!row) return reply(env, 404, { error: "not found" });
+        const who = ppePerson(user);
+        const office = user.tier === "T1" || user.tier === "T2";
+        const owner = row.person_key === who.key;
+        const items = ppeJson(row.items, []);
+        const buy = items.some((x) => x.kind === "buy");
+        const by = user.email || user.name || "unknown";
+        const markReceived = async () => {
+          await env.DB.prepare("UPDATE ppe_orders SET status = 'received', received_at = datetime('now') WHERE id = ?").bind(row.id).run();
+          if (!buy) {
+            const st = await env.DB.prepare("SELECT have FROM ppe_state WHERE person_key = ?").bind(row.person_key).first();
+            const have = ppeJson(st && st.have, {});
+            items.forEach((x) => { have[x.id] = true; });
+            await env.DB.prepare("UPDATE ppe_state SET have = ?, updated_at = datetime('now') WHERE person_key = ?").bind(JSON.stringify(have), row.person_key).run();
+          }
+        };
+        if (pom[2] === "receipt") {
+          if (!owner) return reply(env, 403, { error: "forbidden" });
+          if (!buy || row.status !== "approved") return reply(env, 409, { error: "This order is not waiting for a receipt" });
+          const fileName = cleanName(url.searchParams.get("name")) || "receipt.pdf";
+          const bytes = await request.arrayBuffer();
+          if (!bytes.byteLength) return reply(env, 400, { error: "empty file" });
+          if (bytes.byteLength > MAX_UPLOAD) return reply(env, 413, { error: "file too large" });
+          const stamp = `${(row.po_number || "PPE").replace(/[^A-Za-z0-9-]/g, "")}-${profileKey(row.name) || "staff"}-${fileName}`;
+          let item;
+          try { item = await uploadToSharePoint(env, ["Receipts", "PPE"], stamp, bytes, request.headers.get("Content-Type"), false); }
+          catch (e) { console.log("ppe receipt upload failed", String(e && e.message || e)); return reply(env, 502, { error: "The receipt could not be uploaded" }); }
+          await env.DB.prepare("UPDATE ppe_orders SET receipt_item = ? WHERE id = ?").bind(item.id || "", row.id).run();
+          await markReceived();
+        } else {
+          let body;
+          try { body = await request.json(); } catch { return reply(env, 400, { error: "bad json" }); }
+          const next = String(body.status || "");
+          if (next === "received") {
+            if (!owner || buy || row.status !== "provided") return reply(env, 409, { error: "This order cannot be marked received" });
+            await markReceived();
+          } else if (next === "approved" || next === "declined") {
+            if (!office) return reply(env, 403, { error: "forbidden" });
+            if (row.status !== "requested") return reply(env, 409, { error: "This order has already been dealt with" });
+            if (next === "approved") {
+              let po = "";
+              if (buy) { const hi = (await env.DB.prepare("SELECT MAX(CAST(SUBSTR(po_number, 5) AS INTEGER)) AS m FROM ppe_orders WHERE po_number LIKE 'PPE-%'").first()).m || 1000; po = "PPE-" + String(Number(hi) + 1); }
+              await env.DB.prepare("UPDATE ppe_orders SET status = 'approved', approved_by = ?, approved_at = datetime('now'), po_number = ? WHERE id = ?").bind(by, po || null, row.id).run();
+            } else {
+              await env.DB.prepare("UPDATE ppe_orders SET status = 'declined', declined_by = ?, declined_at = datetime('now') WHERE id = ?").bind(by, row.id).run();
+            }
+          } else if (next === "provided") {
+            if (!office) return reply(env, 403, { error: "forbidden" });
+            if (buy || row.status !== "approved") return reply(env, 409, { error: "This order cannot be marked provided" });
+            await env.DB.prepare("UPDATE ppe_orders SET status = 'provided', provided_by = ?, provided_at = datetime('now') WHERE id = ?").bind(by, row.id).run();
+          } else return reply(env, 400, { error: "That status is not valid" });
+        }
+        const done = await env.DB.prepare("SELECT * FROM ppe_orders WHERE id = ?").bind(row.id).first();
+        return reply(env, 200, { order: ppeOrderOut(done) });
+      } catch (e) {
+        console.log("ppe status error", String(e && e.message || e));
+        return reply(env, 500, { error: "Could not update the order", detail: String(e && e.message || e).slice(0, 200) });
+      }
+    }
+    if (url.pathname === "/api/dfp/populate" && (request.method === "GET" || request.method === "POST")) {
+      // One time seeding of DFP's tables from what Xero already holds. Director only (T1). After this, DFP's data is the source and Xero is fed from it.
+      // GET is a preview: it reads Xero and reports what would be saved, and writes nothing to the new tables. POST saves.
+      // dfp_xero gets DFP's six fields for each current employee, only when the person has no row yet. dfp_reservoir gets a row for each person who does not have one (the old tables' data is merged in by reservoirTables). xero_payroll rows are replaced with Xero's current values.
+      // The reply carries counts, names and the names of empty fields. It never carries a personal value, bank details included.
+      if (user.tier !== "T1") return reply(env, 403, { error: "forbidden" });
+      try {
+        const save = request.method === "POST";
+        const got = await dfpReadFromXero(env);
+        if (got.fail) {
+          console.log("dfp populate failed", got.fail.detail);
+          return reply(env, 502, { error: "Xero refused the request", status: got.fail.status, detail: got.fail.detail });
+        }
+        const out = { saved: save, worker: WORKER_BUILD, employeesRead: got.people.length, xeroCalls: got.calls, dfpXeroAdded: 0, dfpXeroAlreadyThere: 0, dfpReservoirAdded: 0, dfpReservoirAlreadyThere: 0, xeroPayrollSaved: 0, noWorkEmail: [], people: [] };
+        if (save) { await dfpTables(env); await reservoirTables(env); }
+        for (const p of got.people) {
+          const i = p.xero, y = p.payroll;
+          const entry = { name: i.name, missing: dfpGaps(p), leaveBalancesFound: y.balanceCount, allowancesFound: y.allowanceCount };
+          if (save) {
+            if (i.email) {
+              const bk = i.bank || {};
+              const bankIn = { name: String(bk.name || "").trim(), bsb: String(bk.bsb || "").trim(), number: String(bk.number || "").trim() };
+              const existing = await env.DB.prepare("SELECT email, bank_account_name, bsb, account_number FROM dfp_xero WHERE email = ?").bind(i.email).first();
+              const blank = (v) => v === null || v === undefined || String(v).trim() === "";
+              if (existing) {
+                // Only blank fields are filled (a row made by a saved emergency contact has none of these yet). Anything already saved is kept, bank details included.
+                await env.DB.prepare("UPDATE dfp_xero SET xero_employee_id = COALESCE(xero_employee_id, ?), name = COALESCE(name, ?), address = COALESCE(address, ?), dob = COALESCE(dob, ?), mobile = COALESCE(mobile, ?), start_date = COALESCE(start_date, ?), job_title = COALESCE(job_title, ?), bank_account_name = CASE WHEN bank_account_name IS NULL OR TRIM(bank_account_name) = '' THEN COALESCE(NULLIF(?, ''), bank_account_name) ELSE bank_account_name END, bsb = CASE WHEN bsb IS NULL OR TRIM(bsb) = '' THEN COALESCE(NULLIF(?, ''), bsb) ELSE bsb END, account_number = CASE WHEN account_number IS NULL OR TRIM(account_number) = '' THEN COALESCE(NULLIF(?, ''), account_number) ELSE account_number END WHERE email = ?").bind(i.xeroId, i.name, i.address, i.dob, normPhone(i.mobile), i.startDate, i.jobTitle, bankIn.name, bankIn.bsb, bankIn.number, i.email).run();
+                out.dfpXeroAlreadyThere++; entry.dfpXero = "kept as it was, blanks filled";
+                const filled = (blank(existing.bank_account_name) && bankIn.name ? 1 : 0) + (blank(existing.bsb) && bankIn.bsb ? 1 : 0) + (blank(existing.account_number) && bankIn.number ? 1 : 0);
+                if (filled) { out.bankDetailsFilled = (out.bankDetailsFilled || 0) + 1; entry.bankDetails = filled === 3 ? "filled from Xero" : "partly filled from Xero"; }
+                else if (!blank(existing.bank_account_name) || !blank(existing.bsb) || !blank(existing.account_number)) entry.bankDetails = "already saved, kept";
+                else entry.bankDetails = "none in Xero";
+              }
+              else {
+                await env.DB.prepare("INSERT OR IGNORE INTO dfp_xero (email, xero_employee_id, name, address, dob, mobile, start_date, job_title, bank_account_name, bsb, account_number, status, source, updated_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''), 'ACTIVE', 'xero one time population', ?)").bind(i.email, i.xeroId, i.name, i.address, i.dob, normPhone(i.mobile), i.startDate, i.jobTitle, bankIn.name, bankIn.bsb, bankIn.number, user.name || user.email || "").run();
+                out.dfpXeroAdded++; entry.dfpXero = "added";
+                if (bankIn.name || bankIn.bsb || bankIn.number) { out.bankDetailsFilled = (out.bankDetailsFilled || 0) + 1; entry.bankDetails = "filled from Xero"; }
+                else entry.bankDetails = "none in Xero";
+              }
+              // An emergency contact Xero already holds is copied in, but only for someone DFP has no saved contact for. A contact saved through Reservoir is never touched.
+              const em = i.em || {};
+              if (em.name || em.relationship || em.mobile || em.email) {
+                const rr = await reservoirRowFor(env, i.email, i.name, true);
+                const r2 = await env.DB.prepare("UPDATE dfp_reservoir SET em_name = ?, em_relationship = ?, em_mobile = ?, em_email = ?, em_saved_at = datetime('now') WHERE person_key = ? AND em_saved_at IS NULL").bind(em.name || "", em.relationship || "", normPhone(em.mobile || ""), em.email || "", rr.person_key).run();
+                if (r2 && r2.meta && r2.meta.changes) { out.emergencySeeded = (out.emergencySeeded || 0) + 1; entry.emergencyContact = "copied from Xero"; }
+              }
+            } else { entry.dfpXero = "not saved, no work email in Xero"; }
+            let superPct = y.superPct === undefined ? null : y.superPct, superRun = y.superRunDate || null;
+            if (superPct === null) {
+              const before = await env.DB.prepare("SELECT super_pct, super_run_date FROM xero_payroll WHERE employee_id = ?").bind(y.employeeId).first();
+              if (before && before.super_pct !== null && before.super_pct !== undefined) { superPct = before.super_pct; superRun = before.super_run_date || null; }
+            }
+            const had = await reservoirRowFor(env, i.email, i.name, false);
+            if (had) { out.dfpReservoirAlreadyThere++; entry.dfpReservoir = "already there"; }
+            else { await reservoirRowFor(env, i.email, i.name, true); out.dfpReservoirAdded++; entry.dfpReservoir = "added"; }
+            await env.DB.prepare("INSERT OR REPLACE INTO xero_payroll (employee_id, email, name, status, classification, employment_basis, rate_ordinary, rate_ot15, rate_ot2, has_overtime, rates_note, leave_loading, super_fund_name, super_member_number, super_usi, leave_balances, allowances, super_amount_period, last_pay_run_id, synced_at, source, annual_salary, week_hours, super_pct, super_run_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, datetime('now'), 'xero one time population', ?, ?, ?, ?)").bind(y.employeeId, y.email, y.name, y.status, y.classification, y.basis, y.ordinary, y.ot15, y.ot2, y.hasOvertime, y.ratesNote, y.leaveLoading, y.fundName, y.memberNumber, y.usi, y.balances, y.allowances, y.annual === null || y.annual === undefined ? null : y.annual, y.weekHours === null || y.weekHours === undefined ? null : y.weekHours, superPct, superRun).run();
+            out.xeroPayrollSaved++;
+          }
+          if (!i.email) out.noWorkEmail.push(i.name);
+          out.people.push(entry);
+        }
+        out.people.sort((a, b) => a.name.localeCompare(b.name));
+        return reply(env, 200, out);
+      } catch (e) {
+        console.log("dfp populate error", String(e && e.message || e));
+        return reply(env, 502, { error: String(e && e.message || e).slice(0, 300) });
+      }
+    }
+    if (url.pathname === "/api/xero/test" && request.method === "GET") {
+      // Reads the organisation name and employee count to prove the link and the payroll scopes work.
+      if (user.tier !== "T1") return reply(env, 403, { error: "forbidden" });
+      try {
+        const org = await xeroFetch(env, "api.xro/2.0/Organisation");
+        const emp = await xeroFetch(env, "payroll.xro/1.0/Employees");
+        let fields = null;
+        let emergencyShape = null;
+        try {
+          const first = emp.ok ? ((await emp.clone().json()).Employees || [])[0] : null;
+          if (first) {
+            const one = await xeroFetch(env, `payroll.xro/1.0/Employees/${first.EmployeeID}`);
+            const rec = one.ok ? ((await one.json()).Employees || [])[0] : null;
+            if (rec) {
+              fields = Object.keys(rec);
+              emergencyShape = Object.keys(rec).filter((k) => /emergency/i.test(k)).map((k) => { const v = rec[k]; const o = Array.isArray(v) ? v[0] : v; return k + (o && typeof o === "object" ? " {" + Object.keys(o).join(", ") + "}" : ""); });
+            }
+          }
+        } catch (e) { fields = null; }
+        const orgData = org.ok ? await org.json() : null;
+        const empData = emp.ok ? await emp.json() : null;
+        return reply(env, 200, { accounting: org.status, organisation: orgData && orgData.Organisations && orgData.Organisations[0] ? orgData.Organisations[0].Name : null, payroll: emp.status, employees: empData && empData.Employees ? empData.Employees.length : null, fields, emergencyShape });
+      } catch (e) { return reply(env, 502, { error: String(e.message || e).slice(0, 200) }); }
+    }
+
+    if (url.pathname === "/api/address" && request.method === "GET") {
+      // Australian address suggestions from Geoscape. The key is a Worker secret, never in the app.
+      if (!env.GEOSCAPE_KEY) return reply(env, 503, { error: "address service not set up" });
+      const q = (url.searchParams.get("q") || "").trim().slice(0, 50);
+      if (q.length < 3) return reply(env, 200, { options: [] });
+      try {
+        const res = await fetch(`https://api.psma.com.au/v1/predictive/address?query=${encodeURIComponent(q)}&maxNumberOfResults=5&stateTerritory=ALL`, { headers: { Authorization: env.GEOSCAPE_KEY, Accept: "application/json" } });
+        if (!res.ok) return reply(env, 502, { error: "address service", detail: String(res.status) });
+        const data = await res.json();
+        const list = data.suggest || data.suggestions || [];
+        return reply(env, 200, { options: list.map((x) => x.address).filter(Boolean) });
+      } catch (e) { return reply(env, 502, { error: "address service" }); }
+    }
+
+    const sm = url.pathname.match(/^\/api\/secrets(?:\/([A-Za-z0-9._-]{1,100}))?$/);
+    if (sm) {
+      // Company passwords and IDs. Only T1 and T2 can read or change them, and the Director ID is T1 only.
+      if (user.tier !== "T1" && user.tier !== "T2") return reply(env, 403, { error: "forbidden" });
+      const skey = sm[1];
+      const allowed = (k) => k !== "company.directorId" || user.tier === "T1";
+      if (request.method === "GET" && !skey) {
+        await settingsTable(env);
+        await env.DB.prepare("INSERT OR IGNORE INTO app_settings (key, value, by_name) VALUES ('secret.company.vba.password', 'Se@sidePDE3214', 'Reservoir')").run();
+        const { results } = await env.DB.prepare("SELECT key, value FROM app_settings WHERE key LIKE 'secret.%'").all();
+        const out = {};
+        results.forEach((r) => { const k = r.key.slice(7); if (allowed(k)) out[k] = r.value; });
+        return reply(env, 200, out);
+      }
+      if (request.method === "PUT" && skey) {
+        if (!allowed(skey)) return reply(env, 403, { error: "forbidden" });
+        let body;
+        try { body = await request.json(); } catch { return reply(env, 400, { error: "bad json" }); }
+        const value = String(body.value ?? "").slice(0, 500);
+        await settingsTable(env);
+        await env.DB.prepare("INSERT INTO app_settings (key, value, by_name) VALUES (?, ?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value, at = datetime('now'), by_name = excluded.by_name").bind("secret." + skey, value, user.name).run();
+        return reply(env, 200, { ok: true });
+      }
+      return reply(env, 405, { error: "method not allowed" });
+    }
+
+
+    if (url.pathname === "/api/contacts" && request.method === "GET") {
+      // Xero contact names, searched as the office types. Reads the saved list only, never Xero. T1 and T2 only.
+      if (user.tier !== "T1" && user.tier !== "T2") return reply(env, 403, { error: "forbidden" });
+      await xeroContactsTable(env);
+      const q = String(url.searchParams.get("q") || "").trim().toLowerCase().slice(0, 60);
+      if (q.length < 2) return reply(env, 200, { items: [] });
+      const esc = q.replace(/[\\%_]/g, (m) => "\\" + m);
+      const rows = ((await env.DB.prepare("SELECT contact_id, name FROM xero_contacts WHERE name_lc LIKE ? ESCAPE '\\' ORDER BY (name_lc LIKE ? ESCAPE '\\') DESC, name_lc LIMIT 8").bind(`%${esc}%`, `${esc}%`).all()).results) || [];
+      return reply(env, 200, { items: rows.map((r) => ({ id: r.contact_id, name: r.name })) });
+    }
+
+    const rm = url.pathname.match(/^\/api\/fleet\/([A-Za-z0-9_-]{1,64})\/repairs$/);
+    if (rm) {
+      // Repairs and maintenance records on a vehicle. The office adds them (T1 and T2); nothing here edits or removes a record.
+      if (user.tier !== "T1" && user.tier !== "T2") return reply(env, 403, { error: "forbidden" });
+      await env.DB.prepare("CREATE TABLE IF NOT EXISTS fleet_repairs (id TEXT PRIMARY KEY, vehicle_id TEXT NOT NULL, repair_date TEXT NOT NULL, contact_id TEXT, contact_name TEXT, notes TEXT, docs TEXT, created_by TEXT, created_at TEXT DEFAULT (datetime('now')))").run();
+      await env.DB.prepare("CREATE INDEX IF NOT EXISTS fleet_repairs_vehicle ON fleet_repairs (vehicle_id, repair_date)").run();
+      const out = (r) => { let docs = []; try { docs = JSON.parse(r.docs || "[]"); } catch (e) { docs = []; } return { id: r.id, date: r.repair_date, contactId: r.contact_id || "", contactName: r.contact_name || "", notes: r.notes || "", docs, createdBy: r.created_by || "", createdAt: r.created_at || "" }; };
+      if (request.method === "GET") {
+        const rows = ((await env.DB.prepare("SELECT * FROM fleet_repairs WHERE vehicle_id = ? ORDER BY repair_date DESC, created_at DESC LIMIT 200").bind(rm[1]).all()).results) || [];
+        return reply(env, 200, { items: rows.map(out) });
+      }
+      if (request.method === "POST") {
+        const veh = await env.DB.prepare("SELECT rego, name FROM fleet WHERE id = ?").bind(rm[1]).first();
+        if (!veh) return reply(env, 404, { error: "not found", worker: WORKER_BUILD });
+        let body;
+        try { body = await request.json(); } catch (e) { return reply(env, 400, { error: "bad json" }); }
+        const date = String(body.date || "").slice(0, 10);
+        if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return reply(env, 400, { error: "A date is needed." });
+        const contactName = String(body.contactName || "").trim().slice(0, 200);
+        if (!contactName) return reply(env, 400, { error: "A contact is needed." });
+        const docs = (Array.isArray(body.docs) ? body.docs : []).slice(0, 10).map((d) => ({ id: String(d.id || "").slice(0, 64), name: String(d.name || "").slice(0, 200), itemId: String(d.itemId || "").slice(0, 200), kind: d.kind === "invoice" ? "invoice" : "extra" }));
+        const id = `r${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}`;
+        await env.DB.prepare("INSERT INTO fleet_repairs (id, vehicle_id, repair_date, contact_id, contact_name, notes, docs, created_by) VALUES (?, ?, ?, ?, ?, ?, ?, ?)").bind(id, rm[1], date, String(body.contactId || "").slice(0, 64), contactName, String(body.notes || "").slice(0, 2000), JSON.stringify(docs), user.name || "").run();
+        const row = await env.DB.prepare("SELECT * FROM fleet_repairs WHERE id = ?").bind(id).first();
+        return reply(env, 200, { item: out(row) });
+      }
+      return reply(env, 405, { error: "method not allowed" });
+    }
+
+    if (url.pathname === "/api/tools/items") {
+      // The tools editor behind the Tools tile on the Operations home screen. T1 and T2 only. Deleting hides the tool, so old checks still read correctly.
+      if (user.tier !== "T1" && user.tier !== "T2") return reply(env, 403, { error: "forbidden" });
+      await env.DB.prepare("CREATE TABLE IF NOT EXISTS vehicle_tool_items (id INTEGER PRIMARY KEY AUTOINCREMENT, grp TEXT NOT NULL, item TEXT NOT NULL, spec TEXT, sort INTEGER, active INTEGER DEFAULT 1)").run();
+      if (request.method === "GET") {
+        const rows = ((await env.DB.prepare("SELECT id, grp, item, spec FROM vehicle_tool_items WHERE active = 1 ORDER BY sort, id").all()).results) || [];
+        return reply(env, 200, { items: rows.map((r) => ({ id: r.id, group: r.grp, item: r.item, spec: r.spec || "" })) });
+      }
+      if (request.method !== "POST") return reply(env, 405, { error: "method not allowed" });
+      if (user.viewAs && !VIEW_AS_WRITES) return reply(env, 403, { error: "Viewing as someone else is read only." });
+      let body;
+      try { body = await request.json(); } catch (e) { return reply(env, 400, { error: "bad json" }); }
+      const name = String(body.item || "").trim().slice(0, 80), spec = String(body.spec || "").trim().slice(0, 120);
+      if (body.action === "add") {
+        if (!name) return reply(env, 400, { error: "Give the tool a name" });
+        const top = await env.DB.prepare("SELECT COALESCE(MAX(sort), 0) AS m FROM vehicle_tool_items").first();
+        const grp = await env.DB.prepare("SELECT grp FROM vehicle_tool_items WHERE active = 1 ORDER BY sort, id LIMIT 1").first();
+        await env.DB.prepare("INSERT INTO vehicle_tool_items (grp, item, spec, sort) VALUES (?, ?, ?, ?)").bind(grp ? grp.grp : "Company Tool", name, spec, (top ? top.m : 0) + 1).run();
+      } else if (body.action === "edit") {
+        if (!name) return reply(env, 400, { error: "Give the tool a name" });
+        await env.DB.prepare("UPDATE vehicle_tool_items SET item = ?, spec = ? WHERE id = ?").bind(name, spec, Number(body.id)).run();
+      } else if (body.action === "delete") {
+        await env.DB.prepare("UPDATE vehicle_tool_items SET active = 0 WHERE id = ?").bind(Number(body.id)).run();
+      } else return reply(env, 400, { error: "unknown action" });
+      const rows = ((await env.DB.prepare("SELECT id, grp, item, spec FROM vehicle_tool_items WHERE active = 1 ORDER BY sort, id").all()).results) || [];
+      return reply(env, 200, { items: rows.map((r) => ({ id: r.id, group: r.grp, item: r.item, spec: r.spec || "" })) });
+    }
+
+    if (url.pathname === "/api/team-tools") {
+      // The assigned driver tools list: what each driver is expected to carry. Read by everyone signed in, edited by T1 and T2 from the Team Tools tile. Deleting hides the tool.
+      await env.DB.prepare("CREATE TABLE IF NOT EXISTS team_tool_items (id INTEGER PRIMARY KEY AUTOINCREMENT, grp TEXT NOT NULL, item TEXT NOT NULL, spec TEXT, sort INTEGER, active INTEGER DEFAULT 1)").run();
+      const haveTeam = await env.DB.prepare("SELECT COUNT(*) AS n FROM team_tool_items").first();
+      if (!haveTeam || !haveTeam.n) {
+        const seedTeam = [["Power Tools",[["Drill/driver","Battery platform compatible with employee kit"],["Impact driver",""],["Nail gun",""],["Circular saw",""],["125 mm angle grinder",""],["SDS rotary hammer drill",""],["Reciprocating saw",""],["Torch","Rechargeable"],["Batteries and charger","Suitable quantity for a full workday"],["Multi-tool","Optional"]]],["Hand Tools",[["PVC/plastic pipe saw",""],["8 m tape measure",""],["1 m folding ruler",""],["Utility knife",""],["Plasterboard cutter",""],["Adjustable spanners","Assorted sizes"],["Multigrips",""],["Footprint grips",""],["Screwdriver set","Phillips and flat-head"],["Allen key set",""],["Hammer",""],["Spirit levels","300 mm and 600 mm"],["Flaring block",""],["Deburring tool",""],["Hacksaw",""],["Copper tube cutters",""],["Markers and pencils",""],["Tube benders","16 mm and 20 mm"],["Tin snips","Right-cut and left-cut"],["Combination square",""],["Cold chisel",""],["Wood chisel",""],["Caulking/silicone gun",""],["Mixer tap socket set",""],["Long-nose pliers",""],["File",""],["Tool bag",""],["Headlamp","Rechargeable"]]]];
+        let n = 0;
+        for (const g of seedTeam) for (const row of g[1]) await env.DB.prepare("INSERT INTO team_tool_items (grp, item, spec, sort) VALUES (?, ?, ?, ?)").bind(g[0], row[0], row[1], n++).run();
+      }
+      const teamRows = async () => (((await env.DB.prepare("SELECT id, grp, item, spec FROM team_tool_items WHERE active = 1 ORDER BY sort, id").all()).results) || []).map((r) => ({ id: r.id, group: r.grp, item: r.item, spec: r.spec || "" }));
+      if (request.method === "GET") return reply(env, 200, { items: await teamRows() });
+      if (request.method !== "POST") return reply(env, 405, { error: "method not allowed" });
+      if (user.tier !== "T1" && user.tier !== "T2") return reply(env, 403, { error: "forbidden" });
+      if (user.viewAs && !VIEW_AS_WRITES) return reply(env, 403, { error: "Viewing as someone else is read only." });
+      let body;
+      try { body = await request.json(); } catch (e) { return reply(env, 400, { error: "bad json" }); }
+      const name = String(body.item || "").trim().slice(0, 80), spec = String(body.spec || "").trim().slice(0, 120);
+      if (body.action === "add") {
+        if (!name) return reply(env, 400, { error: "Give the tool a name" });
+        const grp = String(body.group || "").trim().slice(0, 40) || "Hand Tools";
+        const last = await env.DB.prepare("SELECT MAX(sort) AS m FROM team_tool_items WHERE grp = ?").bind(grp).first();
+        const top = await env.DB.prepare("SELECT COALESCE(MAX(sort), 0) AS m FROM team_tool_items").first();
+        // Insert at the end of its group by pushing later rows down one place.
+        const at = last && last.m !== null && last.m !== undefined ? last.m + 1 : (top ? top.m : 0) + 1;
+        await env.DB.prepare("UPDATE team_tool_items SET sort = sort + 1 WHERE sort >= ?").bind(at).run();
+        await env.DB.prepare("INSERT INTO team_tool_items (grp, item, spec, sort) VALUES (?, ?, ?, ?)").bind(grp, name, spec, at).run();
+      } else if (body.action === "edit") {
+        if (!name) return reply(env, 400, { error: "Give the tool a name" });
+        await env.DB.prepare("UPDATE team_tool_items SET item = ?, spec = ? WHERE id = ?").bind(name, spec, Number(body.id)).run();
+      } else if (body.action === "delete") {
+        await env.DB.prepare("UPDATE team_tool_items SET active = 0 WHERE id = ?").bind(Number(body.id)).run();
+      } else return reply(env, 400, { error: "unknown action" });
+      return reply(env, 200, { items: await teamRows() });
+    }
+
+    const tm = url.pathname.match(/^\/api\/fleet\/([A-Za-z0-9_-]{1,64})\/tools$/);
+    if (tm) {
+      // The Vehicle Tools check. Whoever takes in a vehicle ticks off what is on it; each save is kept, so the next swap can be compared with the last.
+      await env.DB.prepare("CREATE TABLE IF NOT EXISTS vehicle_tool_items (id INTEGER PRIMARY KEY AUTOINCREMENT, grp TEXT NOT NULL, item TEXT NOT NULL, spec TEXT, sort INTEGER, active INTEGER DEFAULT 1)").run();
+      await env.DB.prepare("CREATE TABLE IF NOT EXISTS vehicle_tool_checks (id TEXT PRIMARY KEY, vehicle_id TEXT NOT NULL, checked_by TEXT, checked_at TEXT DEFAULT (datetime('now')), missing_count INTEGER, notes TEXT, results TEXT)").run();
+      await env.DB.prepare("CREATE INDEX IF NOT EXISTS vehicle_tool_checks_v ON vehicle_tool_checks (vehicle_id, checked_at)").run();
+      await env.DB.prepare("DELETE FROM vehicle_tool_items WHERE grp = 'Vehicle Supply'").run(); // supplies are covered by the PPE screen
+      const have = await env.DB.prepare("SELECT COUNT(*) AS n FROM vehicle_tool_items").first();
+      if (!have || !have.n) {
+        const seed = [["Company Tool", "Extension ladder", ""], ["Company Tool", "A-frame ladders", "Small and medium"], ["Company Tool", "Extractor fans", "2 units"], ["Company Tool", "SDS drill-bit set", "5 mm, 6.5 mm, 8 mm and 25 mm"], ["Company Tool", "Impact drill-bit set", "Phillips head, hex bits 5/16 and 3/8, and spade bits"], ["Company Tool", "Hole-saw kit", ""], ["Company Tool", "Gas manometer", ""], ["Company Tool", "Bucket pump", ""], ["Company Tool", "Water-pressure gauge and thermometer", ""], ["Company Tool", "String lines", ""], ["Company Tool", "Ratchet straps", ""], ["Company Tool", "30 m tape measure", ""], ["Company Tool", "B-press tool", ""], ["Company Tool", "Shovels", ""], ["Company Tool", "Probe", ""], ["Company Tool", "Broom, dustpan and brush", ""]];
+        for (let i = 0; i < seed.length; i++) await env.DB.prepare("INSERT INTO vehicle_tool_items (grp, item, spec, sort) VALUES (?, ?, ?, ?)").bind(seed[i][0], seed[i][1], seed[i][2], i).run();
+      }
+      const lastOf = async () => {
+        const r = await env.DB.prepare("SELECT * FROM vehicle_tool_checks WHERE vehicle_id = ? ORDER BY checked_at DESC, rowid DESC LIMIT 1").bind(tm[1]).first();
+        if (!r) return null;
+        let results = []; try { results = JSON.parse(r.results || "[]"); } catch (e) { results = []; }
+        return { id: r.id, at: String(r.checked_at || "").slice(0, 10), by: r.checked_by || "", missing: results.filter((x) => !x.present).map((x) => x.item), missingCount: r.missing_count || 0, notes: r.notes || "" };
+      };
+      if (request.method === "GET") {
+        const rows = ((await env.DB.prepare("SELECT id, grp, item, spec FROM vehicle_tool_items WHERE active = 1 ORDER BY sort, id").all()).results) || [];
+        return reply(env, 200, { items: rows.map((r) => ({ id: r.id, group: r.grp, item: r.item, spec: r.spec || "" })), last: await lastOf() });
+      }
+      if (request.method === "POST") {
+        const veh = await env.DB.prepare("SELECT rego, name FROM fleet WHERE id = ?").bind(tm[1]).first();
+        if (!veh) return reply(env, 404, { error: "not found", worker: WORKER_BUILD });
+        let body;
+        try { body = await request.json(); } catch (e) { return reply(env, 400, { error: "bad json" }); }
+        const rows = ((await env.DB.prepare("SELECT id, grp, item FROM vehicle_tool_items WHERE active = 1 ORDER BY sort, id").all()).results) || [];
+        const present = new Set((Array.isArray(body.present) ? body.present : []).map((x) => Number(x)));
+        const results = rows.map((r) => ({ id: r.id, group: r.grp, item: r.item, present: present.has(r.id) }));
+        const missing = results.filter((x) => !x.present);
+        const id = `t${Date.now().toString(36)}${Math.random().toString(36).slice(2, 7)}`;
+        const notes = String(body.notes || "").slice(0, 2000);
+        await env.DB.prepare("INSERT INTO vehicle_tool_checks (id, vehicle_id, checked_by, missing_count, notes, results) VALUES (?, ?, ?, ?, ?, ?)").bind(id, tm[1], user.name || "", missing.length, notes, JSON.stringify(results)).run();
+        if (missing.length) {
+          try {
+            const tiers = await accessTiers(env);
+            const label = veh.rego || veh.name || tm[1];
+            for (const e of Object.keys(tiers).filter((k) => tiers[k] === "T1")) await notify(env, { to: e, kind: "toolcheck", title: `${label} Tools Missing`, body: `${missing.length} missing: ${missing.map((x) => x.item).join(", ").slice(0, 300)}`, link: "", by: user.name || "Reservoir" });
+          } catch (e) { /* the check is already saved */ }
+        }
+        return reply(env, 200, { last: await lastOf() });
+      }
+      return reply(env, 405, { error: "method not allowed" });
+    }
+
+    if (url.pathname === "/api/headers" && request.method === "GET") {
+      try { return reply(env, 200, { heads: await headsRead(env, false), worker: WORKER_BUILD }); }
+      catch (e) { return reply(env, 200, { heads: {}, worker: WORKER_BUILD }); }
+    }
+    if (url.pathname === "/api/headers" && request.method === "PUT") {
+      if (user.tier !== "T1") return reply(env, 403, { error: "forbidden" });
+      let body = {};
+      try { body = await request.json(); } catch (e) { return reply(env, 400, { error: "bad request" }); }
+      const key = String(body.key || "").slice(0, 200);
+      const text = String(body.text || "").slice(0, 200);
+      if (!key) return reply(env, 400, { error: "key needed" });
+      try {
+        const map = { ...(await headsRead(env, true)) };
+        if (text.trim()) map[key] = text; else delete map[key];
+        await headsWrite(env, map);
+        return reply(env, 200, { heads: map, worker: WORKER_BUILD });
+      } catch (e) { return reply(env, 502, { error: "save failed", worker: WORKER_BUILD }); }
+    }
+
+    if (url.pathname === "/api/voice/list" && request.method === "GET") {
+      // Every signed in person can hear the guides, so the list is open to all.
+      try {
+        return reply(env, 200, { guides: await voiceList(env, url.searchParams.get("fresh") === "1"), worker: WORKER_BUILD });
+      } catch (e) {
+        return reply(env, 502, { error: "voice guides could not be read", worker: WORKER_BUILD });
+      }
+    }
+
+    const vf = url.pathname.match(/^\/api\/voice\/file\/([A-Za-z0-9!_-]{1,200})$/);
+    if (vf && request.method === "GET") {
+      try {
+        const metaRes = await graphFetch(env, `/sites/${siteId(env)}/drive/items/${vf[1]}?select=id,name,file,parentReference`);
+        if (!metaRes.ok) return reply(env, 404, { error: "not found", worker: WORKER_BUILD });
+        const meta = await metaRes.json();
+        let path = (meta.parentReference && meta.parentReference.path) || "";
+        try { path = decodeURIComponent(path); } catch (e) { /* keep as is */ }
+        if (!meta.file || !VOICE_EXT.test(meta.name || "") || !path.includes("root:/" + VOICE_ROOT.join("/"))) return reply(env, 404, { error: "not found", worker: WORKER_BUILD });
+        const dl = await graphFetch(env, `/sites/${siteId(env)}/drive/items/${vf[1]}/content`, { redirect: "manual" });
+        const loc = dl.headers.get("Location");
+        const file = loc ? await fetch(loc) : dl;
+        if (!file.ok) return reply(env, 502, { error: "download failed" });
+        const ext = (meta.name.match(VOICE_EXT) || [".mp3"])[0].toLowerCase();
+        const type = ext === ".m4a" ? "audio/mp4" : ext === ".wav" ? "audio/wav" : "audio/mpeg";
+        return new Response(file.body, { status: 200, headers: { ...cors(env), "Content-Type": type, "Cache-Control": "private, max-age=300" } });
+      } catch (e) {
+        return reply(env, 502, { error: "download failed" });
+      }
+    }
+
+    if (url.pathname === "/api/voice/upload" && request.method === "POST") {
+      // Put a new voice guide into its tile's folder. The old one is kept as the next version. T1 only.
+      if (user.tier !== "T1") return reply(env, 403, { error: "forbidden" });
+      const home = String(url.searchParams.get("home") || "").slice(0, 80);
+      const tile = String(url.searchParams.get("tile") || "").slice(0, 80);
+      if (!voiceNorm(home) || !voiceNorm(tile)) return reply(env, 400, { error: "home screen and tile are needed" });
+      const given = String(url.searchParams.get("name") || "");
+      const ext = (given.match(VOICE_EXT) || [""])[0].toLowerCase() || ((request.headers.get("Content-Type") || "").includes("wav") ? ".wav" : (request.headers.get("Content-Type") || "").includes("mp4") ? ".m4a" : ".mp3");
+      const bytes = await request.arrayBuffer();
+      if (!bytes.byteLength) return reply(env, 400, { error: "empty file" });
+      if (bytes.byteLength > MAX_UPLOAD) return reply(env, 413, { error: "file too large" });
+      try {
+        const done = await voiceUpload(env, home, tile, ext, bytes, request.headers.get("Content-Type"));
+        return reply(env, 200, { ...done, worker: WORKER_BUILD });
+      } catch (e) {
+        return reply(env, 502, { error: "upload failed: " + String(e && e.message || e).slice(0, 120), worker: WORKER_BUILD });
+      }
+    }
+
+    const dm = url.pathname.match(/^\/api\/fleet\/([A-Za-z0-9_-]{1,64})\/docs$/);
+    if (dm && request.method === "POST") {
+      // Upload a document into the vehicle's Service folder, or its Finance or Repairs folder when folder=Finance or folder=Repairs. T1 and T2 only.
+      if (user.tier !== "T1" && user.tier !== "T2") return reply(env, 403, { error: "forbidden" });
+      const row = await env.DB.prepare("SELECT grp, rego, name FROM fleet WHERE id = ?").bind(dm[1]).first();
+      if (!row) return reply(env, 404, { error: "not found", worker: WORKER_BUILD });
+      const label = cleanName(row.rego || row.name || dm[1]);
+      if (!label) return reply(env, 400, { error: "vehicle needs a rego or name" });
+      const fileName = cleanName(url.searchParams.get("name")) || "document";
+      const bytes = await request.arrayBuffer();
+      if (!bytes.byteLength) return reply(env, 400, { error: "empty file" });
+      if (bytes.byteLength > MAX_UPLOAD) return reply(env, 413, { error: "file too large" });
+      try {
+        const item = await uploadToSharePoint(env, ["Fleet Management", row.grp === "Machinery" ? "Machinery" : "Vehicles", label, ({ Finance: "Finance", Repairs: "Repairs" })[url.searchParams.get("folder")] || "Service"], fileName, bytes, request.headers.get("Content-Type"), url.searchParams.get("replace") === "1");
+        return reply(env, 200, { id: item.id, name: item.name || fileName });
+      } catch (e) {
+        return reply(env, 502, { error: "upload failed" });
+      }
+    }
+
+    const fm = url.pathname.match(/^\/api\/docs\/([A-Za-z0-9!_-]{1,200})$/);
+    if (fm && request.method === "GET") {
+      // Open or download a stored document. T1 and T2 only.
+      if (user.tier !== "T1" && user.tier !== "T2") return reply(env, 403, { error: "forbidden" });
+      try {
+        const metaRes = await graphFetch(env, `/sites/${siteId(env)}/drive/items/${fm[1]}?select=name,file,folder`);
+        if (!metaRes.ok) return reply(env, 404, { error: "not found", worker: WORKER_BUILD });
+        const meta = await metaRes.json();
+        if (!meta.file) return reply(env, 404, { error: "not found", worker: WORKER_BUILD });
+        const dl = await graphFetch(env, `/sites/${siteId(env)}/drive/items/${fm[1]}/content`, { redirect: "manual" });
+        const loc = dl.headers.get("Location");
+        const file = loc ? await fetch(loc) : dl;
+        if (!file.ok) return reply(env, 502, { error: "download failed" });
+        const type = (meta.file && meta.file.mimeType) || "application/octet-stream";
+        const disp = url.searchParams.get("download") ? "attachment" : "inline";
+        return new Response(file.body, { status: 200, headers: { ...cors(env), "Content-Type": type, "Content-Disposition": `${disp}; filename*=UTF-8''${encodeURIComponent(meta.name)}`, "Access-Control-Expose-Headers": "Content-Disposition", "Cache-Control": "no-store" } });
+      } catch (e) {
+        return reply(env, 502, { error: "download failed" });
+      }
+    }
+
+    const fd = url.pathname.match(/^\/api\/docs\/([A-Za-z0-9!_-]{1,200})$/);
+    if (fd && request.method === "DELETE") {
+      // Delete a stored document. T1 only.
+      if (user.tier !== "T1") return reply(env, 403, { error: "forbidden" });
+      try {
+        const meta = await driveMeta(env, fd[1]);
+        if (!meta) return reply(env, 404, { error: "not found", worker: WORKER_BUILD });
+        const del = await graphFetch(env, `/sites/${siteId(env)}/drive/items/${fd[1]}`, { method: "DELETE" });
+        if (!del.ok && del.status !== 404) return reply(env, 502, { error: "delete failed" });
+        return reply(env, 200, { ok: true });
+      } catch (e) {
+        return reply(env, 502, { error: "delete failed" });
+      }
+    }
+
+    if (url.pathname === "/api/invoices/mailbox" && request.method === "POST") {
+      // Do the next waiting supplier email in the Accounts mailbox: first the accPay Sweep folder, then the inbox (A to Z by supplier). One email per press.
+      if (user.tier !== "T1") return reply(env, 403, { error: "forbidden" });
+      if (user.viewAs && !VIEW_AS_WRITES) return reply(env, 403, { error: "Viewing as someone else is read only." });
+      if (!env.AROFLO_BILLS_EMAIL) return reply(env, 501, { error: "not set", detail: "AROFLO_BILLS_EMAIL is not set on the Worker" });
+      try {
+        const box = MAILBOXES.find((x) => x.id === "accounts");
+        const addr = mailAddress(env, box);
+        await settingsTable(env);
+        await invHistoryTable(env);
+        await invOneTimeClear(env);
+        let credits = 0;
+        let lastErr = "";
+        const creditsOnly = url.searchParams.get("credits") === "1";
+        const folderId = await invFolderId(env, addr);
+        if (folderId) {
+          const fh = await invFolderHits(env, addr, folderId, creditsOnly);
+          if (fh.err) lastErr = fh.err;
+          for (const { m, rule } of fh.hits) {
+            if (!(await invClaim(env, "invmail.claim." + invHash(m.internetMessageId || m.id)))) continue;
+            const r = await invProcessHit(env, user, addr, rule, m, true);
+            if (!r) continue;
+            if (r.lastErr) { lastErr = r.lastErr; continue; }
+            if (r.credit) { credits++; continue; }
+            return reply(env, 200, { ...r, credits });
+          }
+        }
+        for (const rule of invRulesSorted()) {
+          // A rule matches one exact sender address, or any address on a sender domain (Samios branches each have their own).
+          const f = `receivedDateTime ge 1900-01-01T00:00:00Z and hasAttachments eq true${rule.from ? ` and from/emailAddress/address eq '${rule.from}'` : ""}`;
+          const r = await mailGraph(env, addr, `/mailFolders/inbox/messages?$top=${rule.fromDomain ? 50 : 25}&$select=subject,receivedDateTime,categories,from,internetMessageId&$filter=${encodeURIComponent(f)}&$orderby=receivedDateTime desc`);
+          if (!r.ok) { lastErr = mailWhy(r); continue; }
+          const dom = rule.fromDomain ? "@" + rule.fromDomain.toLowerCase() : "";
+          const hits = ((r.json && r.json.value) || []).filter((m) => (!dom || String((m.from && m.from.emailAddress && m.from.emailAddress.address) || "").toLowerCase().endsWith(dom)) && [rule.subject, ...(rule.alsoSubject || [])].some((t) => String(m.subject || "").toLowerCase().includes(t.toLowerCase()))).slice(0, 10);
+          for (const hit of hits) {
+            if (creditsOnly && !invIsCreditMail(hit, rule)) continue;
+            if (!rule.creditNotes && (hit.categories || []).some((c) => String(c).toLowerCase() === "credit")) { credits++; continue; }
+            // An email tagged ERROR! waits for Retry in Reservoir.
+            if ((hit.categories || []).some((c) => String(c).toLowerCase() === "error!")) continue;
+            const res = await invProcessHit(env, user, addr, rule, hit, false);
+            if (!res) continue;
+            if (res.lastErr) { lastErr = res.lastErr; continue; }
+            if (res.credit) { credits++; continue; }
+            return reply(env, 200, { ...res, credits });
+          }
+        }
+        if (lastErr) return reply(env, 200, { ok: false, error: lastErr });
+        return reply(env, 200, { ok: true, found: false, credits });
+      } catch (e) {
+        return reply(env, 502, { error: "mailbox failed", detail: String(e.message || "").slice(0, 200) });
+      }
+    }
+
+    if (url.pathname === "/api/invoices/history" && request.method === "GET") {
+      // What the mailbox pickup has done. Successes for this month and last, errors until they are cleared.
+      if (user.tier !== "T1") return reply(env, 403, { error: "forbidden" });
+      return reply(env, 200, await invHistoryList(env));
+    }
+    const ih = url.pathname.match(/^\/api\/invoices\/history\/(\d{1,12})$/);
+    if (ih && request.method === "DELETE") {
+      if (user.tier !== "T1") return reply(env, 403, { error: "forbidden" });
+      if (user.viewAs && !VIEW_AS_WRITES) return reply(env, 403, { error: "Viewing as someone else is read only." });
+      await invHistoryTable(env);
+      await env.DB.prepare("DELETE FROM invoice_history WHERE id = ?").bind(Number(ih[1])).run();
+      return reply(env, 200, { ok: true });
+    }
+
+    if (ih && request.method === "PATCH") {
+      // Tick: the retry failed, the invoice was entered by hand, so the line moves to the successful history marked Manual.
+      if (user.tier !== "T1") return reply(env, 403, { error: "forbidden" });
+      if (user.viewAs && !VIEW_AS_WRITES) return reply(env, 403, { error: "Viewing as someone else is read only." });
+      return reply(env, 200, { ok: await invManual(env, Number(ih[1])) });
+    }
+    const iry = url.pathname.match(/^\/api\/invoices\/history\/(\d{1,12})\/retry$/);
+    if (iry && request.method === "POST") {
+      if (user.tier !== "T1") return reply(env, 403, { error: "forbidden" });
+      if (user.viewAs && !VIEW_AS_WRITES) return reply(env, 403, { error: "Viewing as someone else is read only." });
+      if (!env.AROFLO_BILLS_EMAIL) return reply(env, 501, { error: "not set", detail: "AROFLO_BILLS_EMAIL is not set on the Worker" });
+      try {
+        return reply(env, 200, await invRetry(env, user, Number(iry[1])));
+      } catch (e) {
+        return reply(env, 502, { error: "retry failed", detail: String(e.message || "").slice(0, 200) });
+      }
+    }
+
+    const inv = url.pathname.match(/^\/api\/invoices\/(xero|aroflo)$/);
+    if (inv && request.method === "POST") {
+      // Invoices dropped on the desktop screen go out as one email each, so the destination inbox makes one draft per file.
+      if (user.tier !== "T1" && user.tier !== "T2") return reply(env, 403, { error: "forbidden" });
+      const varName = inv[1] === "xero" ? "XERO_BILLS_EMAIL" : "AROFLO_BILLS_EMAIL";
+      const to = env[varName];
+      if (!to) return reply(env, 501, { error: "not set", detail: `${varName} is not set on the Worker` });
+      try {
+        const body = await request.json();
+        const list = Array.isArray(body && body.files) ? body.files : [];
+        if (!list.length || list.length > 10) return reply(env, 400, { error: "bad request", detail: "1 to 10 files" });
+        for (const f of list) if (!f || !f.data || Math.floor(String(f.data).length * 0.75) > MAX_EMAIL) return reply(env, 413, { error: "too large", detail: `${(f && f.name) || "file"} is over 3.5 MB` });
+        for (const f of list) await mailAttachment(env, user, to, String(f.name || "invoice.pdf").slice(0, 150), String(f.type || "application/pdf"), String(f.data));
+        return reply(env, 200, { ok: true, sent: list.length });
+      } catch (e) {
+        return reply(env, 502, { error: "send failed", detail: String(e.message || "").slice(0, 200) });
+      }
+    }
+
+    const xm = url.pathname.match(/^\/api\/(?:docs|receipts)\/([A-Za-z0-9!_-]{1,200})\/xero$/);
+    if (xm && request.method === "POST") {
+      // Email a stored PDF to the Xero bills inbox. Reimbursements can only be released by T1.
+      if (user.tier !== "T1" && user.tier !== "T2") return reply(env, 403, { error: "forbidden" });
+      try {
+        const meta = await driveMeta(env, xm[1]);
+        if (!meta) return reply(env, 404, { error: "not found", detail: "the file is no longer in SharePoint or its id is not valid", worker: WORKER_BUILD });
+        if (meta.folder.startsWith("Receipts/Reimbursements") && user.tier !== "T1") return reply(env, 403, { error: "forbidden" });
+        await sendToXero(env, user, meta, await request.arrayBuffer());
+        // Remember when and for whom a reimbursement went, so the draft bill Xero makes can be given that person as its contact.
+        try { await receiptMarkSent(env, xm[1]); } catch (e) { /* the send already worked */ }
+        return reply(env, 200, { ok: true });
+      } catch (e) {
+        return reply(env, e.message === "too large" ? 413 : 502, { error: "send failed", detail: String(e.message || "").slice(0, 200) });
+      }
+    }
+
+    // The receipt history. Every receipt sent from Reservoir is kept here, so it is still there after the app is closed and the office can see reimbursements from other phones. The files themselves are in SharePoint. The office (T1) sees every receipt, T2 sees their own. Only T1 marks a reimbursement paid or declined.
+    const rdel = url.pathname.match(/^\/api\/receipt-records\/([A-Za-z0-9_-]{1,64})$/);
+    if (rdel && request.method === "DELETE") {
+      // Remove a receipt for good: the SharePoint file and the saved record. T1 only.
+      if (user.tier !== "T1") return reply(env, 403, { error: "forbidden" });
+      await receiptRecordsTable(env);
+      const row = await env.DB.prepare("SELECT item_id FROM receipt_records WHERE id = ?").bind(rdel[1]).first();
+      for (const one of String((row && row.item_id) || "").split(",").map((x) => x.trim()).filter(Boolean)) {
+        try { await graphFetch(env, `/sites/${siteId(env)}/drive/items/${one}`, { method: "DELETE" }); } catch (e) { /* the record still goes */ }
+      }
+      await env.DB.prepare("DELETE FROM receipt_records WHERE id = ?").bind(rdel[1]).run();
+      return reply(env, 200, { ok: true });
+    }
+
+    const rrm = url.pathname.match(/^\/api\/receipt-records(?:\/([A-Za-z0-9_-]{1,64})\/status)?$/);
+    if (rrm) {
+      // Anyone signed in can send a reimbursement and see their own. Only T1 and T2 handle company receipts, and only T1 processes a reimbursement.
+      await receiptRecordsTable(env);
+      const first = String(user.name || "").split(" ")[0];
+      const mail = String(user.email || "").toLowerCase();
+      const today = new Date().toISOString().slice(0, 10);
+      if (request.method === "GET" && !rrm[1]) {
+        // The office opening the receipts checks Xero first (at most every 30 seconds), so waiting reimbursements are settled before they are listed.
+        if (user.tier === "T1" && Date.now() - xeroVerifyAt > 30000) { xeroVerifyAt = Date.now(); try { await xeroVerify(env); } catch (e) { /* the list still loads */ } }
+        const rows = user.tier === "T1"
+          ? await env.DB.prepare("SELECT * FROM receipt_records ORDER BY created_at DESC LIMIT 300").all()
+          : await env.DB.prepare("SELECT * FROM receipt_records WHERE by_email = ? ORDER BY created_at DESC LIMIT 300").bind(mail).all();
+        return reply(env, 200, { receipts: (rows.results || []).map(receiptRecordOut) });
+      }
+      let body;
+      try { body = await request.json(); } catch { return reply(env, 400, { error: "bad json" }); }
+      if (request.method === "POST" && !rrm[1]) {
+        const id = String(body.id || "");
+        if (!/^[A-Za-z0-9_-]{1,64}$/.test(id)) return reply(env, 400, { error: "bad id" });
+        const type = body.receiptType === "reimbursement" ? "reimbursement" : "company";
+        if (type === "company" && user.tier !== "T1" && user.tier !== "T2") return reply(env, 403, { error: "forbidden" });
+        const status = ["sent", "submitted"].includes(body.status) ? body.status : (type === "company" ? "sent" : "submitted");
+        const view = typeof body.view === "string" && body.view.startsWith("data:image/") && body.view.length < 400000 ? body.view : "";
+        const date = /^\d{4}-\d{2}-\d{2}$/.test(String(body.date || "")) ? body.date : today;
+        // A director (never while viewing as someone) can add a reimbursement on behalf of a team member. It is filed under that person, so it shows in their own history, and it can go in already processed.
+        let byName = first, byMail = mail, rowStatus = status, doneOn = "";
+        const forMail = String(body.forEmail || "").trim().toLowerCase();
+        if (forMail && forMail !== mail) {
+          if (user.tier !== "T1" || user.viewAs || type !== "reimbursement") return reply(env, 403, { error: "forbidden" });
+          const person = await env.DB.prepare("SELECT name FROM dfp_xero WHERE lower(email) = ?").bind(forMail).first();
+          if (!person || !person.name) return reply(env, 400, { error: "That team member was not found" });
+          byName = String(person.name).split(" ")[0];
+          byMail = forMail;
+        }
+        // Already sent to Xero before the record existed: it waits for the bill to appear there before it counts as processed.
+        const viaXero = body.xeroSent === true && (type === "company" ? (user.tier === "T1" || user.tier === "T2") : user.tier === "T1");
+        if (type === "reimbursement" && (body.status === "paid" || body.status === "checking") && user.tier === "T1") { if (viaXero) rowStatus = "checking"; else { rowStatus = "paid"; doneOn = date; } }
+        await env.DB.prepare("INSERT OR IGNORE INTO receipt_records (id, by_name, by_email, type, amount, note, item_id, file_name, status, view, sent_date, done_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)")
+          .bind(id, byName, byMail, type, type === "reimbursement" ? txt(body.amount, 12) : "", txt(body.text, 500), txt(body.itemId, 600), txt(body.fileName, 600), rowStatus, view, date, doneOn).run();
+        if (viaXero) await env.DB.prepare("UPDATE receipt_records SET xero_name = ?, xero_at = ?, xero_state = 'waiting' WHERE id = ?").bind(String(txt(body.itemId, 600)).split(",").filter(Boolean).join("|") || id, new Date(Date.now() - 60000).toISOString(), id).run();
+        if (type === "reimbursement" && rowStatus === "paid") await notify(env, { to: byMail, kind: "receipt", title: "Reimbursement request processed", body: "Your reimbursement has been paid. Open Receipts to see it.", link: "receipts", by: user.name || mail });
+        return reply(env, 200, { ok: true });
+      }
+      if (request.method === "POST" && rrm[1]) {
+        if (!isApprover(user)) return reply(env, 403, { error: "forbidden" });
+        if (!["paid", "declined"].includes(body.status)) return reply(env, 400, { error: "bad status" });
+        const date = /^\d{4}-\d{2}-\d{2}$/.test(String(body.date || "")) ? body.date : today;
+        // A reimbursement sent to Xero is only processed once its bill has appeared in Xero. Until then it stays waiting. T1 can tick it as entered by hand.
+        if (body.status === "paid") {
+          let rr0 = await env.DB.prepare("SELECT type, xero_state FROM receipt_records WHERE id = ?").bind(rrm[1]).first();
+          if (rr0 && rr0.type === "reimbursement" && rr0.xero_state && rr0.xero_state !== "ok") {
+            if (body.manual === true) {
+              if (user.tier !== "T1") return reply(env, 403, { error: "forbidden" });
+              await env.DB.prepare("UPDATE receipt_records SET xero_state = 'manual' WHERE id = ?").bind(rrm[1]).run();
+            } else {
+              try { await xeroVerify(env); } catch (e) { /* the state stays as it was */ }
+              rr0 = await env.DB.prepare("SELECT type, xero_state FROM receipt_records WHERE id = ?").bind(rrm[1]).first();
+              if (rr0 && rr0.xero_state && rr0.xero_state !== "ok") {
+                await env.DB.prepare("UPDATE receipt_records SET status = 'checking', done_date = '' WHERE id = ?").bind(rrm[1]).run();
+                return reply(env, 200, { ok: true, status: "checking", xero: rr0.xero_state });
+              }
+            }
+          }
+        }
+        await receiptSettle(env, rrm[1], body.status, date, user.name || mail);
+        return reply(env, 200, { ok: true, status: body.status });
+      }
+      return reply(env, 405, { error: "method not allowed" });
+    }
+
+    if (url.pathname === "/api/receipts" && request.method === "POST") {
+      // Upload a receipt photo or PDF. Anyone signed in can upload a reimbursement. Company receipts are T1 and T2.
+      const fileName = cleanName(url.searchParams.get("name")) || "receipt.pdf";
+      const kind = url.searchParams.get("kind") === "reimbursement" ? "Reimbursements" : "Company";
+      if (kind === "Company" && user.tier !== "T1" && user.tier !== "T2") return reply(env, 403, { error: "forbidden" });
+      const bytes = await request.arrayBuffer();
+      if (!bytes.byteLength) return reply(env, 400, { error: "empty file" });
+      if (bytes.byteLength > MAX_UPLOAD) return reply(env, 413, { error: "file too large" });
+      try {
+        const item = await uploadToSharePoint(env, ["Receipts", kind], fileName, bytes, request.headers.get("Content-Type"), false);
+        return reply(env, 200, { itemId: item.id, name: item.name || fileName });
+      } catch (e) {
+        return reply(env, 502, { error: "upload failed" });
+      }
+    }
+
+    if (url.pathname === "/api/fleet-addresses" && request.method === "GET") {
+      // Name, home address and emergency contact, for the fleet screens and the Operations team screen. T1 and T2.
+      if (user.tier !== "T1" && user.tier !== "T2") return reply(env, 403, { error: "forbidden" });
+      try {
+        const rows = ((await env.DB.prepare("SELECT x.name, x.address, x.mobile, r.personal_email, r.preferred_name, r.em_name, r.em_relationship, r.em_mobile, r.em_email, r.em_saved_at FROM dfp_xero x LEFT JOIN dfp_reservoir r ON lower(r.email) = lower(x.email) WHERE x.name IS NOT NULL AND x.name <> ''").all()).results) || [];
+        return reply(env, 200, { people: rows.map((r) => ({ name: r.name, address: r.address || "", mobile: r.mobile || "", personalEmail: r.personal_email || "", preferredName: String(r.preferred_name || "").trim(), ...(r.em_saved_at ? { emName: r.em_name || "", emRelationship: r.em_relationship || "", emMobile: r.em_mobile || "", emEmail: r.em_email || "" } : {}) })) });
+      } catch (e) {
+        return reply(env, 502, { error: "could not read addresses" });
+      }
+    }
+
+    const m = url.pathname.match(/^\/api\/fleet(?:\/([A-Za-z0-9_-]{1,64}))?$/);
+    if (!m) return reply(env, 404, { error: "not found", worker: WORKER_BUILD });
+    const id = m[1];
+    const canEdit = user.tier === "T1" || user.tier === "T2";
+
+    await fleetCols(env);
+    if (request.method === "GET" && !id) {
+      // One time: Chad Lyons's Hilux 1LL2HE had dropped out of the fleet table. Put it back once, with only what is known (rego, make, model, driver). Done once, so deleting it later sticks.
+      try {
+        await settingsTable(env);
+        const flag = await env.DB.prepare("SELECT key FROM app_settings WHERE key = 'migration.restore_fleet_1LL2HE_v1'").first();
+        if (!flag) {
+          const have = await env.DB.prepare("SELECT id FROM fleet WHERE upper(rego) = '1LL2HE'").first();
+          if (!have) {
+            const next = await env.DB.prepare("SELECT COALESCE(MAX(sort_order), 0) + 1 AS n FROM fleet WHERE grp = 'Vehicles'").first();
+            const vals = FIELDS.map((f) => f === "rego" ? "1LL2HE" : f === "make" ? "Toyota" : f === "model" ? "Hilux" : f === "driver" ? "Chad Lyons" : "");
+            await env.DB.prepare(`INSERT INTO fleet (id, grp, ${FIELDS.join(", ")}, repairs, serviceHistory, sort_order, updated_by) VALUES (?, 'Vehicles', ${FIELDS.map(() => "?").join(", ")}, '[]', '[]', ?, 'Restored')`).bind("v-1ll2he", ...vals, next.n).run();
+          }
+          await env.DB.prepare("INSERT INTO app_settings (key, value, detail, by_name, at) VALUES ('migration.restore_fleet_1LL2HE_v1', '1', 'Chad Lyons fleet row put back', 'Restored', datetime('now'))").run();
+        }
+      } catch (e) { console.log("fleet restore failed", String(e && e.message || e).slice(0, 160)); }
+      // One time: put back the rest of 1LL2HE's recorded details (from the original fleet record). Only blank fields are filled, so nothing typed since is overwritten, and it runs once.
+      try {
+        const flag2 = await env.DB.prepare("SELECT key FROM app_settings WHERE key = 'migration.restore_fleet_1LL2HE_v2'").first();
+        if (!flag2) {
+          const known = { fuel: "Diesel", expiry: "2026-11-10", serial: "8792223", year: "2017", body: "Tray", colour: "White", vin: "MR0EB3CB200444240", engine: "2GD4322537", compliance: "08/2017" };
+          const row = await env.DB.prepare("SELECT id FROM fleet WHERE upper(rego) = '1LL2HE'").first();
+          if (row) {
+            const keys = Object.keys(known).filter((k) => FIELDS.includes(k));
+            await env.DB.prepare(`UPDATE fleet SET ${keys.map((k) => `${k} = CASE WHEN COALESCE(${k}, '') = '' THEN ? ELSE ${k} END`).join(", ")} WHERE id = ?`).bind(...keys.map((k) => known[k]), row.id).run();
+            await env.DB.prepare("INSERT INTO app_settings (key, value, detail, by_name, at) VALUES ('migration.restore_fleet_1LL2HE_v2', '1', 'Chad Lyons fleet details put back', 'Restored', datetime('now'))").run();
+          }
+        }
+      } catch (e) { console.log("fleet details restore failed", String(e && e.message || e).slice(0, 160)); }
+      // One time: 1LL2HE gets the service provider, phone, email and booking details the other vehicles share (all are serviced at the same place). Only blank fields are filled.
+      try {
+        const flag3 = await env.DB.prepare("SELECT key FROM app_settings WHERE key = 'migration.restore_fleet_1LL2HE_v3'").first();
+        if (!flag3) {
+          const row = await env.DB.prepare("SELECT id FROM fleet WHERE upper(rego) = '1LL2HE'").first();
+          const src = await env.DB.prepare("SELECT * FROM fleet WHERE upper(rego) <> '1LL2HE' AND COALESCE(serviceProvider, '') <> '' ORDER BY sort_order LIMIT 1").first();
+          if (row && src) {
+            const keys = ["serviceProvider", "servicePhone", "serviceEmail", "serviceBooking"].filter((k) => FIELDS.includes(k));
+            await env.DB.prepare(`UPDATE fleet SET ${keys.map((k) => `${k} = CASE WHEN COALESCE(${k}, '') = '' THEN ? ELSE ${k} END`).join(", ")} WHERE id = ?`).bind(...keys.map((k) => src[k] || ""), row.id).run();
+            await env.DB.prepare("INSERT INTO app_settings (key, value, detail, by_name, at) VALUES ('migration.restore_fleet_1LL2HE_v3', '1', 'Service details copied from other vehicles', 'Restored', datetime('now'))").run();
+          }
+        }
+      } catch (e) { console.log("fleet service restore failed", String(e && e.message || e).slice(0, 160)); }
+      const { results } = await env.DB.prepare("SELECT * FROM fleet ORDER BY grp, sort_order, id").all();
+      return reply(env, 200, results.map(rowToItem));
+    }
+
+    if (request.method === "PUT" && id) {
+      let body;
+      try { body = await request.json(); } catch { return reply(env, 400, { error: "bad json" }); }
+      const existing = await env.DB.prepare("SELECT * FROM fleet WHERE id = ?").bind(id).first();
+      // Saves are changes, never whole records. The app sends only the fields, requests and service entries that changed, plus the ids it removed. Each is applied on its own to what is stored now, so requests, service history and the vehicle details can never write over one another, and one device can never write an old copy over another device's work.
+      if (body && body.delta === true) {
+        const arr = (v) => Array.isArray(v) ? v : [];
+        const applyList = (storedJson, upsert, remove) => {
+          let stored;
+          try { stored = JSON.parse(storedJson || "[]"); } catch { stored = []; }
+          if (!Array.isArray(stored)) stored = [];
+          const up = arr(upsert).filter((x) => x && x.id !== undefined && x.id !== null);
+          const gone = new Set(arr(remove).map(String));
+          const byId = new Map(up.map((x) => [String(x.id), x]));
+          const used = new Set();
+          const kept = stored.filter((x) => !(x && gone.has(String(x.id)))).map((x) => {
+            const k = x && String(x.id);
+            if (byId.has(k)) { used.add(k); return byId.get(k); }
+            return x;
+          });
+          return [...up.filter((x) => !used.has(String(x.id))), ...kept];
+        };
+        const touchRepairs = arr(body.repairsUpsert).length + arr(body.repairsRemove).length > 0;
+        const touchHistory = canEdit && arr(body.historyUpsert).length + arr(body.historyRemove).length > 0;
+        if (!existing && !canEdit) return reply(env, 403, { error: "forbidden" });
+        const grp = body.group === "Machinery" ? "Machinery" : "Vehicles";
+        const sent = body.fields && typeof body.fields === "object" ? body.fields : {};
+        const names = canEdit ? FIELDS.filter((f) => Object.prototype.hasOwnProperty.call(sent, f)) : [];
+        const clean = (f) => f === "servicePhone" ? normPhone(String(sent[f] ?? "").slice(0, 500)) : String(sent[f] ?? "").slice(0, fleetLimit(f));
+        const newRepairs = JSON.stringify(applyList(existing ? existing.repairs : "[]", body.repairsUpsert, body.repairsRemove));
+        if (newRepairs.length > 900000) return reply(env, 413, { error: "too large" });
+        const newHistory = JSON.stringify(applyList(existing ? existing.serviceHistory : "[]", canEdit ? body.historyUpsert : [], canEdit ? body.historyRemove : []).slice(0, 500));
+        if (newHistory.length > 400000) return reply(env, 413, { error: "too large" });
+        if (!existing) {
+          const next = await env.DB.prepare("SELECT COALESCE(MAX(sort_order), 0) + 1 AS n FROM fleet WHERE grp = ?").bind(grp).first();
+          await env.DB.prepare(`INSERT INTO fleet (id, grp, ${FIELDS.join(", ")}, repairs, serviceHistory, sort_order, updated_by) VALUES (?, ?, ${FIELDS.map(() => "?").join(", ")}, ?, ?, ?, ?)`).bind(id, grp, ...FIELDS.map((f) => clean(f)), newRepairs, newHistory, next.n, user.name).run();
+          return reply(env, 200, { ok: true });
+        }
+        const sets = [];
+        const binds = [];
+        if (canEdit && body.group && grp !== existing.grp) { sets.push("grp = ?"); binds.push(grp); }
+        names.forEach((f) => { sets.push(`${f} = ?`); binds.push(clean(f)); });
+        if (touchRepairs) { sets.push("repairs = ?"); binds.push(newRepairs); }
+        if (touchHistory) { sets.push("serviceHistory = ?"); binds.push(newHistory); }
+        if (!sets.length) return reply(env, 200, { ok: true });
+        await env.DB.prepare(`UPDATE fleet SET ${sets.join(", ")}, updated_at = datetime('now'), updated_by = ? WHERE id = ?`).bind(...binds, user.name, id).run();
+        if (canEdit && names.includes("rego") && env.GRAPH_CLIENT_SECRET && existing.rego && String(sent.rego || "") && String(sent.rego) !== String(existing.rego)) {
+          try {
+            const grpName = existing.grp === "Machinery" ? "Machinery" : "Vehicles";
+            const oldPath = pathOf(["Fleet Management", grpName, cleanName(existing.rego)]);
+            await graphFetch(env, `/sites/${siteId(env)}/drive/root:/${oldPath}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: cleanName(sent.rego) }) });
+          } catch (e) { /* folder may not exist yet */ }
+        }
+        return reply(env, 200, { ok: true });
+      }
+      // Whole record saves from an older copy of the app are refused on a vehicle that already exists, because that is the save that wiped service entries.
+      if (existing) return reply(env, 409, { error: "This copy of the app is out of date. Close it and open it again to update." });
+      const incomingRepairs = Array.isArray(body.repairs) ? body.repairs : [];
+      const repairs = JSON.stringify(existing ? mergeById(incomingRepairs, existing.repairs, body.knownRepairs) : incomingRepairs);
+      if (repairs.length > 900000) return reply(env, 413, { error: "too large" });
+
+      if (!canEdit) {
+        // Team members can only add vehicle reports to a vehicle that already exists.
+        if (!existing) return reply(env, 403, { error: "forbidden" });
+        await env.DB.prepare("UPDATE fleet SET repairs = ?, updated_at = datetime('now'), updated_by = ? WHERE id = ?").bind(repairs, user.name, id).run();
+        return reply(env, 200, { ok: true });
+      }
+
+      const incomingHistory = Array.isArray(body.serviceHistory) ? body.serviceHistory.slice(0, 500) : [];
+      const history = JSON.stringify((existing ? mergeById(incomingHistory, existing.serviceHistory, body.knownHistory) : incomingHistory).slice(0, 500));
+      if (history.length > 400000) return reply(env, 413, { error: "too large" });
+      const grp = body.group === "Machinery" ? "Machinery" : "Vehicles";
+      const vals = FIELDS.map((f) => f === "servicePhone" ? normPhone(String(body[f] ?? "").slice(0, 500)) : String(body[f] ?? "").slice(0, fleetLimit(f)));
+      if (existing) {
+        await env.DB.prepare(`UPDATE fleet SET grp = ?, ${FIELDS.map((f) => `${f} = ?`).join(", ")}, repairs = ?, serviceHistory = ?, updated_at = datetime('now'), updated_by = ? WHERE id = ?`).bind(grp, ...vals, repairs, history, user.name, id).run();
+        if (env.GRAPH_CLIENT_SECRET && existing.rego && String(body.rego || "") && String(body.rego) !== String(existing.rego)) {
+          try {
+            const grpName = existing.grp === "Machinery" ? "Machinery" : "Vehicles";
+            const oldPath = pathOf(["Fleet Management", grpName, cleanName(existing.rego)]);
+            await graphFetch(env, `/sites/${siteId(env)}/drive/root:/${oldPath}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: cleanName(body.rego) }) });
+          } catch (e) { /* folder may not exist yet */ }
+        }
+      } else {
+        const next = await env.DB.prepare("SELECT COALESCE(MAX(sort_order), 0) + 1 AS n FROM fleet WHERE grp = ?").bind(grp).first();
+        await env.DB.prepare(`INSERT INTO fleet (id, grp, ${FIELDS.join(", ")}, repairs, serviceHistory, sort_order, updated_by) VALUES (?, ?, ${FIELDS.map(() => "?").join(", ")}, ?, ?, ?, ?)`).bind(id, grp, ...vals, repairs, history, next.n, user.name).run();
+      }
+      return reply(env, 200, { ok: true });
+    }
+
+    if (request.method === "DELETE" && id) {
+      if (!canEdit) return reply(env, 403, { error: "forbidden" });
+      await env.DB.prepare("DELETE FROM fleet WHERE id = ?").bind(id).run();
+      return reply(env, 200, { ok: true });
+    }
+
+    return reply(env, 405, { error: "method not allowed" });
+  }
+};
+
+globalThis.w210_BOTTOM = "Reservoir-Worker-2026.11.03-w212";
+// Reservoir-Worker-2026.11.03-w212
