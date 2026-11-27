@@ -18,3 +18,5 @@
   Cache-Control: no-cache, must-revalidate
 /weir.html
   Cache-Control: no-cache, must-revalidate
+/audit/index.html
+  Cache-Control: no-cache, must-revalidate

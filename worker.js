@@ -690,7 +690,7 @@ const receiptRecordOut = (r) => ({ id: r.id, kind: "receipt", receiptType: r.typ
 
 // Update push. Set this to a bundle name (for example "Full-Reservoir-2026.11.25-v26") and every open Reservoir and Weir window that finds that bundle newer than its own reloads straight away, instead of waiting for midnight or a home screen. Leave it empty for the normal gentle update.
 const APP_FORCE_UPDATE = "Full-Reservoir-2026.11.25-v26";
-const WORKER_BUILD = "Reservoir-Worker-2026.11.27-w346";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.27-w347";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -5006,6 +5006,52 @@ async function mailExtraFor(env, boxId, imids) {
   } catch (e) {}
   return out;
 }
+// Notes on an email: any number, newest on top, in every mailbox. Everyone who can open the mailbox sees them. Only the person who wrote a note can edit it, and only in the first 5 minutes. Notes are never deleted, they are the record. A note written by someone else flashes for the person the email is categorised to (a category that is their first name) until they acknowledge it.
+let mailNotesReady = false;
+async function mailNotesTable(env) {
+  if (mailNotesReady) return;
+  await mailExtraTable(env);
+  await env.DB.prepare("CREATE TABLE IF NOT EXISTS mail_notes (id TEXT PRIMARY KEY, box TEXT NOT NULL, imid TEXT NOT NULL, text TEXT NOT NULL, by_name TEXT, by_email TEXT, at TEXT, edited_at TEXT)").run();
+  await env.DB.prepare("CREATE INDEX IF NOT EXISTS mail_notes_imid ON mail_notes (box, imid)").run();
+  await env.DB.prepare("CREATE TABLE IF NOT EXISTS mail_note_acks (note_id TEXT NOT NULL, email TEXT NOT NULL, at TEXT, PRIMARY KEY (note_id, email))").run();
+  // The single notes made before this change become the first note of their email.
+  await env.DB.prepare("INSERT OR IGNORE INTO mail_notes (id, box, imid, text, by_name, by_email, at) SELECT 'legacy:' || box || ':' || imid, box, imid, note, COALESCE(note_by, ''), '', COALESCE(note_at, '') FROM mail_extra WHERE note IS NOT NULL AND note != ''").run();
+  await env.DB.prepare("UPDATE mail_extra SET note = '' WHERE note != ''").run();
+  mailNotesReady = true;
+}
+const mailNoteFirstName = (user) => String((user && user.name) || "").trim().split(/\s+/)[0].toLowerCase();
+// What the notes of each email look like to this person: how many there are, and whether an added note is waiting for them to acknowledge.
+async function mailNotesSummary(env, boxId, items, user) {
+  const out = new Map();
+  const ids = [...new Set(items.map((x) => x.imid).filter(Boolean))];
+  if (!ids.length) return out;
+  try {
+    await mailNotesTable(env);
+    const me = String((user && user.email) || "").toLowerCase(), first = mailNoteFirstName(user);
+    const cats = new Map(items.map((x) => [x.imid, (x.categories || []).map((c) => String(c).toLowerCase())]));
+    for (let i = 0; i < ids.length; i += 40) {
+      const part = ids.slice(i, i + 40);
+      const r = await env.DB.prepare(`SELECT n.id, n.imid, n.by_email, n.at, (SELECT 1 FROM mail_note_acks a WHERE a.note_id = n.id AND a.email = ?) AS acked FROM mail_notes n WHERE n.box = ? AND n.imid IN (${part.map(() => "?").join(",")}) ORDER BY n.at ASC, n.rowid ASC`).bind(me, boxId, ...part).all();
+      for (const x of ((r && r.results) || [])) {
+        const o = out.get(x.imid) || { count: 0, flash: false };
+        o.count++;
+        if (!x.acked && !String(x.id).startsWith("legacy:") && String(x.by_email || "").toLowerCase() !== me && first && (cats.get(x.imid) || []).includes(first)) o.flash = true;
+        out.set(x.imid, o);
+      }
+    }
+  } catch (e) { console.log("notes summary failed", String(e && e.message || e)); }
+  return out;
+}
+async function mailNotesFor(env, boxId, imid, user, categories) {
+  await mailNotesTable(env);
+  const me = String((user && user.email) || "").toLowerCase();
+  const r = await env.DB.prepare("SELECT n.id, n.text, n.by_name, n.by_email, n.at, n.edited_at, (SELECT 1 FROM mail_note_acks a WHERE a.note_id = n.id AND a.email = ?) AS acked FROM mail_notes n WHERE n.box = ? AND n.imid = ? ORDER BY n.at ASC, n.rowid ASC").bind(me, boxId, imid).all();
+  const rows = (r && r.results) || [];
+  const first = mailNoteFirstName(user);
+  const mine = (categories || []).some((c) => String(c).toLowerCase() === first);
+  const notes = rows.map((x) => ({ id: x.id, text: String(x.text || ""), by: String(x.by_name || ""), at: String(x.at || ""), edited: String(x.edited_at || ""), mine: !!me && String(x.by_email || "").toLowerCase() === me && Date.now() - Date.parse(String(x.at || "")) <= 5 * 60 * 1000, pending: !x.acked && mine && !String(x.id).startsWith("legacy:") && String(x.by_email || "").toLowerCase() !== me })).reverse();
+  return { notes, flash: notes.some((n) => n.pending) };
+}
 const mailFlag = (f) => (f && (f.flagStatus === "flagged" || f.flagStatus === "complete")) ? f.flagStatus : "";
 const mailId = (v) => { const t = String(v || ""); return t && t.length < 600 ? t : ""; };
 const mailFolderId = (v) => { const t = String(v || "inbox"); return /^[A-Za-z0-9_\-=+\/.]{1,300}$/.test(t) ? t : "inbox"; };
@@ -5194,7 +5240,9 @@ async function mailRoutes(request, env, user, url) {
       if (whereP) await Promise.race([whereP, new Promise((r) => setTimeout(r, cursorGiven ? 30000 : 1200))]);
       const list = rows.map((m) => ({ id: m.id, pf: String(m.parentFolderId || ""), ...(q && oneName ? { folder: oneName } : q && where.get(m.parentFolderId) ? { folder: where.get(m.parentFolderId).slice(0, 40) } : null), from: mailShow(m.from).slice(0, 80), fromAddr: mailPart(m.from).address.toLowerCase(), to: ((m.toRecipients || []).map(mailShow).join(", ")).slice(0, 120), toAddr: String((((m.toRecipients || [])[0] || {}).emailAddress || {}).address || "").toLowerCase().slice(0, 120), subject: String(m.subject || "(no subject)").slice(0, 160), at: m.receivedDateTime || "", read: !!m.isRead, attach: !!m.hasAttachments, categories: (m.categories || []).slice(0, 6).map((c) => String(c).slice(0, 40)), flag: mailFlag(m.flag), ans: mailAns(m), preview: String(m.bodyPreview || "").replace(/\s+/g, " ").slice(0, 140) }));
       const extra = await mailExtraFor(env, box.id, rows.map((m) => m.internetMessageId));
-      list.forEach((it, i) => { const imid = rows[i] && rows[i].internetMessageId; if (!imid) return; it.imid = String(imid).slice(0, 300); const x = extra.get(it.imid); if (x) { if (x.note) it.note = true; if (x.urgent_off) it.uoff = true; if (x.marker) it.marker = String(x.marker).slice(0, 20); } });
+      list.forEach((it, i) => { const imid = rows[i] && rows[i].internetMessageId; if (!imid) return; it.imid = String(imid).slice(0, 300); const x = extra.get(it.imid); if (x) { if (x.urgent_off) it.uoff = true; if (x.marker) it.marker = String(x.marker).slice(0, 20); } });
+      const noteSum = await mailNotesSummary(env, box.id, list, user);
+      list.forEach((it) => { const o = noteSum.get(it.imid); if (o && o.count) { it.note = o.count; if (o.flash) it.noteFlash = true; } });
       if (box.id === "jobs") list.forEach((it, i) => { if (it.marker) return; const tos = ((rows[i] && rows[i].toRecipients) || []).map((x) => String((x.emailAddress && x.emailAddress.address) || "").toLowerCase()); if (tos.includes(mailAddress(env, MAILBOXES.find((b) => b.id === "maintenance")).toLowerCase())) it.marker = "Maintenance"; else if (tos.includes(String(env.MAILBOX_ENQUIRIES || ENQUIRIES_ADDR).toLowerCase())) it.marker = "Enquiries"; });
       return reply(env, 200, { ok: true, label: box.label, messages: list, more: !q && list.length >= top, ...(q && searchNext ? { next: searchNext } : {}), worker: WORKER_BUILD });
     }
@@ -5252,7 +5300,8 @@ async function mailRoutes(request, env, user, url) {
       if (html && m.isDraft && /cid:dfplogo/i.test(shown)) shown = shown.split("cid:dfplogo").join(String(env.ALLOWED_ORIGIN || "").split(",")[0].trim().replace(/\/$/, "") + "/dfp-signature-logo.png");
       const imid = String(m.internetMessageId || "").slice(0, 300);
       const ex = imid ? (await mailExtraFor(env, box.id, [imid])).get(imid) : null;
-      return reply(env, 200, { ok: true, id: m.id, imid, note: ex && ex.note ? { text: String(ex.note), by: String(ex.note_by || ""), at: String(ex.note_at || "") } : null, urgentOff: !!(ex && ex.urgent_off), subject: String(m.subject || "(no subject)"), from: mailPart(m.from), to: (m.toRecipients || []).map(mailPart), cc: (m.ccRecipients || []).map(mailPart), bcc: (m.bccRecipients || []).map(mailPart), importance: String(m.importance || "normal"), at: m.receivedDateTime || m.sentDateTime || "", read: !!m.isRead, categories: (m.categories || []).slice(0, 6).map((c) => String(c).slice(0, 40)), flag: mailFlag(m.flag), html, body: shown, attachments: (m.attachments || []).filter((a) => !a.isInline).map((a) => ({ id: a.id, name: String(a.name || "attachment").slice(0, 160), size: Number(a.size || 0), type: String(a.contentType || "") })).concat(movedPics), worker: WORKER_BUILD });
+      const nt = imid ? await mailNotesFor(env, box.id, imid, user, m.categories || []) : { notes: [], flash: false };
+      return reply(env, 200, { ok: true, id: m.id, imid, notes: nt.notes, noteFlash: nt.flash, urgentOff: !!(ex && ex.urgent_off), subject: String(m.subject || "(no subject)"), from: mailPart(m.from), to: (m.toRecipients || []).map(mailPart), cc: (m.ccRecipients || []).map(mailPart), bcc: (m.bccRecipients || []).map(mailPart), importance: String(m.importance || "normal"), at: m.receivedDateTime || m.sentDateTime || "", read: !!m.isRead, categories: (m.categories || []).slice(0, 6).map((c) => String(c).slice(0, 40)), flag: mailFlag(m.flag), html, body: shown, attachments: (m.attachments || []).filter((a) => !a.isInline).map((a) => ({ id: a.id, name: String(a.name || "attachment").slice(0, 160), size: Number(a.size || 0), type: String(a.contentType || "") })).concat(movedPics), worker: WORKER_BUILD });
     }
     if (url.pathname === "/api/mail/replies" && !post) {
       // Everything our side sent in the same conversation as this email: replies and forwards, with the folder each one sits in.
@@ -5822,17 +5871,35 @@ async function mailRoutes(request, env, user, url) {
         if (!mv.ok) return reply(env, 200, { ok: false, error: mv.status === 409 ? "A folder with that name is already there." : mailWhy(mv, true), worker: WORKER_BUILD });
         return reply(env, 200, { ok: true, newId: String((mv.json && mv.json.id) || ""), worker: WORKER_BUILD });
       }
-      if (act === "setnote" || act === "urgentoff") {
+      if (act === "addnote" || act === "editnote" || act === "acknote") {
         const imid = String(body.imid || "").slice(0, 300);
         if (!imid) return reply(env, 200, { ok: false, error: "That email cannot take a note.", worker: WORKER_BUILD });
+        await mailNotesTable(env);
+        const me = String(user.email || "").toLowerCase();
+        const by = String(user.name || user.email || "").trim().slice(0, 80);
+        const text = String(body.note || "").replace(/\r/g, "").trim().slice(0, 1000);
+        if (act === "addnote") {
+          if (!text) return reply(env, 200, { ok: false, error: "The note is empty.", worker: WORKER_BUILD });
+          await env.DB.prepare("INSERT INTO mail_notes (id, box, imid, text, by_name, by_email, at) VALUES (?, ?, ?, ?, ?, ?, ?)").bind(crypto.randomUUID(), box.id, imid, text, by, me, new Date().toISOString()).run();
+        } else if (act === "editnote") {
+          const row = await env.DB.prepare("SELECT by_email, at FROM mail_notes WHERE id = ? AND box = ? AND imid = ?").bind(String(body.noteId || ""), box.id, imid).first();
+          if (!row) return reply(env, 200, { ok: false, error: "That note is no longer there.", worker: WORKER_BUILD });
+          if (String(row.by_email || "").toLowerCase() !== me) return reply(env, 200, { ok: false, error: "Only the person who wrote a note can change it.", worker: WORKER_BUILD });
+          if (Date.now() - Date.parse(String(row.at || "")) > 5 * 60 * 1000) return reply(env, 200, { ok: false, error: "A note can only be changed in the first 5 minutes. Add a new note instead.", worker: WORKER_BUILD });
+          if (!text) return reply(env, 200, { ok: false, error: "The note is empty.", worker: WORKER_BUILD });
+          await env.DB.prepare("UPDATE mail_notes SET text = ?, edited_at = ? WHERE id = ?").bind(text, new Date().toISOString(), String(body.noteId)).run();
+        } else {
+          await env.DB.prepare("INSERT OR IGNORE INTO mail_note_acks (note_id, email, at) SELECT id, ?, ? FROM mail_notes WHERE box = ? AND imid = ?").bind(me, new Date().toISOString(), box.id, imid).run();
+        }
+        const cats = Array.isArray(body.categories) ? body.categories : [];
+        const nt = await mailNotesFor(env, box.id, imid, user, cats);
+        return reply(env, 200, { ok: true, notes: nt.notes, noteFlash: nt.flash, worker: WORKER_BUILD });
+      }
+      if (act === "urgentoff") {
+        const imid = String(body.imid || "").slice(0, 300);
+        if (!imid) return reply(env, 200, { ok: false, error: "That email cannot be changed.", worker: WORKER_BUILD });
         await mailExtraTable(env);
         await env.DB.prepare("INSERT OR IGNORE INTO mail_extra (box, imid) VALUES (?, ?)").bind(box.id, imid).run();
-        if (act === "setnote") {
-          const text = String(body.note || "").replace(/\r/g, "").trim().slice(0, 1000);
-          const by = String(user.name || user.email || "").trim().slice(0, 80);
-          await env.DB.prepare("UPDATE mail_extra SET note = ?, note_by = ?, note_at = ? WHERE box = ? AND imid = ?").bind(text, text ? by : "", text ? new Date().toISOString() : "", box.id, imid).run();
-          return reply(env, 200, { ok: true, note: text ? { text, by, at: new Date().toISOString() } : null, worker: WORKER_BUILD });
-        }
         await env.DB.prepare("UPDATE mail_extra SET urgent_off = ? WHERE box = ? AND imid = ?").bind(body.off === false ? 0 : 1, box.id, imid).run();
         return reply(env, 200, { ok: true, worker: WORKER_BUILD });
       }
@@ -5976,8 +6043,8 @@ async function vmTag(env) {
         await mailDo(env, addr, `/messages/${encodeURIComponent(m.id)}`, "PATCH", { categories: [...new Set([...have, "Andrew"])] });
         const imid = String(m.internetMessageId || "").slice(0, 300);
         if (imid) {
-          await env.DB.prepare("INSERT OR IGNORE INTO mail_extra (box, imid) VALUES (?, ?)").bind(b.id, imid).run();
-          await env.DB.prepare("UPDATE mail_extra SET note = ?, note_by = ?, note_at = ? WHERE box = ? AND imid = ? AND (note IS NULL OR note = '')").bind("This is a commercial inquiry through the 1300.", "Weir", new Date().toISOString(), b.id, imid).run();
+          await mailNotesTable(env);
+          await env.DB.prepare("INSERT OR IGNORE INTO mail_notes (id, box, imid, text, by_name, by_email, at) VALUES (?, ?, ?, ?, 'Weir', '', ?)").bind("auto:" + b.id + ":" + imid, b.id, imid, "This is a commercial inquiry through the 1300.", new Date().toISOString()).run();
         }
         await mark("commercial");
       } else if (/general|maintenance/.test(name)) {
