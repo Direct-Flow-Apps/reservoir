@@ -1,6 +1,6 @@
 {
   "name": "reservoir-api",
-  "main": "worker.js",
+  "main": "Core Worker.js",
   "compatibility_date": "2026-10-08",
   "placement": { "mode": "smart" },
   "keep_vars": true,
