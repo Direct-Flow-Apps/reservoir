@@ -690,7 +690,7 @@ const receiptRecordOut = (r) => ({ id: r.id, kind: "receipt", receiptType: r.typ
 
 // Update push. Set this to a bundle name (for example "Full-Reservoir-2026.11.25-v26") and every open Reservoir and Weir window that finds that bundle newer than its own reloads straight away, instead of waiting for midnight or a home screen. Leave it empty for the normal gentle update.
 const APP_FORCE_UPDATE = "Full-Reservoir-2026.11.25-v26";
-const WORKER_BUILD = "Reservoir-Worker-2026.11.27-w350";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.27-w351";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -6473,8 +6473,8 @@ async function arofloRoutes(request, env, user, url) {
           const res = await fetch(AROFLO_BASE + path, { method, headers: H, ...(payload !== undefined ? { body: JSON.stringify(payload) } : null) });
           const t = (await res.text()).replace(/\s+/g, " ");
           let json = null; try { json = JSON.parse(t); } catch (e) { json = null; }
-          return { status: res.status, text: t.slice(0, 300), json };
-        } catch (e) { return { status: 0, text: String(e && e.message || e).slice(0, 200), json: null }; }
+          return { status: res.status, text: t.slice(0, 300), json, allow: res.headers.get("allow") || "" };
+        } catch (e) { return { status: 0, text: String(e && e.message || e).slice(0, 200), json: null, allow: "" }; }
       };
       const statusOf = async () => {
         const r = await call("GET", T);
@@ -6499,6 +6499,23 @@ async function arofloRoutes(request, env, user, url) {
         }
         const d = await docsOf();
         log.push(`GET ${T}/documents answered ${d.http}. ${d.list.length} documents${d.list.length ? ": " + d.list.slice(0, 8).map((x) => `${nameOf(x)} [${filterOf(x) || "no filter shown"}]`).join(", ") : ". " + d.text.slice(0, 160)}`);
+        return reply(env, 200, { ok: true, log, worker: WORKER_BUILD });
+      }
+      if (act === "po") {
+        // Purchase orders and suppliers. Reads both lists, asks each route which methods it allows, then sends an empty purchase order, which AroFlo cannot turn into a real one. 405 means the route has no create, 400 means the route exists and wanted fields.
+        for (const p of ["/suppliers", "/purchaseorders", "/purchase-orders"]) {
+          const r = await call("GET", `${p}?limit=5`);
+          const list = r.json ? (arofloList(r.json) || (Array.isArray(r.json) ? r.json : [])) : [];
+          log.push(`GET ${p} answered ${r.status}${r.status === 200 ? `. ${list.length} returned${list.length ? ": " + list.slice(0, 5).map((x) => String(x.name || x.supplierName || x.number || x.purchaseOrderNumber || x.id || "").slice(0, 40)).join(", ") : ". " + r.text.slice(0, 120)}` : " " + r.text.slice(0, 140)}`);
+          const o = await call("OPTIONS", p);
+          log.push(`OPTIONS ${p} answered ${o.status}. Allowed methods: ${o.allow || "not stated"}`);
+        }
+        for (const p of ["/purchaseorders", "/purchase-orders"]) {
+          const r = await call("POST", p, {});
+          log.push(`POST ${p} with an empty body answered ${r.status}. ${r.text.slice(0, 200)}`);
+        }
+        const sup = await call("POST", "/suppliers", {});
+        log.push(`POST /suppliers with an empty body answered ${sup.status}. ${sup.text.slice(0, 200)}`);
         return reply(env, 200, { ok: true, log, worker: WORKER_BUILD });
       }
       if (act === "set") {
