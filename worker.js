@@ -690,7 +690,7 @@ const receiptRecordOut = (r) => ({ id: r.id, kind: "receipt", receiptType: r.typ
 
 // Update push. Set this to a bundle name (for example "Full-Reservoir-2026.11.25-v26") and every open Reservoir and Weir window that finds that bundle newer than its own reloads straight away, instead of waiting for midnight or a home screen. Leave it empty for the normal gentle update.
 const APP_FORCE_UPDATE = "Full-Reservoir-2026.11.25-v26";
-const WORKER_BUILD = "Reservoir-Worker-2026.11.27-w349";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.27-w350";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -6374,7 +6374,7 @@ async function mailDraftsSweep(env) {
 async function arofloRoutes(request, env, user, url) {
   if (!url.pathname.startsWith("/api/aroflo")) return null;
   if (user.tier !== "T1") return reply(env, 403, { error: "forbidden" });
-  const isPush = (url.pathname === "/api/aroflo/filter-test" || url.pathname === "/api/aroflo/push-test" || url.pathname === "/api/aroflo/push-note" || url.pathname === "/api/aroflo/push-file") && request.method === "POST";
+  const isPush = (url.pathname === "/api/aroflo/status-test" || url.pathname === "/api/aroflo/filter-test" || url.pathname === "/api/aroflo/push-test" || url.pathname === "/api/aroflo/push-note" || url.pathname === "/api/aroflo/push-file") && request.method === "POST";
   if (request.method !== "GET" && !isPush) return reply(env, 404, { error: "not found" });
   if (!env.AROFLO_TOKEN) return reply(env, 200, { ok: false, error: "The AROFLO_TOKEN secret is not set on the Worker.", worker: WORKER_BUILD });
   try {
@@ -6458,6 +6458,91 @@ async function arofloRoutes(request, env, user, url) {
         for (const [lab, p, h, b] of tries) { if (ok) break; if (win && lab === win[0]) continue; ok = await tryIt(`photo, ${lab}, POST`, p, { method: "POST", headers: h, body: b }); }
       }
       return reply(env, 200, { ok, attempts, worker: WORKER_BUILD });
+    }
+    // Status test. Reads a task's status and substatus, tries to change them, and tries to change the filter of a document already on the task. Every write is checked by reading the task again, because AroFlo answers 204 even when it ignores a body. Directors only, and only when a button is pressed.
+    if (url.pathname === "/api/aroflo/status-test") {
+      let body = {};
+      try { body = await request.json(); } catch (e) { body = {}; }
+      const id = String(body.id || ""), act = String(body.act || "read");
+      if (!/^[A-Za-z0-9_.-]{1,60}$/.test(id)) return reply(env, 400, { error: "bad task" });
+      const T = `/tasks/${encodeURIComponent(id)}`;
+      const H = { Authorization: "Bearer " + env.AROFLO_TOKEN, Accept: "application/json", "Content-Type": "application/json" };
+      const log = [];
+      const call = async (method, path, payload) => {
+        try {
+          const res = await fetch(AROFLO_BASE + path, { method, headers: H, ...(payload !== undefined ? { body: JSON.stringify(payload) } : null) });
+          const t = (await res.text()).replace(/\s+/g, " ");
+          let json = null; try { json = JSON.parse(t); } catch (e) { json = null; }
+          return { status: res.status, text: t.slice(0, 300), json };
+        } catch (e) { return { status: 0, text: String(e && e.message || e).slice(0, 200), json: null }; }
+      };
+      const statusOf = async () => {
+        const r = await call("GET", T);
+        const rec = r.json && r.json.data && typeof r.json.data === "object" && !Array.isArray(r.json.data) ? r.json.data : r.json;
+        const flat = rec ? arofloFlat(rec, "", [], 0).filter(([k]) => /status/i.test(k)) : [];
+        return { http: r.status, fields: flat.map(([k, v]) => `${k}=${String(v).slice(0, 60)}`).join(", ") };
+      };
+      const docsOf = async () => {
+        const r = await call("GET", `${T}/documents`);
+        const list = r.json ? (arofloList(r.json) || (Array.isArray(r.json) ? r.json : [])) : [];
+        return { http: r.status, list, text: r.text };
+      };
+      const filterOf = (d) => String(d && (d.documentFilter || d.filter) || "");
+      const nameOf = (d) => String(d && (d.displayName || d.name || d.fileName) || "");
+      if (act === "read") {
+        const st = await statusOf();
+        log.push(`GET ${T} answered ${st.http}. Status fields: ${st.fields || "none found"}`);
+        for (const p of ["/substatuses", "/substatus", "/tasks/substatuses", "/tasks/subStatuses", "/taskSubStatuses", "/tasks/statuses"]) {
+          const r = await call("GET", p);
+          log.push(`GET ${p} answered ${r.status}${r.status === 200 ? ": " + r.text.slice(0, 260) : ""}`);
+          if (r.status === 200) break;
+        }
+        const d = await docsOf();
+        log.push(`GET ${T}/documents answered ${d.http}. ${d.list.length} documents${d.list.length ? ": " + d.list.slice(0, 8).map((x) => `${nameOf(x)} [${filterOf(x) || "no filter shown"}]`).join(", ") : ". " + d.text.slice(0, 160)}`);
+        return reply(env, 200, { ok: true, log, worker: WORKER_BUILD });
+      }
+      if (act === "set") {
+        const status = String(body.status || "").slice(0, 40), sub = String(body.sub || "").slice(0, 60);
+        if (!status && !sub) return reply(env, 400, { error: "Enter a status or a substatus" });
+        const before = await statusOf();
+        log.push(`Before: ${before.fields || "none found"}`);
+        const tries = [];
+        if (status) tries.push(["status", { status }]);
+        if (sub) { tries.push(["subStatus by name", { subStatus: sub }]); tries.push(["subStatusName", { subStatusName: sub }]); tries.push(["subStatus object", { subStatus: { name: sub } }]); tries.push(["substatus lower case", { substatus: sub }]); if (/^[A-Za-z0-9=+/_-]{4,40}$/.test(sub)) tries.push(["subStatusId", { subStatusId: sub }]); }
+        let changed = false, last = before.fields;
+        for (const [lab, payload] of tries) {
+          const r = await call("PATCH", T, payload);
+          const after = await statusOf();
+          const moved = after.fields !== last;
+          log.push(`PATCH ${lab} ${JSON.stringify(payload)} answered ${r.status}${r.status >= 300 ? " " + r.text.slice(0, 160) : ""}. Read back: ${after.fields || "none found"}. ${moved ? "CHANGED" : "no change"}`);
+          if (moved) { last = after.fields; changed = true; if (lab !== "status") break; }
+        }
+        return reply(env, 200, { ok: true, changed, log, worker: WORKER_BUILD });
+      }
+      if (act === "docfilter") {
+        const up = await call("POST", `${T}/documents/upload`, { displayName: "status-test", fileName: "status-test.txt", base64: btoa("status test"), documentFilter: "SHOW_ALL" });
+        const m = /"(?:documentId|id)"\s*:\s*"?([A-Za-z0-9=+/_-]+)"?/.exec(up.text);
+        log.push(`Upload with SHOW_ALL answered ${up.status}. ${up.text.slice(0, 220)}`);
+        const docId = m ? m[1] : "";
+        const find = async () => { const d = await docsOf(); const hit = d.list.find((x) => nameOf(x).includes("status-test") || (docId && String(x.id || x.documentId || "") === docId)); return { d, hit }; };
+        let f0 = await find();
+        log.push(`Document found on the task: ${f0.hit ? "yes, filter " + (filterOf(f0.hit) || "not shown") + ", id " + String(f0.hit.id || f0.hit.documentId || docId) : "no (list answered " + f0.d.http + ")"}`);
+        const did = String((f0.hit && (f0.hit.id || f0.hit.documentId)) || docId);
+        if (!did) { log.push("No document id, so no change could be tried."); return reply(env, 200, { ok: true, changed: false, log, worker: WORKER_BUILD }); }
+        const D = `${T}/documents/${encodeURIComponent(did)}`;
+        const tries = [["PATCH document documentFilter", "PATCH", D, { documentFilter: "INTERNAL_ONLY" }], ["PUT document documentFilter", "PUT", D, { documentFilter: "INTERNAL_ONLY" }], ["PATCH document filter", "PATCH", D, { filter: "INTERNAL_ONLY" }], ["PATCH document /filter", "PATCH", `${D}/filter`, { documentFilter: "INTERNAL_ONLY" }], ["PUT document /filter", "PUT", `${D}/filter`, { documentFilter: "INTERNAL_ONLY" }], ["PATCH documents list item", "PATCH", `${T}/documents`, { documents: [{ id: did, documentFilter: "INTERNAL_ONLY" }] }]];
+        let changed = false;
+        for (const [lab, method, path, payload] of tries) {
+          const r = await call(method, path, payload);
+          const f1 = await find();
+          const now = f1.hit ? filterOf(f1.hit) : "";
+          const moved = !!now && now !== filterOf(f0.hit);
+          log.push(`${lab} answered ${r.status}${r.status >= 300 ? " " + r.text.slice(0, 140) : ""}. Read back filter: ${now || "not shown"}. ${moved ? "CHANGED" : "no change"}`);
+          if (moved) { changed = true; break; }
+        }
+        return reply(env, 200, { ok: true, changed, log, worker: WORKER_BUILD });
+      }
+      return reply(env, 400, { error: "bad action" });
     }
     // Maps the document filter. Uploads a tiny text file with each filter value and reports what AroFlo answered, including the filter it says it stored. A made up value goes first so AroFlo's own error can list the real ones.
     if (url.pathname === "/api/aroflo/filter-test") {
