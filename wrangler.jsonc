@@ -5,7 +5,8 @@
   "placement": { "mode": "smart" },
   "keep_vars": true,
   "d1_databases": [
-    { "binding": "DB", "database_name": "reservoir", "database_id": "9aef3882-4dcf-480e-9ff9-2c379abdcccb" }
+    { "binding": "DB", "database_name": "reservoir", "database_id": "9aef3882-4dcf-480e-9ff9-2c379abdcccb" },
+    { "binding": "DB_UAT", "database_name": "reservoir-uat", "database_id": "f1d9e322-1984-49fd-b7e1-d0119251c787" }
   ],
   "ai": { "binding": "AI" },
   "triggers": { "crons": ["*/30 * * * *", "*/5 * * * *", "* * * * *"] }
