@@ -690,7 +690,7 @@ const receiptRecordOut = (r) => ({ id: r.id, kind: "receipt", receiptType: r.typ
 
 // Update push. Set this to a bundle name (for example "Full-Reservoir-2026.11.25-v26") and every open Reservoir and Weir window that finds that bundle newer than its own reloads straight away, instead of waiting for midnight or a home screen. Leave it empty for the normal gentle update.
 const APP_FORCE_UPDATE = "Full-Reservoir-2026.11.25-v26";
-const WORKER_BUILD = "Reservoir-Worker-2026.11.27-w347";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.27-w349";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -5019,23 +5019,46 @@ async function mailNotesTable(env) {
   await env.DB.prepare("UPDATE mail_extra SET note = '' WHERE note != ''").run();
   mailNotesReady = true;
 }
-const mailNoteFirstName = (user) => String((user && user.name) || "").trim().split(/\s+/)[0].toLowerCase();
-// What the notes of each email look like to this person: how many there are, and whether an added note is waiting for them to acknowledge.
+// The people an email is waiting on: staff the email is categorised to. A category names a person by first name or preferred name (Mitch for Mitchell), so each signed in address is matched on its start, its Xero first name and its preferred name.
+async function mailNoteResponsible(env, categories) {
+  const want = new Set((categories || []).map((c) => String(c).trim().toLowerCase()).filter(Boolean));
+  if (!want.size) return new Set();
+  const tiers = await accessTiers(env);
+  const names = new Map();
+  try {
+    const r = await env.DB.prepare("SELECT lower(x.email) AS email, x.name AS name, r.preferred_name AS preferred FROM dfp_xero x LEFT JOIN dfp_reservoir r ON lower(r.email) = lower(x.email)").all();
+    for (const x of ((r && r.results) || [])) names.set(x.email, [String(x.name || "").trim().split(/\s+/)[0], String(x.preferred || "").trim()].map((n) => n.toLowerCase()).filter(Boolean));
+  } catch (e) { console.log("note names failed", String(e && e.message || e)); }
+  return new Set(Object.keys(tiers).filter((e) => want.has(e.split("@")[0].split(/[._]/)[0]) || (names.get(e) || []).some((n) => want.has(n))));
+}
+// A note is waiting when it was written by someone else, the email is categorised to somebody, and none of those people has acknowledged it. Everyone sees that it is waiting; only the people it is waiting on can acknowledge it.
+function mailNoteState(row, resp, me) {
+  const by = String(row.by_email || "").toLowerCase();
+  const id = String(row.id || "");
+  if (id.startsWith("legacy:") || id.startsWith("auto:")) return { pending: false, canAck: false };
+  const need = [...resp].filter((e) => e !== by);
+  const acked = new Set(String(row.acked_by || "").split(",").filter(Boolean));
+  const pending = need.length > 0 && !need.some((e) => acked.has(e));
+  return { pending, canAck: pending && need.includes(me) };
+}
 async function mailNotesSummary(env, boxId, items, user) {
   const out = new Map();
   const ids = [...new Set(items.map((x) => x.imid).filter(Boolean))];
   if (!ids.length) return out;
   try {
     await mailNotesTable(env);
-    const me = String((user && user.email) || "").toLowerCase(), first = mailNoteFirstName(user);
-    const cats = new Map(items.map((x) => [x.imid, (x.categories || []).map((c) => String(c).toLowerCase())]));
+    const me = String((user && user.email) || "").toLowerCase();
+    const cats = new Map(items.map((x) => [x.imid, x.categories || []]));
+    const respCache = new Map();
     for (let i = 0; i < ids.length; i += 40) {
       const part = ids.slice(i, i + 40);
-      const r = await env.DB.prepare(`SELECT n.id, n.imid, n.by_email, n.at, (SELECT 1 FROM mail_note_acks a WHERE a.note_id = n.id AND a.email = ?) AS acked FROM mail_notes n WHERE n.box = ? AND n.imid IN (${part.map(() => "?").join(",")}) ORDER BY n.at ASC, n.rowid ASC`).bind(me, boxId, ...part).all();
+      const r = await env.DB.prepare(`SELECT n.id, n.imid, n.by_email, (SELECT group_concat(a.email) FROM mail_note_acks a WHERE a.note_id = n.id) AS acked_by FROM mail_notes n WHERE n.box = ? AND n.imid IN (${part.map(() => "?").join(",")})`).bind(boxId, ...part).all();
       for (const x of ((r && r.results) || [])) {
         const o = out.get(x.imid) || { count: 0, flash: false };
         o.count++;
-        if (!x.acked && !String(x.id).startsWith("legacy:") && String(x.by_email || "").toLowerCase() !== me && first && (cats.get(x.imid) || []).includes(first)) o.flash = true;
+        const ck = (cats.get(x.imid) || []).join("|").toLowerCase();
+        if (!respCache.has(ck)) respCache.set(ck, await mailNoteResponsible(env, cats.get(x.imid) || []));
+        if (mailNoteState(x, respCache.get(ck), me).pending) o.flash = true;
         out.set(x.imid, o);
       }
     }
@@ -5045,11 +5068,9 @@ async function mailNotesSummary(env, boxId, items, user) {
 async function mailNotesFor(env, boxId, imid, user, categories) {
   await mailNotesTable(env);
   const me = String((user && user.email) || "").toLowerCase();
-  const r = await env.DB.prepare("SELECT n.id, n.text, n.by_name, n.by_email, n.at, n.edited_at, (SELECT 1 FROM mail_note_acks a WHERE a.note_id = n.id AND a.email = ?) AS acked FROM mail_notes n WHERE n.box = ? AND n.imid = ? ORDER BY n.at ASC, n.rowid ASC").bind(me, boxId, imid).all();
-  const rows = (r && r.results) || [];
-  const first = mailNoteFirstName(user);
-  const mine = (categories || []).some((c) => String(c).toLowerCase() === first);
-  const notes = rows.map((x) => ({ id: x.id, text: String(x.text || ""), by: String(x.by_name || ""), at: String(x.at || ""), edited: String(x.edited_at || ""), mine: !!me && String(x.by_email || "").toLowerCase() === me && Date.now() - Date.parse(String(x.at || "")) <= 5 * 60 * 1000, pending: !x.acked && mine && !String(x.id).startsWith("legacy:") && String(x.by_email || "").toLowerCase() !== me })).reverse();
+  const r = await env.DB.prepare("SELECT n.id, n.text, n.by_name, n.by_email, n.at, n.edited_at, (SELECT group_concat(a.email) FROM mail_note_acks a WHERE a.note_id = n.id) AS acked_by FROM mail_notes n WHERE n.box = ? AND n.imid = ? ORDER BY n.at ASC, n.rowid ASC").bind(boxId, imid).all();
+  const resp = await mailNoteResponsible(env, categories);
+  const notes = ((r && r.results) || []).map((x) => { const st = mailNoteState(x, resp, me); return { id: x.id, text: String(x.text || ""), by: String(x.by_name || ""), at: String(x.at || ""), edited: String(x.edited_at || ""), mine: !!me && String(x.by_email || "").toLowerCase() === me && Date.now() - Date.parse(String(x.at || "")) <= 5 * 60 * 1000, pending: st.pending, canAck: st.canAck }; }).reverse();
   return { notes, flash: notes.some((n) => n.pending) };
 }
 const mailFlag = (f) => (f && (f.flagStatus === "flagged" || f.flagStatus === "complete")) ? f.flagStatus : "";

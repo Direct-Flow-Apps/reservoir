@@ -690,7 +690,7 @@ const receiptRecordOut = (r) => ({ id: r.id, kind: "receipt", receiptType: r.typ
 
 // Update push. Set this to a bundle name (for example "Full-Reservoir-2026.11.25-v26") and every open Reservoir and Weir window that finds that bundle newer than its own reloads straight away, instead of waiting for midnight or a home screen. Leave it empty for the normal gentle update.
 const APP_FORCE_UPDATE = "Full-Reservoir-2026.11.25-v26";
-const WORKER_BUILD = "Reservoir-Worker-2026.11.27-w348";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.27-w349";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -5019,14 +5019,17 @@ async function mailNotesTable(env) {
   await env.DB.prepare("UPDATE mail_extra SET note = '' WHERE note != ''").run();
   mailNotesReady = true;
 }
-// The people an email is waiting on: staff whose first name is one of its categories. The first name is the start of their sign in address.
+// The people an email is waiting on: staff the email is categorised to. A category names a person by first name or preferred name (Mitch for Mitchell), so each signed in address is matched on its start, its Xero first name and its preferred name.
 async function mailNoteResponsible(env, categories) {
   const want = new Set((categories || []).map((c) => String(c).trim().toLowerCase()).filter(Boolean));
   if (!want.size) return new Set();
+  const tiers = await accessTiers(env);
+  const names = new Map();
   try {
-    const tiers = await accessTiers(env);
-    return new Set(Object.keys(tiers).filter((e) => want.has(e.split("@")[0].split(/[._]/)[0])));
-  } catch (e) { return new Set(); }
+    const r = await env.DB.prepare("SELECT lower(x.email) AS email, x.name AS name, r.preferred_name AS preferred FROM dfp_xero x LEFT JOIN dfp_reservoir r ON lower(r.email) = lower(x.email)").all();
+    for (const x of ((r && r.results) || [])) names.set(x.email, [String(x.name || "").trim().split(/\s+/)[0], String(x.preferred || "").trim()].map((n) => n.toLowerCase()).filter(Boolean));
+  } catch (e) { console.log("note names failed", String(e && e.message || e)); }
+  return new Set(Object.keys(tiers).filter((e) => want.has(e.split("@")[0].split(/[._]/)[0]) || (names.get(e) || []).some((n) => want.has(n))));
 }
 // A note is waiting when it was written by someone else, the email is categorised to somebody, and none of those people has acknowledged it. Everyone sees that it is waiting; only the people it is waiting on can acknowledge it.
 function mailNoteState(row, resp, me) {
