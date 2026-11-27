@@ -690,7 +690,7 @@ const receiptRecordOut = (r) => ({ id: r.id, kind: "receipt", receiptType: r.typ
 
 // Update push. Set this to a bundle name (for example "Full-Reservoir-2026.11.25-v26") and every open Reservoir and Weir window that finds that bundle newer than its own reloads straight away, instead of waiting for midnight or a home screen. Leave it empty for the normal gentle update.
 const APP_FORCE_UPDATE = "Full-Reservoir-2026.11.25-v26";
-const WORKER_BUILD = "Reservoir-Worker-2026.11.27-w342";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.27-w346";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -3824,14 +3824,14 @@ async function daisysParse(bytes) {
   const yr = dt[3].length === 2 ? 2000 + Number(dt[3]) : Number(dt[3]);
   return { number, date: `${yr}-${String(dt[2]).padStart(2, "0")}-${String(dt[1]).padStart(2, "0")}`, ex, gst, inc, order: belowText("PO#:") };
 }
-// Some generators (pdf-lib) split one line of text into several runs. Joins runs on the same line that sit right next to each other.
+// Some generators (pdf-lib) split one word into several runs. Joins runs on the same line only when the next run starts inside or touching the end of the one before, so separate columns stay separate.
 function joinRuns(items) {
   const out = [];
   const sorted = [...items].sort((a, b) => a.page - b.page || a.y - b.y || a.x - b.x);
   for (const it of sorted) {
     const p = out[out.length - 1];
     const sz = (p && p.size) || it.size || 12;
-    if (p && p.page === it.page && Math.abs(p.y - it.y) < 1.5 && it.x - (p.x + p.t.length * sz * 0.6) < sz * 1.2 && it.x >= p.x) out[out.length - 1] = { ...p, t: p.t + it.t, size: p.size };
+    if (p && p.page === it.page && Math.abs(p.y - it.y) < 1.5 && it.x - (p.x + p.t.length * sz * 0.6) <= 0 && it.x >= p.x) out[out.length - 1] = { ...p, t: p.t + it.t, size: p.size };
     else out.push({ ...it });
   }
   return out;
@@ -8524,8 +8524,10 @@ async function tsXeroPullSchedule(env) {
   if (now.date >= "2026-10-26") await xeroPullOnce(env, "oneoff.contacts_pull_20261026", "One off contacts pull", contactsPullFn);
   if (now.dow >= 1 && now.dow <= 5 && now.mins >= 18 * 60 && now.mins < 19 * 60) await xeroPullOnce(env, `sweep.contacts_pull.${now.date}`, "Weekday contacts pull", contactsPullFn);
 }
-// ---- Accounts mailbox invoice pickup. Supplier emails are moved into the Reservoir folder the moment they arrive (inbox rules this Worker creates), Microsoft pings the Worker for each one, and the Worker makes the bill in Xero, then sends it to AroFlo, marks it read and archives it. Xero goes first and nothing is sent to AroFlo unless the bill is in, so a failed invoice has gone nowhere. There is no email to Xero fallback. A problem email, a credit or an email with no PDF goes back to the inbox. The half hourly cron is the backstop for a missed ping. ----
-const INV_FOLDER_NAME = "Reservoir";
+// ---- Accounts mailbox invoice pickup. Supplier emails are moved into the accPay Sweep folder the moment they arrive (inbox rules this Worker creates), Microsoft pings the Worker for each one, and the Worker makes the bill in Xero, then sends it to AroFlo, marks it read and archives it. Xero goes first and nothing is sent to AroFlo unless the bill is in, so a failed invoice has gone nowhere. There is no email to Xero fallback. A failed invoice stays in the accPay Sweep folder tagged ERROR! and is fixed from Reservoir (Retry); a credit or an email with no PDF goes back to the inbox. The half hourly cron is the backstop for a missed ping. ----
+// The folder the accounts payable sweep works from. Found by name ignoring case and spaces, so only the spelling "accPay Sweep" is needed.
+const INV_FOLDER_KEY = "accpaysweep";
+const INV_FOLDER_LABEL = "accPay Sweep";
 const invHash = (s) => { s = String(s); let h = 5381; for (let i = 0; i < s.length; i++) h = ((h * 33) ^ s.charCodeAt(i)) >>> 0; return h.toString(36); };
 const invRulesSorted = () => [...INVOICE_MAIL_RULES].sort((a, b) => a.name.localeCompare(b.name));
 let invFolderCache = "";
@@ -8633,10 +8635,10 @@ async function invHistoryTidy(env) {
 }
 async function invFolderId(env, addr) {
   if (invFolderCache) return invFolderCache;
-  const q = `?$filter=${encodeURIComponent(`displayName eq '${INV_FOLDER_NAME}'`)}&$select=id,displayName`;
+  const q = "?$top=100&$select=id,displayName";
   for (const path of ["/mailFolders", "/mailFolders/inbox/childFolders"]) {
     const r = await mailGraph(env, addr, path + q);
-    const f = r.ok && r.json && r.json.value && r.json.value[0];
+    const f = r.ok && r.json && r.json.value && r.json.value.find((x) => String(x.displayName || "").toLowerCase().replace(/\s+/g, "") === INV_FOLDER_KEY);
     if (f && f.id) { invFolderCache = f.id; return f.id; }
   }
   return "";
@@ -8716,9 +8718,16 @@ async function invProcessHit(env, actor, addr, rule, hit, inFolder, redo) {
   let archived = "";
   if (!allOk) {
     const tag = await patch({ categories: [...new Set([...(hit.categories || []), "ERROR!"])] });
-    if (inFolder) { const mv = await moveTo("inbox"); archived = mv && mv.ok ? "moved to the inbox and tagged ERROR!" : "left in the Reservoir folder (could not move it)"; }
-    else archived = tag && tag.ok ? "left in the mailbox and tagged ERROR!" : "left in the mailbox (could not tag it ERROR!)";
+    archived = tag && tag.ok ? (inFolder ? `left in the ${INV_FOLDER_LABEL} folder and tagged ERROR!` : "left in the mailbox and tagged ERROR!") : "left in the mailbox (could not tag it ERROR!)";
     for (const it of items) await invHistoryAdd(env, msgKey + ":" + invHash(it.file), rule.name, it.number || it.file, "error", failed.join(". ") || it.xeroNote, hit.internetMessageId);
+    // Tayler and Andrey are told when an invoice fails the first time. A retry that fails shows on the screen instead.
+    if (redo === undefined) {
+      try {
+        const tiers = await accessTiers(env);
+        const why = (failed.join(". ") || (items.find((x) => x.xeroNote) || {}).xeroNote || "It did not go through.").slice(0, 160);
+        for (const to of Object.keys(tiers).filter((e) => /^(tayler|andrey)[.@]/i.test(e))) await notify(env, { to, kind: "info", title: "Unsuccessful invoice sweep", body: `${rule.name}${items[0] && items[0].number ? " " + items[0].number : ""}: ${why}`, link: "invoices", by: "Reservoir" });
+      } catch (e) { console.log("sweep notice failed", String(e && e.message || e)); }
+    }
     if (!items.length) await invHistoryAdd(env, msgKey, rule.name, "", "error", failed.join(". "), hit.internetMessageId);
   } else {
     // Some suppliers put the real invoice behind a link in the email. Once everything is in, the email goes back to Accounts with a note so the links get downloaded and uploaded by hand.
@@ -8732,26 +8741,22 @@ async function invProcessHit(env, actor, addr, rule, hit, inFolder, redo) {
   }
   return { ok: true, found: true, subject: String(hit.subject || "").slice(0, 120), received: hit.receivedDateTime || "", items, archived, failed: failed.join(". ") };
 }
-// The email behind a failed invoice, for a retry. Looked up by the email's own id when the history line has it, then among the emails tagged ERROR!, then by reading the inbox and the Reservoir folder.
+// The email behind a failed invoice, for a retry. Read from the accPay Sweep folder only: by the email's own id when the history line has it, then by looking through the folder.
 async function invFindEmail(env, addr, folderId, msgKey, imid) {
+  if (!folderId) return { err: "The accPay Sweep folder could not be found in the Accounts mailbox." };
   const sel = "$select=subject,receivedDateTime,categories,from,internetMessageId,parentFolderId";
   const same = (m) => invHash(m.internetMessageId || m.id) === msgKey;
   const look = async (path) => { const r = await mailGraph(env, addr, path); return r.ok ? { m: ((r.json && r.json.value) || []).find(same) || null } : { err: mailWhy(r) }; };
   let err = "";
   if (imid) {
-    const a = await look(`/messages?$top=10&${sel}&$filter=${encodeURIComponent(`internetMessageId eq '${String(imid).replace(/'/g, "''")}'`)}`);
+    const a = await look(`/mailFolders/${folderId}/messages?$top=10&${sel}&$filter=${encodeURIComponent(`internetMessageId eq '${String(imid).replace(/'/g, "''")}'`)}`);
     if (a.m) return a;
     err = a.err || err;
   }
-  const b = await look(`/messages?$top=100&${sel}&$filter=${encodeURIComponent("categories/any(c:c eq 'ERROR!')")}`);
-  if (b.m) return b;
-  err = b.err || err;
   const plain = `?$top=100&${sel}&$filter=${encodeURIComponent("receivedDateTime ge 1900-01-01T00:00:00Z and hasAttachments eq true")}&$orderby=receivedDateTime desc`;
-  for (const f of ["inbox", folderId].filter(Boolean)) {
-    const c = await look(`/mailFolders/${f}/messages${plain}`);
-    if (c.m) return c;
-    err = c.err || err;
-  }
+  const c = await look(`/mailFolders/${folderId}/messages${plain}`);
+  if (c.m) return c;
+  err = c.err || err;
   return err ? { err } : { m: null };
 }
 // Retry a failed invoice from scratch: forget what was sent, take the ERROR! tag off the email and run it again, Xero first. The line moves to the successful history, or stays under errors with the new reason.
@@ -8777,7 +8782,7 @@ async function invRetry(env, actor, id) {
     const found = await invFindEmail(env, addr, folderId, msgKey, row.imid);
     if (found.err) return stop(found.err);
     const hit = found.m;
-    if (!hit) return stop("The email for this invoice could not be found in the Accounts mailbox.");
+    if (!hit) return stop("The email for this invoice is not in the accPay Sweep folder.");
     const rule = invMatchRule(hit);
     if (!rule) return stop("No supplier rule matches that email any more.");
     const cats = (hit.categories || []).filter((c) => String(c).toLowerCase() !== "error!");
@@ -8803,7 +8808,7 @@ async function invRetry(env, actor, id) {
 }
 // A Samios credit note email. The Credits button does only these; the automatic runs and the normal invoice press do them along with the invoices.
 const invIsCreditMail = (m, rule) => !!(rule && rule.creditNotes && /credit note/i.test(String(m.subject || "")));
-// Emails waiting in the Reservoir folder, matched to a supplier rule, in supplier order (A to Z). creditsOnly gives just the credit notes.
+// Emails waiting in the accPay Sweep folder, matched to a supplier rule, in supplier order (A to Z). creditsOnly gives just the credit notes.
 async function invFolderHits(env, addr, folderId, creditsOnly) {
   const f = "receivedDateTime ge 1900-01-01T00:00:00Z and hasAttachments eq true";
   const r = await mailGraph(env, addr, `/mailFolders/${folderId}/messages?$top=50&$select=subject,receivedDateTime,categories,from,internetMessageId&$filter=${encodeURIComponent(f)}&$orderby=receivedDateTime desc`);
@@ -8820,7 +8825,7 @@ async function invFolderHits(env, addr, folderId, creditsOnly) {
   hits.sort((a, b) => a.rule.name.localeCompare(b.rule.name) || String(a.m.receivedDateTime).localeCompare(String(b.m.receivedDateTime)));
   return { err: "", hits };
 }
-// The Worker's own run (a Microsoft ping or the half hourly backstop). Does up to max emails from the Reservoir folder.
+// The Worker's own run (a Microsoft ping or the half hourly backstop). Does up to max emails from the accPay Sweep folder.
 async function invMailSweep(env, max) {
   if (!env.AROFLO_BILLS_EMAIL) return;
   const addr = mailAddress(env, MAILBOXES.find((x) => x.id === "accounts"));
@@ -8847,23 +8852,30 @@ async function invSubscribe(env) {
   if (!env.GRAPH_CLIENT_SECRET) return;
   await settingsTable(env);
   const addr = mailAddress(env, MAILBOXES.find((x) => x.id === "accounts"));
-  const row = await env.DB.prepare("SELECT value, detail FROM app_settings WHERE key = 'invmail.sub'").first();
-  const left = row && row.detail ? Date.parse(row.detail) - Date.now() : 0;
-  if (row && row.value && left > 24 * 3600 * 1000) return;
   const folderId = await invFolderId(env, addr);
   if (!folderId) return;
+  const row = await env.DB.prepare("SELECT value, detail FROM app_settings WHERE key = 'invmail.sub'").first();
+  const watched = await env.DB.prepare("SELECT detail FROM app_settings WHERE key = 'invmail.sub.folder'").first();
+  const sameFolder = !!(watched && watched.detail === folderId);
+  const left = row && row.detail ? Date.parse(row.detail) - Date.now() : 0;
+  if (row && row.value && sameFolder && left > 24 * 3600 * 1000) return;
   const expires = new Date(Date.now() + 4200 * 60000).toISOString();
-  const save = (id) => env.DB.prepare("INSERT OR REPLACE INTO app_settings (key, value, detail, by_name, at) VALUES ('invmail.sub', ?, ?, 'Reservoir', datetime('now'))").bind(id, expires).run();
-  if (row && row.value) {
+  const save = async (id) => {
+    await env.DB.prepare("INSERT OR REPLACE INTO app_settings (key, value, detail, by_name, at) VALUES ('invmail.sub', ?, ?, 'Reservoir', datetime('now'))").bind(id, expires).run();
+    await env.DB.prepare("INSERT OR REPLACE INTO app_settings (key, value, detail, by_name, at) VALUES ('invmail.sub.folder', '1', ?, 'Reservoir', datetime('now'))").bind(folderId).run();
+  };
+  if (row && row.value && sameFolder) {
     const r = await graphFetch(env, `/subscriptions/${encodeURIComponent(row.value)}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ expirationDateTime: expires }) });
     if (r.ok) { await save(row.value); return; }
   }
+  // The folder changed: the old registration watches the wrong folder, so it goes.
+  if (row && row.value && !sameFolder) await graphFetch(env, `/subscriptions/${encodeURIComponent(row.value)}`, { method: "DELETE" }).catch(() => null);
   const r = await graphFetch(env, "/subscriptions", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ changeType: "created", notificationUrl: `${env.API_ORIGIN || "https://reservoir-api.directflow.workers.dev"}/api/invoices/notify`, resource: `users/${addr}/mailFolders/${folderId}/messages`, expirationDateTime: expires, clientState: await invClientState(env) }) });
   const j = await r.json().catch(() => ({}));
   if (r.ok && j.id) await save(j.id);
   else console.log("mail subscription failed", r.status, JSON.stringify(j).slice(0, 300));
 }
-// The server side rules that move supplier mail into the Reservoir folder as it arrives. Needs MailboxSettings.ReadWrite on the Reservoir Directories app. Done again only when the rules or folder change.
+// The server side rules that move supplier mail into the accPay Sweep folder as it arrives. Needs MailboxSettings.ReadWrite on the Reservoir Directories app. Done again only when the rules or folder change.
 async function invRulesSync(env) {
   if (!env.GRAPH_CLIENT_SECRET) return;
   await settingsTable(env);
@@ -9394,7 +9406,7 @@ export default {
     if (earlyUrl.pathname === "/api/app/push" && request.method === "GET") return reply(env, 200, { force: APP_FORCE_UPDATE });
     if (earlyUrl.pathname === "/api/ping" && request.method === "GET") return reply(env, 200, { worker: WORKER_BUILD, xeroMe: true, xeroStaff: true });
     if (earlyUrl.pathname === "/api/invoices/notify" && request.method === "POST") {
-      // Microsoft pings here when mail lands in the Reservoir folder. The first call after the registration is made carries a validation token that must be echoed back.
+      // Microsoft pings here when mail lands in the accPay Sweep folder. The first call after the registration is made carries a validation token that must be echoed back.
       const vt = earlyUrl.searchParams.get("validationToken");
       if (vt) return new Response(vt, { status: 200, headers: { "Content-Type": "text/plain" } });
       try {
@@ -11197,7 +11209,7 @@ export default {
     }
 
     if (url.pathname === "/api/invoices/mailbox" && request.method === "POST") {
-      // Do the next waiting supplier email in the Accounts mailbox: first the Reservoir folder, then the inbox (A to Z by supplier). One email per press.
+      // Do the next waiting supplier email in the Accounts mailbox: first the accPay Sweep folder, then the inbox (A to Z by supplier). One email per press.
       if (user.tier !== "T1") return reply(env, 403, { error: "forbidden" });
       if (user.viewAs && !VIEW_AS_WRITES) return reply(env, 403, { error: "Viewing as someone else is read only." });
       if (!env.AROFLO_BILLS_EMAIL) return reply(env, 501, { error: "not set", detail: "AROFLO_BILLS_EMAIL is not set on the Worker" });
@@ -11233,7 +11245,7 @@ export default {
           for (const hit of hits) {
             if (creditsOnly && !invIsCreditMail(hit, rule)) continue;
             if (!rule.creditNotes && (hit.categories || []).some((c) => String(c).toLowerCase() === "credit")) { credits++; continue; }
-            // An email Reservoir tagged ERROR! waits until the tag is removed in Outlook.
+            // An email tagged ERROR! waits for Retry in Reservoir.
             if ((hit.categories || []).some((c) => String(c).toLowerCase() === "error!")) continue;
             const res = await invProcessHit(env, user, addr, rule, hit, false);
             if (!res) continue;
