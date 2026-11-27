@@ -690,7 +690,7 @@ const receiptRecordOut = (r) => ({ id: r.id, kind: "receipt", receiptType: r.typ
 
 // Update push. Set this to a bundle name (for example "Full-Reservoir-2026.11.25-v26") and every open Reservoir and Weir window that finds that bundle newer than its own reloads straight away, instead of waiting for midnight or a home screen. Leave it empty for the normal gentle update.
 const APP_FORCE_UPDATE = "Full-Reservoir-2026.11.25-v26";
-const WORKER_BUILD = "Reservoir-Worker-2026.11.27-w354";
+const WORKER_BUILD = "Reservoir-Worker-2026.11.28-w355";
 // ---- Xero connection (OAuth2 web app). Secrets: XERO_CLIENT_SECRET. Optional vars: XERO_CLIENT_ID, XERO_REDIRECT, XERO_SCOPES ----
 const XERO_CLIENT_ID_DEFAULT = "6387204C4C394207A0C825A12FB86975";
 const XERO_REDIRECT_DEFAULT = "https://reservoir-api.directflow.workers.dev/api/xero/callback";
@@ -9543,47 +9543,11 @@ async function mergeExportTest(env) {
     await save("done");
   } catch (e) { say("error " + String(e && e.message || e)); await save("failed"); }
 }
-// One time copy of the live database into the test database (the DB_UAT binding). It runs a slice every minute until every table is across, then stops for good. Sign in tokens and push subscriptions are never copied, so the test copy cannot act as the live app.
-const UAT_SKIP = new Set(["schema_done", "xero_auth", "push_subs", "passkeys", "passkey_challenges"]);
-async function uatCopy(env) {
-  const dst = env.DB_UAT, src = env.DB;
-  if (!dst || !src) return;
-  await dst.prepare("CREATE TABLE IF NOT EXISTS _copy_state (k TEXT PRIMARY KEY, v TEXT)").run();
-  const get = async (k) => { const r = await dst.prepare("SELECT v FROM _copy_state WHERE k = ?").bind(k).first(); return r ? r.v : null; };
-  const put = (k, v) => dst.prepare("INSERT INTO _copy_state (k, v) VALUES (?, ?) ON CONFLICT(k) DO UPDATE SET v = excluded.v").bind(k, String(v)).run();
-  if (await get("done")) return;
-  const objs = ((await src.prepare("SELECT type, name, tbl_name, sql FROM sqlite_master WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '_cf_%' ORDER BY CASE type WHEN 'table' THEN 0 ELSE 1 END, name").all()).results) || [];
-  const tables = objs.filter((o) => o.type === "table" && !UAT_SKIP.has(o.name));
-  if (!(await get("schema"))) {
-    for (const t of tables) await dst.exec(t.sql.replace(/^\s*CREATE\s+TABLE\s+(IF\s+NOT\s+EXISTS\s+)?/i, "CREATE TABLE IF NOT EXISTS ").replace(/\s+/g, " "));
-    await put("schema", "1");
-  }
-  let budget = 12;
-  for (const t of tables) {
-    if (await get("t:" + t.name) === "done") continue;
-    const q = '"' + t.name.replace(/"/g, '""') + '"';
-    let off = Number(await get("o:" + t.name) || 0);
-    while (budget-- > 0) {
-      const rows = ((await src.prepare(`SELECT * FROM ${q} ORDER BY rowid LIMIT 40 OFFSET ${off}`).all()).results) || [];
-      if (!rows.length) { await put("t:" + t.name, "done"); break; }
-      const cols = Object.keys(rows[0]);
-      const ins = `INSERT OR REPLACE INTO ${q} (${cols.map((c) => '"' + c.replace(/"/g, '""') + '"').join(",")}) VALUES (${cols.map(() => "?").join(",")})`;
-      await dst.batch(rows.map((r) => dst.prepare(ins).bind(...cols.map((c) => Array.isArray(r[c]) ? new Uint8Array(r[c]) : r[c]))));
-      off += rows.length;
-      await put("o:" + t.name, off);
-      if (rows.length < 40) { await put("t:" + t.name, "done"); break; }
-    }
-    if (budget <= 0) return;
-  }
-  for (const o of objs.filter((x) => x.type !== "table" && !UAT_SKIP.has(x.tbl_name))) { try { await dst.exec(o.sql.replace(/\s+/g, " ")); } catch (e) { /* already there */ } }
-  await put("done", new Date().toISOString());
-  console.log("uat copy finished");
-}
 export default {
   // Runs on a Cloudflare cron trigger if one is added (for example Thursday early morning). It only refreshes leave balances and leave history from Xero into D1.
   async scheduled(event, env, ctx) {
     // A one minute trigger only tidies pictures out of the body of received email, and nothing else.
-    if (event && event.cron === "* * * * *") { ctx.waitUntil(uatCopy(env).catch((e) => console.log("uat copy failed", String(e && e.message || e)))); ctx.waitUntil(picTest(env).catch((e) => console.log("picture test failed", String(e && e.message || e))).then(() => picClean(env)).catch((e) => console.log("picture clean failed", String(e && e.message || e)))); ctx.waitUntil(vmTag(env).catch((e) => console.log("voicemail tag failed", String(e && e.message || e)))); return; }
+    if (event && event.cron === "* * * * *") { ctx.waitUntil(picTest(env).catch((e) => console.log("picture test failed", String(e && e.message || e))).then(() => picClean(env)).catch((e) => console.log("picture clean failed", String(e && e.message || e)))); ctx.waitUntil(vmTag(env).catch((e) => console.log("voicemail tag failed", String(e && e.message || e)))); return; }
     // A five minute trigger, if one is added, only looks for new mail so pings arrive quickly.
     if (event && event.cron === "*/5 * * * *") { ctx.waitUntil(mergeExportTest(env).catch((e) => console.log("export test failed", String(e && e.message || e)))); ctx.waitUntil(mergeCopyUndo(env).catch((e) => console.log("copy undo failed", String(e && e.message || e)))); ctx.waitUntil(mergeSentCopy(env).catch((e) => console.log("sent copy failed", String(e && e.message || e)))); ctx.waitUntil(mergeAutoReply(env).catch((e) => console.log("autoreply failed", String(e && e.message || e)))); ctx.waitUntil(mergeArchiveCopy(env).catch((e) => console.log("archive copy failed", String(e && e.message || e)))); ctx.waitUntil(mailWatch(env).catch((e) => console.log("mail watch failed", String(e && e.message || e)))); ctx.waitUntil(mailHoldSweep(env).catch((e) => console.log("hold sweep failed", String(e && e.message || e)))); ctx.waitUntil(rcptRefresh(env, MAILBOXES, (Math.floor(Date.now() / 300000) % 6 === 0) ? "all" : "sent").catch((e) => console.log("address index failed", String(e && e.message || e)))); ctx.waitUntil(vbaSubscribe(env).then(() => vbaWatch(env)).catch((e) => console.log("vba watch failed", String(e && e.message || e)))); return; }
     // Every run checks the automatic timesheets and the payroll sweeps. The leave sync keeps its own schedule and is skipped on the half hourly one.
