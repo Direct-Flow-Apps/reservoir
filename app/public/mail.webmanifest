@@ -1,7 +1,7 @@
 {
   "id": "/mail",
-  "name": "Weir Mail",
-  "short_name": "Weir Mail",
+  "name": "Weir",
+  "short_name": "Weir",
   "start_url": "/mail",
   "scope": "/",
   "display": "standalone",
