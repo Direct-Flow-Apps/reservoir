@@ -908,7 +908,7 @@ const profileOut = (r) => {
   return o;
 };
 // ---- Licence and registration cards: self managed ----
-// The person saves their own card straight away (number, expiry, photos). The office is told with a notice and can check the photo. If the photo is not good enough the office resets that card: it is cleared and the person gets a job on their punch list to do it again.
+// The person saves their own card straight away (number, expiry, photos). The office is told with a notice and can check the photo. If the photo is not good enough the office resets that card: it is cleared and the person gets a job on their task list to do it again.
 const CARD_DEFS = {
   plumbReg: { label: "Plumbing Registration", keys: ["plumbRegNo", "plumbRegExpiry"], copy: "plumbRegCopy" },
   driver: { label: "Driver Licence", keys: ["driverNo", "driverExpiry"], copy: "driverCopy" },
@@ -7144,8 +7144,8 @@ async function tsDuplicate(env, employeeId, email, week) {
   return "";
 }
 // Only a director may approve a waiting timesheet for now.
-// ---- Notifications and the punch list ----
-// One table for everything that needs to tell somebody something. A notice goes to one person (their work email) or to the whole office ('@office', seen by every director and manager). A notice with todo = 1 is a job for the person: it stays on their punch list, and keeps counting on the bell, until it is done. Any other notice counts until it has been read.
+// ---- Notifications and the task list ----
+// One table for everything that needs to tell somebody something. A notice goes to one person (their work email) or to the whole office ('@office', seen by every director and manager). A notice with todo = 1 is a job for the person: it stays on their task list, and keeps counting on the bell, until it is done. Any other notice counts until it has been read.
 // data holds what the app needs to act on the notice, for example which card and which photo.
 let noticesReady = false;
 // ---- General requests (fuel card, replacement tools, test and tag, and the rest). The app keeps each request as one JSON record. Anyone signed in can send one and see their own. The office (T1 and T2) sees them all, and only Tayler can approve or decline.
