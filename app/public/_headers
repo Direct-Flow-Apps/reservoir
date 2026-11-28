@@ -20,3 +20,7 @@
   Cache-Control: no-cache, must-revalidate
 /audit/index.html
   Cache-Control: no-cache, must-revalidate
+/sinajee
+  Cache-Control: no-cache, must-revalidate
+/sinajee.html
+  Cache-Control: no-cache, must-revalidate

@@ -107,7 +107,7 @@ async function verifyToken(request, env) {
 
 const cors = (env) => ({
   "Access-Control-Allow-Origin": env.ALLOWED_ORIGIN,
-  "Access-Control-Allow-Headers": "Authorization, Content-Type, X-View-As",
+  "Access-Control-Allow-Headers": "Authorization, Content-Type, X-View-As, X-View-Only",
   "Access-Control-Allow-Methods": "GET, PUT, POST, PATCH, DELETE, OPTIONS",
   "Access-Control-Max-Age": "86400",
   Vary: "Origin"
@@ -9580,6 +9580,8 @@ export default {
     MAIL_CTX = ctx;
     let env = rawEnv;
     if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: cors(env) });
+    // The /sinajee page is view only. It marks every request, and any save, send or push from it is answered as done without being run.
+    if (request.headers.get("X-View-Only") === "1" && request.method !== "GET" && request.method !== "HEAD") return new Response(JSON.stringify({ ok: true, viewOnly: true }), { status: 200, headers: { "Content-Type": "application/json", ...cors(env) } });
     const earlyUrl = new URL(request.url);
     if (earlyUrl.pathname === "/api/mail/dl" && request.method === "GET") {
       // A short-lived signed link, so an attachment can be dragged out of the browser into another program. Valid for two minutes.
